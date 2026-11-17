@@ -19,6 +19,14 @@ its trust anchors and release checks.
 
 ## [Unreleased]
 
+### Fixed
+
+- `scripts/verify_release.sh` resolves the commit of a release tag again.
+  Its copy in v0.1.21-rc1 stops at the attestation step with HTTP 422
+  ("No commit found for SHA: tags/…"); use the one on `main` (#878).
+
+## [0.1.21-rc1] - 2026-11-15
+
 ### Added
 
 - Stale anchor: at a `STALE_ANCHOR` park, the user can re-anchor on a fresh
@@ -40,7 +48,8 @@ its trust anchors and release checks.
   `release rehearsal` workflows (#734, #771); the Go engine joins the Linux
   gate (#813).
 - `eez_probe`, a compatibility probe for a foreign-chain snap peer (#768).
-- Docs: Scaffold-ETH 2 dApps on Myotis (#735); the Myotis Rust Tour (#738).
+- Docs: Scaffold-ETH 2 dApps on Myotis (#735); the Myotis Rust Tour (#738);
+  `SECURITY.md`, how to report a vulnerability privately (#870).
 - This changelog.
 
 ### Changed
@@ -62,8 +71,12 @@ its trust anchors and release checks.
 ### Fixed
 
 - `myotis-node`: a use-after-free at teardown (#455, #852).
-- The JSON-RPC servers bound a request body instead of reading it whole
-  (#667, #852).
+- The loopback JSON-RPC server of the Android app, the desktop app and the
+  daemon read a request body whole, so one oversized request could exhaust
+  the memory of the app hosting the node. A body is now capped at 5 MiB (413)
+  and must arrive within 10 s (408), the limits `myotis-rpcd` already had.
+  Any local process (on Android, any app with network access) or a web origin
+  the user allowed could send it (#667, #852).
 - The light client could rotate its sync committee twice after a catch-up
   force-rotation and then refuse updates signed in the real period; fixed in
   the Java, Rust and Go engines (#737, #852).
@@ -559,7 +572,8 @@ MetaMask; ENS with CCIP-Read; mainnet and Gnosis Chain; the Android app, the
 shared Compose Multiplatform UI and the macOS dmg; and `:myotis-api`, the
 engine contract (#1 to #123).
 
-[Unreleased]: https://github.com/biafra23/myotis/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/biafra23/myotis/compare/v0.1.21-rc1...HEAD
+[0.1.21-rc1]: https://github.com/biafra23/myotis/compare/v0.1.20...v0.1.21-rc1
 [0.1.20]: https://github.com/biafra23/myotis/compare/v0.1.20-rc1...v0.1.20
 [0.1.20-rc1]: https://github.com/biafra23/myotis/compare/v0.1.19...v0.1.20-rc1
 [0.1.19]: https://github.com/biafra23/myotis/compare/v0.1.19-rc2...v0.1.19
