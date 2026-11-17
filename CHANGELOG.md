@@ -33,6 +33,25 @@ its trust anchors and release checks.
   module depending on the other. Both modules are published, so a consumer that
   reached `LoopbackRpc` through `:myotis-engine-rust` now gets it through
   `:myotis-engine-common` (the Go-engine embed, #832).
+- Go engine: verified reads now run at the optimistic head, as the Rust
+  engine does. The default (empty/`latest`) account, storage and
+  `eth_*`-adapter reads verify against the light client's BLS-ATTESTED
+  head state root instead of the beacon-finalized one — the trust
+  position moves from the finality checkpoint to the sync-committee
+  attestation of the head (both anchors come from the same signed
+  update; neither is a peer claim), and read freshness moves with it
+  from ~13–19 minutes to seconds. `finalized` stays APPLIED as its own
+  read (never mapped to the head); a near-head number is served from
+  head state inside the shared `RpcBlockWindow` (±64/16, enforced twice:
+  JVM adapter and engine); `safe`/`earliest` stay refused (#366).
+  Results report `anchor:"head"` with the attested slot's
+  `matchedBeaconSlot` and the head block's proven coordinates;
+  `eth_blockNumber` answers the optimistic head; the readiness dot ages
+  from the attested slot. Remaining divergence from the Rust twin,
+  documented: no `fresh_head`/header-chain fallback — a peer that
+  cannot serve the attested head loses the attempt and the read retries
+  at the next publish (the Go engine never reads at a root only a peer
+  names, even a header-chain-verified one).
 
 ### Fixed
 

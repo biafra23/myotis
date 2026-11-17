@@ -124,6 +124,20 @@ func (s *Store) FinalizedExecInfo() (number, timestamp uint64, hash hash32, ok b
 	return s.finalizedLC.ExecNumber, s.finalizedLC.ExecTimestamp, s.finalizedLC.ExecBlockHash, true
 }
 
+// OptimisticStateRoot is the attested payload's OWN state_root field —
+// the root a verified HEAD read verifies against, the exact twin of
+// FinalizedStateRoot for the finalized header (reader.rs reads head state
+// under the anchor's optimistic root, myotis-net/src/el/anchor.rs). Same
+// verification as the finalized root: the execution branch was checked
+// against the attested header's body root inside ProcessUpdate /
+// ProcessFinalityUpdate, under the committee's BLS signature.
+func (s *Store) OptimisticStateRoot() hash32 {
+	if s.optimisticLC == nil {
+		return hash32{}
+	}
+	return s.optimisticLC.ExecStateRoot
+}
+
 // OptimisticExecInfo is FinalizedExecInfo for the attested (optimistic)
 // header, backing the shapes' optimisticBlockNumber. ok=false until an
 // attested header is held.

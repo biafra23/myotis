@@ -14,21 +14,26 @@ import org.slf4j.LoggerFactory;
  * The Go engine's {@link VerifiedReads} adapter — the read surface the host's
  * {@code LoopbackRpc} listener serves on {@code 127.0.0.1:rpcPort}. It is the
  * honest, smaller sibling of {@code RustVerifiedReads}: the Go build serves the
- * proof-verified ACCOUNT and STORAGE reads (at the beacon-finalized state root —
- * its only anchor) and nothing else yet, so:
+ * proof-verified ACCOUNT and STORAGE reads — head-anchored like the twin (the
+ * light client's BLS-attested optimistic head root by default, the
+ * beacon-finalized root on request) — and nothing else yet, so:
  *
  * <ul>
  *   <li>{@code getBalance}/{@code getTransactionCount}/{@code getStorageAt} run
  *       the verified reads; a verified-absent account answers balance/nonce 0 and
  *       a proven-zero slot answers 32 zero bytes (eth semantics, like the
  *       Rust twin).</li>
- *   <li>{@code finalized} is the ONLY served selector
- *       ({@link #supportsFinalizedTag()} true — it is APPLIED, never mapped to
- *       another block). {@code latest}/{@code pending}/a number are NOT served,
- *       because serving them would mean answering from finalized state while the
- *       caller asked about the head: the apply-or-refuse rule (#314) says refuse
- *       — null, the contract's "cannot answer verified" — until the Go engine
- *       grows the optimistic-head anchor.</li>
+ *   <li>The selector policy is the twin's, shared through
+ *       {@code RpcBlockWindow}: head tags ({@code latest}/{@code pending}/
+ *       empty) and {@code finalized} are served — {@code finalized} APPLIED at
+ *       the finalized root, never mapped to the head — a near-head number is
+ *       served from head state inside the window (the standard light-client
+ *       trade-off, checked against the anchor's optimistic number), and
+ *       {@code safe}/{@code earliest} are never served (#366 — the engine
+ *       tracks neither). What is refused here stops at {@code null} (the
+ *       contract's "cannot answer verified"); the engine applies the same
+ *       window again below the FFI and answers a permanently-refused selector
+ *       with the -32602 envelope.</li>
  *   <li>The EVM reads ({@code call}, {@code estimateGas} — the engine has no
  *       EVM), the block/tx/receipt reads, {@code getCode}, {@code gasPrice},
  *       {@code maxPriorityFeePerGas}, {@code feeHistory}, {@code getBlockReceipts}
@@ -48,7 +53,8 @@ import org.slf4j.LoggerFactory;
  * </ul>
  *
  * <p>What still reaches the wire as the retryable -32000: refused SELECTORS on
- * the typed state reads ({@code getBalance(addr, "latest")} etc. answer null),
+ * the typed state reads ({@code getBalance(addr, "safe")} etc. answer null —
+ * the head tags and near-head numbers are served now),
  * {@code getCode}, {@code gasPrice}, {@code maxPriorityFeePerGas} — and
  * storage positions at or above 2^64, which {@link #getStorageAt} refuses
  * before the FFI (the ABI names a slot in eight bytes; slots from 2^63 to
@@ -87,18 +93,19 @@ final class GoVerifiedReads implements VerifiedReads {
 
     @Override
     public Long headBlockNumber() {
-        // The Go engine has no optimistic head yet; its eth_blockNumber answer is
-        // the beacon-FINALIZED execution block — verified, never reorged, but
-        // materially further behind the tip than a node's "latest": mainnet
-        // finality lags the head by ~2-3 epochs (~13-19 min at 12s slots) before
-        // it moves at all, and the checkpoint it rides advances only ~once per
-        // epoch (~6.4 min). A wallet reading balances here sees confirmations and
-        // nonce lag of that order — more than the usual light-client skew, and
-        // something the engine-parity step (an optimistic anchor) will shrink;
-        // honest for a desktop Bee integration meanwhile. 0 (no anchor) → null.
+        // The beacon optimistic-head execution block number (eth_blockNumber),
+        // from the anchor via the status JSON — the same number the verified
+        // reads now run at, exactly the Rust twin's answer (0 == the anchor
+        // has no head yet → null, per the contract).
+        //
+        // Head/state skew (the twin's note, now literally true here):
+        // getBalance/getStorageAt("latest") verify against the ATTESTED head
+        // N, while a peer's fresh tip can be a few blocks ahead of N. Both
+        // readings are beacon-verified; a read at a block > N is the standard
+        // light-client skew wallets tolerate, not a trust violation.
         try {
-            long fin = handle.status().finalizedBlockNumber();
-            return fin > 0 ? fin : null;
+            long head = handle.status().optimisticBlockNumber();
+            return head > 0 ? head : null;
         } catch (RuntimeException | LinkageError e) {
             log.debug("[engines] headBlockNumber unavailable on the Go engine: {}", e.getMessage());
             return null;
@@ -126,10 +133,10 @@ final class GoVerifiedReads implements VerifiedReads {
         }
     }
 
-    /** APPLIED everywhere this engine answers: reads run AT the beacon-finalized
-     *  block, never mapped to the head — the inverse of the Rust engine, which
-     *  serves both anchors. Hosts may send {@code finalized}; everything else
-     *  this adapter answers as unanswerable. */
+    /** APPLIED, never mapped to the head: this engine serves BOTH anchors now
+     *  (head by default, finalized on request), like the Rust twin. The tag
+     *  stays true because hosts must be able to REACH the finalized read —
+     *  the router would otherwise refuse the tag up front. */
     @Override
     public boolean supportsFinalizedTag() {
         return true;
@@ -151,7 +158,7 @@ final class GoVerifiedReads implements VerifiedReads {
 
     @Override
     public String getBalance(byte[] address, String block) {
-        if (!isFinalizedSelector(block)) return null;
+        if (!isServableBlock(block)) return null;
         AccountProofResult r = queryAccount(address, block);
         if (r == null || !isVerified(r)) return null;
         // Verified-absent answers 0 (eth semantics), like the Rust twin.
@@ -160,7 +167,7 @@ final class GoVerifiedReads implements VerifiedReads {
 
     @Override
     public Long getTransactionCount(byte[] address, String block) {
-        if (!isFinalizedSelector(block)) return null;
+        if (!isServableBlock(block)) return null;
         AccountProofResult r = queryAccount(address, block);
         if (r == null || !isVerified(r)) return null;
         // Verified-absent → nonce 0 (r.nonce() is -1 when !exists). No pending
@@ -178,7 +185,7 @@ final class GoVerifiedReads implements VerifiedReads {
 
     @Override
     public byte[] getStorageAt(byte[] address, byte[] slot32, String block) {
-        if (!isFinalizedSelector(block)) return null;
+        if (!isServableBlock(block)) return null;
         if (address == null || address.length != 20) return null;
         if (slot32 == null || slot32.length != 32) return null;
         // The verified read takes the slot as an int64 (the ABI's int64_t); a
@@ -326,12 +333,23 @@ final class GoVerifiedReads implements VerifiedReads {
                 .toString();
     }
 
-    /** Only the exact {@code finalized} tag (trimmed, case-insensitive); a
-     *  missing/empty selector means the caller asked for the head — which this
-     *  engine cannot anchor, so it is refused, not quietly run at finalized. */
-    static boolean isFinalizedSelector(String block) {
-        return block != null && "finalized".equals(block.trim()
-                .toLowerCase(java.util.Locale.ROOT));
+    /** The shared selector policy ({@code RpcBlockWindow}, the same window the
+     *  router and the Rust adapter apply): head tags and {@code finalized}
+     *  always servable, {@code safe}/{@code earliest} never (#366), a number
+     *  only inside the window around the anchor's optimistic number — read
+     *  lazily, only number pins fetch it (the twin's {@code
+     *  RustVerifiedReads.isServableBlock}, head fetched from the status like
+     *  its {@code headBlockNumber}). Outside the window answers null here;
+     *  below the FFI the engine runs the same check again and answers the
+     *  -32602 envelope for what no retry can serve. */
+    private boolean isServableBlock(String block) {
+        return blockInWindow(block, this::headBlockNumber);
+    }
+
+    /** Seam for tests and the shared-policy call, twin-identical (the Rust
+     *  adapter's {@code blockInWindow} of the same name and signature). */
+    static boolean blockInWindow(String block, java.util.function.Supplier<Long> head) {
+        return io.myotis.jsonrpc.policy.RpcBlockWindow.INSTANCE.blockInWindow(block, head::get);
     }
 
     private AccountProofResult queryAccount(byte[] address, String block) {

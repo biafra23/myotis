@@ -43,20 +43,23 @@ import java.util.List;
  *       there is no {@code WakeGate}: {@link #pause()} returns false, a resume of
  *       a running stack succeeds, of a stopped one does not. Hosts' idle timers
  *       simply never reach a Go-hosted network (pause() false means "not paused").</li>
- *   <li><b>Finalized-anchor reads.</b> The Go reader has no optimistic-head
- *       machinery yet, so every verified read runs at the beacon-FINALIZED state
- *       root: {@link #requestAccount} passes the {@code "finalized"} selector
- *       (the Rust twin passes head), {@code finalized} is the only selector
- *       {@link GoVerifiedReads} serves, and the status's verified-head age is
- *       the anchor's TRUE wall-clock age — seconds since the finalized slot's
- *       wall time, from the catalog's CL genesis (PR #832 review). Mainnet
- *       finalization is slow by construction: the beacon finalizes ~2–3 epochs
- *       (≈13–19 min at 12 s slots) behind the head, so that age sits in that
- *       band continuously and the hosts' 45 s readiness dot reads amber
- *       continuously for a Go-hosted network (an earlier revision aged by
- *       "since last advance", which let the dot go green for 45 s of every
- *       epoch). That is honest (the read state IS older by design), not a
- *       regression to paper over with a constant.</li>
+ *   <li><b>Head-anchored reads, twin parity.</b> The Go reader verifies
+ *       against the light client's BLS-ATTESTED optimistic head root — the
+ *       same default the Rust twin serves: {@link #requestAccount} passes the
+ *       empty selector (the header's verified head), and
+ *       {@link GoVerifiedReads} serves head tags, a near-head number inside
+ *       the shared {@code RpcBlockWindow}, and {@code finalized} (which stays
+ *       APPLIED as the beacon-finalized read, never mapped to the head). The
+ *       remaining divergence from the twin, recorded not fixed: the engine has
+ *       no fresh-head/header-chain fallback — a snap peer that cannot serve
+ *       the attested head root (further behind than its ~128-block state
+ *       window) simply loses that attempt, and the read retries at the next
+ *       publish with the peers not yet tried (go/README.md §Deliberate
+ *       cuts). Verified-head age is the anchor's TRUE wall-clock age —
+ *       seconds since the attested slot's wall time, from the catalog's CL
+ *       genesis (PR #832 review); with the head anchor that is seconds, so
+ *       the hosts' 45 s readiness dot goes green as it does on the Rust
+ *       engine, and the age only goes amber when attestation itself lags.</li>
  *   <li><b>No EVM, no block/tx/receipt reads, no ENS, no log index.</b> The
  *       operator queries throw {@link EngineException} (the Rust twin's
  *       NOT_AVAILABLE rule), {@link #ens()} answers an API that throws the same
@@ -107,8 +110,11 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
     private static final String NOT_AVAILABLE =
             "not available on the Go engine yet (operator query: get-headers, get-block, dial)";
 
-    /** The block selector every Go verified read runs at (see class doc). */
-    static final String READ_SELECTOR = "finalized";
+    /** The block selector every Go verified read runs at: the EMPTY selector,
+     *  which the header (v32) names the verified HEAD — the Rust twin's
+     *  default, applied since the engine reads the attested head root
+     *  (see class doc). */
+    static final String READ_SELECTOR = "";
 
     private final long handle;
     private final String networkName;
@@ -127,21 +133,25 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
 
     /** The network's CL slot clock (from the catalog entry, via create):
      *  {@code clGenesisTime} unix-seconds and the slot width. With them the
-     *  verified-head age is the TRUE wall-clock age of the finalized anchor
-     *  (PR #832 review — aging by "time since this handle last saw a finalized
-     *  advance" restarts at 0 on every advance, so the hosts' 45 s readiness dot
-     *  read green for the first 45 s of every ~6.4 min epoch for state that was
+     *  verified-head age is the TRUE wall-clock age of the anchor reads run
+     *  at — the ATTESTED (optimistic) slot while attestation flows (the Rust
+     *  twin's rule; seconds for a healthy run), falling back to the finalized
+     *  slot only while no optimistic slot is reported yet. Aging by "time
+     *  since this handle last saw an advance" restarts at 0 on every advance
+     *  (PR #832 review — under the old finalized anchor that let the hosts'
+     *  45 s readiness dot read green for 45 s of every epoch for state
      *  13-19 minutes behind). Zero means "no catalog wired" (test seams): the
      *  age then falls back to the advance-stamp clock. */
     private final long clGenesisTime;
     private final int secondsPerSlot;
 
-    /** Fallback age bookkeeping (no catalog values): the last finalized block
-     *  number seen and the monotonic time it was first seen, guarded so
-     *  concurrent status() callers cannot tear the pair. */
+    /** Fallback age bookkeeping (no catalog values): the last read-anchor
+     *  block number seen (optimistic when held, finalized otherwise) and the
+     *  monotonic time it was first seen, guarded so concurrent status()
+     *  callers cannot tear the pair. */
     private final Object headAgeLock = new Object();
-    private long lastFinalizedBlock = -1L;
-    private long lastFinalizeAdvanceNanos;
+    private long lastAnchorBlock = -1L;
+    private long lastAnchorAdvanceNanos;
 
     /** Idle-sleep accounting is Java-side even here: the Go engine never pauses,
      *  so these stay at their zeros — but they are reported through the same
@@ -480,46 +490,55 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
     private io.myotis.api.StatusSnapshot status(ParsedStatus s) {
         int peers = (int) Math.min(s.peerCount(), Integer.MAX_VALUE);
         long targetPeriod = Math.max(s.targetPeriod(), s.currentPeriod());
-        // verifiedHeadAgeMs is the TRUE wall-clock age of the finalized anchor —
-        // the slot's wall time from the catalog's CL genesis (PR #832 review):
-        // the anchor every Go read runs at is 13-19 minutes behind the head even
-        // when everything is healthy, and the hosts' 45 s readiness dot must say
-        // so continuously (aging by "since last advance" went green for 45 s of
-        // every epoch). Without catalog values (test seams) the age falls back to
-        // the Rust-twin advance-stamp clock: pinning to "now" while not serveable
-        // so a serving stretch starts fresh instead of leaking the outage gap in.
-        long fin = s.finalizedBlockNumber();
+        // verifiedHeadAgeMs is the TRUE wall-clock age of the anchor verified
+        // reads run at — the ATTESTED (optimistic) slot once one is held, the
+        // finalized slot only before the first attested head lands (a status
+        // from before the head-anchor parity change, or an old library,
+        // reports optimisticSlot 0). The slot's wall time comes from the
+        // catalog's CL genesis (PR #832 review): with the head anchor a
+        // healthy run ages SECONDS and the hosts' 45 s readiness dot goes
+        // green on merit, exactly like the Rust twin's; the amber band
+        // returns only when attestation itself lags. Without catalog values
+        // (test seams) the age falls back to the Rust-twin advance-stamp
+        // clock: pinning to "now" while not serveable so a serving stretch
+        // starts fresh instead of leaking the outage gap in.
+        long anchorBlock = s.optimisticBlockNumber() > 0
+                ? s.optimisticBlockNumber() : s.finalizedBlockNumber();
+        long anchorSlot = s.optimisticSlot() > 0 ? s.optimisticSlot() : s.finalizedSlot();
         boolean serveable = serveable(s);
         long verifiedHeadAgeMs;
-        if (serveable && clGenesisTime > 0 && secondsPerSlot > 0 && s.finalizedSlot() > 0) {
-            long slotWallMs = (clGenesisTime + s.finalizedSlot() * (long) secondsPerSlot) * 1000L;
+        if (serveable && clGenesisTime > 0 && secondsPerSlot > 0 && anchorSlot > 0) {
+            long slotWallMs = (clGenesisTime + anchorSlot * (long) secondsPerSlot) * 1000L;
             long wallAgeMs = System.currentTimeMillis() - slotWallMs;
-            // A FINALIZED slot's wall time cannot be in the future under an
-            // honest clock (finality trails the head by at least two epochs,
-            // ~13 min). slotWallMs ahead of now is therefore proof the HOST
-            // clock lags chain time — a sleeping laptop waking before NTP —
-            // and clamping that to 0 would read the clock-skew proof itself
-            // as "fresh": the one way this dot goes falsely green. MAX_VALUE
-            // (already the not-serveable answer, so hosts handle it) says
-            // "cannot claim freshness" instead. Residual the JVM cannot fix:
-            // a clock lagging by LESS than the anchor's true age still
-            // under-reports the age — the engine shares this host clock, so
-            // no side can see the true "now" to compare against.
-            // (Final-PR review, combined diff, finding 1.)
+            // The anchor slot's wall time cannot be in the future under an
+            // honest clock: finality trails the head by ≥2 epochs, and an
+            // ATTESTED slot is one the beacon already signed — its slot began
+            // before the attestation could exist. slotWallMs ahead of now is
+            // therefore proof the HOST clock lags chain time — a sleeping
+            // laptop waking before NTP — and clamping that to 0 would read
+            // the clock-skew proof itself as "fresh": the one way this dot
+            // goes falsely green. MAX_VALUE (already the not-serveable
+            // answer, so hosts handle it) says "cannot claim freshness"
+            // instead. Residual the JVM cannot fix: a clock lagging by LESS
+            // than the anchor's true age still under-reports the age — the
+            // engine shares this host clock, so no side can see the true
+            // "now" to compare against. (Final-PR review, combined diff,
+            // finding 1; the head-anchor rewire keeps the invariant, tighter:
+            // a slot cannot attest before it starts.)
             verifiedHeadAgeMs = wallAgeMs < 0 ? Long.MAX_VALUE : wallAgeMs;
         } else {
             long nowNanos = System.nanoTime();
             synchronized (headAgeLock) {
                 if (!serveable) {
-                    lastFinalizedBlock = fin;
-                    lastFinalizeAdvanceNanos = nowNanos;
+                    lastAnchorBlock = anchorBlock;
+                    lastAnchorAdvanceNanos = nowNanos;
                     verifiedHeadAgeMs = Long.MAX_VALUE;
                 } else {
-                    if (fin != lastFinalizedBlock) {
-                        lastFinalizedBlock = fin;
-                        lastFinalizeAdvanceNanos = nowNanos;
+                    if (anchorBlock != lastAnchorBlock) {
+                        lastAnchorBlock = anchorBlock;
+                        lastAnchorAdvanceNanos = nowNanos;
                     }
-                    verifiedHeadAgeMs = Math.max(0L, (nowNanos - lastFinalizeAdvanceNanos) / 1_000_000L);
+                    verifiedHeadAgeMs = Math.max(0L, (nowNanos - lastAnchorAdvanceNanos) / 1_000_000L);
                 }
             }
         }
@@ -540,7 +559,7 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
                 s.attemptedDials(),    // attemptedDials
                 s.discv5TableSize(),
                 s.finalizedBlockNumber(),   // executionBlockNumber (== finalized payload's block)
-                s.optimisticBlockNumber(),  // optimisticBlockNumber (0 on the Go engine yet)
+                s.optimisticBlockNumber(),  // optimisticBlockNumber (the attested head the reads run at)
                 s.finalizedSlot(),
                 s.finalizedBlockNumber(),   // finalizedBlockNumber
                 s.syncStartPeriod(),
@@ -769,13 +788,13 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
 
     @Override
     public AccountProofResult requestAccount(String hexAddress) {
-        // The Go reader anchors at finalized (class doc): the Rust twin passes ""
-        // (its verified head); there is no head here to ask for.
         return accountVerified(hexAddress, READ_SELECTOR);
     }
 
     /** The account read at an explicit selector — {@link GoVerifiedReads} drives
-     *  it with "finalized" (the only selector the Go build applies). */
+     *  it with the request's own selector (the engine applies head tags,
+     *  near-head numbers and {@code finalized}, and permanently refuses what
+     *  it cannot, {@code RpcBlockWindow}-shaped). */
     AccountProofResult accountVerified(String hexAddress, String block) {
         JsonObject o = parseResultOrThrow(
                 gated(() -> GoEngineNative.nativeRequestAccountJson(handle, hexAddress, block)),

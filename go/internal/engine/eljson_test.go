@@ -35,6 +35,13 @@ func testAnchor() Anchor {
 		ExecBlockHash:    fill(0xab),
 		OptimisticSlot:   wall + 2,
 		OptimisticExecNo: 23_456_801,
+		// The optimistic side's proven coordinates complete the head
+		// read's blockTimestamp/blockHash/report-root — a head-read test
+		// must be able to tell them apart from the finalized side's,
+		// hence distinct fills.
+		OptimisticExecTimestamp: testNow - 12,
+		OptimisticExecHash:      fill(0xcd),
+		OptimisticStateRoot:     fill(0x44),
 	}
 }
 
@@ -298,5 +305,58 @@ func TestBeToDecimal(t *testing.T) {
 		if got := beToDecimal(b); got != want {
 			t.Errorf("beToDecimal(%q) = %s, want %s", in, got, want)
 		}
+	}
+}
+
+// --- the HEAD read: the same shape, the optimistic side of the anchor ---
+
+// A head read (ReadAnchor::Head, the Rust twin's DEFAULT) reports the
+// attested payload's own root, number, timestamp, hash and slot — the
+// keys every one of them describes the READ, not the engine's most
+// trusted block. The finalized-side diagnostics (finalizedBlockNumber,
+// finalizedSlot, beaconSynced, finalizedPeriod) keep describing the
+// finalized header, exactly as the twin's eljson.rs does.
+func TestAccountJSONGoldenHead(t *testing.T) {
+	r := foundRead(t)
+	r.Head = true
+	got, err := r.AccountJSON(testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"address":"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045","exists":true,"nonce":42,"balanceWei":"12345678901234567890123","storageRootHex":"0x2222222222222222222222222222222222222222222222222222222222222222","codeHashHex":"0x3333333333333333333333333333333333333333333333333333333333333333","blockNumber":23456801,"blockTimestamp":1800000088,"blockHash":"0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","peerStateRootHex":"0x4444444444444444444444444444444444444444444444444444444444444444","peerProofValid":true,"beaconChainVerified":true,"blsVerified":true,"matchedBeaconSlot":16098008,"verifyMethod":"stateRootMatch","failReason":null,"accountHashHex":"0x06e120c2c3547c60ee47f712d32e5acf38b35d1cc62e23b055a69bb88284c281","proofNodesHex":[],"beaconSynced":true,"finalizedPeriod":1965,"wallClockPeriod":1965,"finalizedBlockNumber":23456789,"optimisticBlockNumber":23456801,"anchor":"head"}`
+	if got != want {
+		t.Errorf("head-read account JSON drifted:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestStorageJSONGoldenHead(t *testing.T) {
+	r := foundRead(t)
+	r.Head = true
+	var key [32]byte
+	key[31] = 7
+	r.Slot = &SlotRead{Key: key, Value: []byte{0x2a}, StorageRoot: fill(0x22)}
+	got, err := r.StorageJSON(testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// peerBlockNumber moves to the optimistic number the read ran at
+	// (host.rs:6620-6623: the twin reports the ANCHOR's optimistic
+	// number, never a raw peer claim), while finalizedBlockNumber and
+	// finalizedSlot keep telling the truth about finality.
+	const want = `{"addressHex":"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045","slot":7,"holderHex":null,"storageKeyHex":"0x0000000000000000000000000000000000000000000000000000000000000007","storageKeyHashHex":"0xa66cc928b5edb82af9bd49922954155ab7b0942694bea4ce44661d9a8736c688","exists":true,"valueHex":"0x2a","valueDecimal":"42","slotsReturned":1,"storageRootHex":"0x2222222222222222222222222222222222222222222222222222222222222222","proofNodesHex":[],"storageProofValid":true,"beaconSynced":true,"beaconChainVerified":true,"blsVerified":true,"matchedBeaconSlot":16098008,"verifyMethod":"stateRootMatch","failReason":null,"peerBlockNumber":23456801,"finalizedBlockNumber":23456789,"optimisticBlockNumber":23456801,"finalizedSlot":16097996,"optimisticSlot":16098008,"maxHeaderChainGap":8192,"anchor":"head"}`
+	if got != want {
+		t.Errorf("head-read storage JSON drifted:\n got %s\nwant %s", got, want)
+	}
+}
+
+// The disclosure memory keys the root ACTUALLY READ: a head read and a
+// finalized read on one engine must not mark each other's peers tried.
+func TestReadRootFollowsKind(t *testing.T) {
+	a := testAnchor()
+	if got := a.ReadRoot(true); got != a.OptimisticStateRoot {
+		t.Error("head read must run at the attested optimistic root")
+	}
+	if got := a.ReadRoot(false); got != a.StateRoot {
+		t.Error("finalized read must run at the finalized payload root")
 	}
 }
