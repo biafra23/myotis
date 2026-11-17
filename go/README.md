@@ -132,13 +132,17 @@ policy, anchoring — is this module's own code, guided by `docs/spec/` and
    the next publish with the peers not yet tried; a peer on a pruned
    state scheme answers a head-root read with an EMPTY proof, and that
    is precisely the `pruned-root` case the reader rotates past —
-   observed live), and the attested header is only as fresh as the
-   FINALITY update carrying it — CLs regenerate that update when the
-   finalized checkpoint moves (~once per ~6.4-min epoch), so head
-   freshness is bounded by an epoch, not a slot; `ProcessOptimisticUpdate`
-   plus a per-slot optimistic-update poll is the remaining increment to
-   the twin's seconds-fresh head. And no hedged reads (sequential only;
-   HEDGE_DELAY 3 s racing is 3c).
+   observed live). The attested header rides the FINALITY update the
+   steady loop polls once per slot, and CL servers answer each poll
+   freshly — the head tracks wall clock within ~1–2 slots, the same
+   mechanism and bound as the twin's (there is no per-slot
+   optimistic-update poll on either engine to wait for). Its honest
+   caveat: which header counts as the head is ordered by the
+   unauthenticated `signature_slot` (#774) — one polled CL pin can
+   roll the head side back within the current committee period
+   (staleness or denial, never forgery; the guards are a three-engine
+   change and the owner's call, go/internal/lc/store.go). And no
+   hedged reads (sequential only; HEDGE_DELAY 3 s racing is 3c).
    Live-smoke verified 2026-11-11 from this machine: the LC finality
    poll advanced the anchor in real time (slot 15633728 → 15633856
    during the run), the first READY Geth answered the read with an
@@ -157,7 +161,10 @@ policy, anchoring — is this module's own code, guided by `docs/spec/` and
    exclusively state-pruned nodes, and a longer window then served
    the read: `verifiedAt=0xe04f511b… lcFinalizedSlot=15634912`,
    nonce/balance from the MPT leaf and the storage read anchored at
-   the PROVEN empty storageRoot.
+   the PROVEN empty storageRoot. (CLI output since names the side the
+   read actually used — `verifiedAt … anchor=head matchedBeaconSlot=…
+   blockNumber=…`, the same `Anchor.ReadSide` the JSON shapes answer
+   from; PR #889 review.)
 5. final integration PR to `main` (PR #773 — once it merges and the
    feature branch is deleted, this section is history, and the
    `feature/go-engine` entry in `go-engine.yml`'s push trigger can go

@@ -331,7 +331,17 @@ func (s *Store) ProcessFinalityUpdate(u *FinalityUpdate) (FinalityOutcome, error
 	// (a peer cannot forge the finalized header either way — it is
 	// Merkle-checked into the attested state, which is what the
 	// committee signed): it is a stale-update-rejection sharp edge, not
-	// a forgery path. This is deliberately IDENTICAL to the Rust twin
+	// a forgery path. Since head reads became the Go engine's default
+	// (PR #889) the edge reaches the OPTIMISTIC side too: one polled CL
+	// pin can replay a genuine earlier update of the CURRENT period with
+	// signature_slot rewritten to the period's last slot, and that
+	// period's honest updates cannot displace it (their real signature
+	// slots are lower) until the period rolls — staleness or denial of
+	// the default read for up to a period, never forgery, and the
+	// finalized side keeps advancing beside it. Spec-style guards
+	// (refuse signature_slot beyond wall clock; tip the optimistic
+	// header only on a higher ATTESTED slot) would close it but change
+	// all three engines' comparator, so they are the owner's call. This is deliberately IDENTICAL to the Rust twin
 	// (store.rs notes the same) and the Java engine, so a fix is a
 	// three-way coordinated change, not a Go-side patch — tracked as
 	// issue #774, not silently diverged here (PR #773 review).

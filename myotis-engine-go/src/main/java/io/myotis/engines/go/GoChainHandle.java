@@ -57,15 +57,17 @@ import java.util.List;
  *       publish with the peers not yet tried (go/README.md §Deliberate
  *       cuts). Verified-head age is the anchor's TRUE wall-clock age —
  *       seconds since the attested slot's wall time, from the catalog's CL
- *       genesis (PR #832 review). It is NOT yet the Rust twin's
- *       seconds-fresh head: the engine's attested header rides the
- *       FINALITY-update poll, and CLs regenerate that update when the
- *       finalized checkpoint moves (~once per ~6.4 min epoch), so the age
- *       saw-tooths from seconds to a few minutes and the hosts' 45 s
- *       readiness dot reads green at the top of each epoch, amber after —
- *       the honest age of an anchor that old. Closing the last of the gap
- *       is porting the per-slot optimistic-update poll (the next engine-
- *       parity increment, go/README.md §Parts), not rounding this number.</li>
+ *       genesis (PR #832 review). The attested header rides the
+ *       once-per-slot FINALITY-update poll, and CL servers answer each
+ *       poll freshly, so the head tracks wall clock within ~1–2 slots —
+ *       the same mechanism and the same bound as the Rust twin's
+ *       (anchor.rs); there is no per-slot optimistic-update poll on
+ *       either engine to wait for. What that age does NOT claim: which
+ *       attested header counts as the head is ordered by the
+ *       unauthenticated {@code signature_slot} (#774) — one polled CL
+ *       pin can roll the head side back within the current committee
+ *       period (staleness or denial, never forgery; the guards are a
+ *       three-engine change and the owner's call, go/internal/lc/store.go).</li>
  *   <li><b>No EVM, no block/tx/receipt reads, no ENS, no log index.</b> The
  *       operator queries throw {@link EngineException} (the Rust twin's
  *       NOT_AVAILABLE rule), {@link #ens()} answers an API that throws the same
@@ -501,12 +503,13 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         // finalized slot only before the first attested head lands (a status
         // from before the head-anchor parity change, or an old library,
         // reports optimisticSlot 0). The slot's wall time comes from the
-        // catalog's CL genesis (PR #832 review): with the head anchor a
-        // healthy run ages from seconds at the top of an epoch up to the
-        // finality-update cadence (~6.4 min) at its bottom — the attested
-        // header rides the finality-update poll, which CLs regenerate once
-        // per finalized checkpoint — so the readiness dot saw-tooths with
-        // it, honestly, until the per-slot optimistic-update poll lands.
+        // catalog's CL genesis (PR #832 review): the attested header
+        // rides the once-per-slot finality-update poll and CL servers
+        // answer freshly, so a healthy run ages only seconds (the
+        // twin's own ~1–2-slot bound, anchor.rs) and the readiness dot
+        // stays green in the normal case (PR #889 review: the old
+        // epoch-saw-tooth story was wrong — the Rust engine never runs
+        // a per-slot optimistic-update poll either).
         // Without catalog values (test seams) the age falls back to the
         // Rust-twin advance-stamp clock: pinning to "now" while not
         // serveable so a serving stretch starts fresh instead of leaking
@@ -599,10 +602,11 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
                 s.networkMetering());
     }
 
-    /** A verified read can be served NOW on this engine: SYNCED, a finalized
-     *  anchor, and a pooled snap peer that can answer AT THAT ROOT. The Go twin
-     *  of the Rust predicate with the head replaced by the finalized block (the
-     *  Go reader's only anchor). */
+    /** A verified read can be served NOW on this engine: SYNCED, a published
+     *  anchor, and a pooled snap peer that can answer AT THE READ'S ROOT. The
+     *  Go twin of the Rust predicate; a published Go anchor always carries
+     *  both sides (attested head and finalized) together, so a present
+     *  finalized side means the head side the reads run at is present too. */
     private static boolean serveable(ParsedStatus s) {
         return s.beaconState() == BeaconState.SYNCED
                 && s.finalizedBlockNumber() > 0 && s.snapServingPeers() > 0;
@@ -964,7 +968,8 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
                     o.getLong("optimisticBlockNumber", 0L),
                     longOrMinusOne(o, "blockTimestamp"),
                     stringOrNull(o, "blockHash"));
-            // The Go shape's one extra key ("anchor", always "finalized" here) is
+            // The Go shape's one extra key ("anchor": the side actually
+            // read, "head" for this handle's verified-head reads) is
             // diagnostics; the record has no field for it and none is needed —
             // the selector that produced the read is this handle's own constant.
         } catch (RuntimeException e) {

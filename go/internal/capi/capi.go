@@ -764,7 +764,7 @@ type readSelector struct {
 // parse_read_block→invalid_params_json mapping produces.
 func parseReadBlock(block string) (readSelector, string, bool) {
 	b := strings.TrimSpace(block)
-	isTag := func(t string) bool { return strings.EqualFold(b, t) }
+	isTag := func(t string) bool { return eqASCIIFold(b, t) }
 	switch {
 	case b == "" || isTag("latest") || isTag("pending"):
 		return readSelector{head: true}, "", false
@@ -802,9 +802,35 @@ func parseReadBlock(block string) (readSelector, string, bool) {
 	if len(shown) > 66 {
 		shown, more = shown[:66], "…"
 	}
+	// The ellipsis goes AFTER the closing quote, like the twin's
+	// `{shown:?}{more}` (host.rs:2280-2282) — not inside the quoted
+	// string (PR #889 review).
 	return readSelector{}, permanentErr(fmt.Sprintf(
-		"invalid block selector %q (expected latest, pending, finalized or a block number)",
-		string(shown)+more)), true
+		"invalid block selector %q%s (expected latest, pending, finalized or a block number)",
+		string(shown), more)), true
+}
+
+// eqASCIIFold is the twin's eq_ignore_ascii_case (host.rs:2250), NOT
+// strings.EqualFold: Unicode case FOLDING maps U+017F (ſ) to 's' and
+// would accept "lateſt" as the head tag; ASCII-only folding keeps the
+// closed vocabulary closed for C-ABI callers.
+func eqASCIIFold(s, t string) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c, d := s[i], t[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if 'A' <= d && d <= 'Z' {
+			d += 'a' - 'A'
+		}
+		if c != d {
+			return false
+		}
+	}
+	return true
 }
 
 // checkReadWindow mirrors check_call_block (host.rs:2332-2345) and the
@@ -821,7 +847,8 @@ func checkReadWindow(sel readSelector, head uint64, haveAnchor bool) (string, bo
 		return "", false, false
 	}
 	if !haveAnchor || head == 0 {
-		return retryableErr(fmt.Sprintf("beacon not synced: no verified head to check block %d against", sel.pinned)), false, true
+		// The block in HEX, like the twin's {block:#x} (host.rs:2317-2319).
+		return retryableErr(fmt.Sprintf("beacon not synced: no verified head to check block 0x%x against", sel.pinned)), false, true
 	}
 	// saturating bounds, spelled out so neither edge under/overflows:
 	// behind = head.saturating_sub(64) (a head below 64 has nothing
@@ -972,7 +999,14 @@ func GetStorageProofJSON(handle int64, address string, slot int64, holder string
 // then EXACTLY 64 ASCII hex digits — no short forms, no odd lengths,
 // no signs or whitespace between. Used for the raw storage position.
 func parseWord32(hex string) ([32]byte, bool) {
-	h := strings.TrimPrefix(strings.TrimPrefix(hex, "0x"), "0X")
+	// ONE prefix at most, like the twin's
+	// strip_prefix("0x").or_else(strip_prefix("0X")) (host.rs:4042): a
+	// second "0X"/"0x" is data and fails the length/hex checks (PR #889
+	// review — nested TrimPrefix accepted "0x0X"+64 hex).
+	h := hex
+	if len(h) >= 2 && (h[:2] == "0x" || h[:2] == "0X") {
+		h = h[2:]
+	}
 	if len(h) != 64 {
 		return [32]byte{}, false
 	}

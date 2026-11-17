@@ -1027,7 +1027,11 @@ func TestStorageAtJSONRefusalShapes(t *testing.T) {
 	if w, ok := parseWord32("0X" + "AB" + strings.Repeat("0", 62)); !ok || w[0] != 0xAB {
 		t.Errorf("parseWord32 must take 0X + mixed case: %x %v", w, ok)
 	}
-	for _, bad := range []string{"0x7", "7", "0x" + strings.Repeat("g", 64), pos + "00"} {
+	// Only ONE prefix is stripped, like the twin (host.rs:4042): a second
+	// prefix is data, so this is 66 payload chars and fails the length
+	// check, not a 64-hex word with a doubled prefix (PR #889 review).
+	bad := []string{"0x7", "7", "0x" + strings.Repeat("g", 64), pos + "00", "0x0X" + strings.Repeat("0", 64)}
+	for _, bad := range bad {
 		if _, ok := parseWord32(bad); ok {
 			t.Errorf("parseWord32(%q) must refuse (no short forms, no width drift)", bad)
 		}
@@ -1048,7 +1052,25 @@ func TestSelectorRefusalEchoIsRuneSafe(t *testing.T) {
 	if strings.ContainsRune(msg, utf8.RuneError) {
 		t.Errorf("truncation cut a rune in half: %q", msg)
 	}
-	if !strings.Contains(msg, "…\"") {
-		t.Errorf("over-long selector must carry the twin's ellipsis: %q", msg)
+	// The twin formats `{shown:?}{more}`: the ellipsis sits AFTER the
+	// closing quote, never inside the quoted selector (PR #889 review —
+	// this test used to pin the inside form while claiming the twin's).
+	if !strings.Contains(msg, `"…`) {
+		t.Errorf("over-long selector must carry the twin's ellipsis after the closing quote: %q", msg)
+	}
+	if strings.Contains(msg, `…"`) {
+		t.Errorf("ellipsis must not sit inside the quoted selector: %q", msg)
+	}
+}
+
+// The tag vocabulary folds ASCII-only, like the twin's
+// eq_ignore_ascii_case (host.rs:2250): Unicode case FOLDING would read
+// "lateſt" (U+017F) as "latest" and serve it as the head tag.
+func TestSelectorTagFoldIsASCIIOnly(t *testing.T) {
+	if _, refusal, _ := parseReadBlock("lateſt"); refusal == "" {
+		t.Errorf("lateſt (U+017F) must not fold to the head tag: %q", refusal)
+	}
+	if sel, refusal, _ := parseReadBlock("LATEST"); refusal != "" || !sel.head {
+		t.Errorf("ASCII upper case must still be the head tag: %v %q", sel, refusal)
 	}
 }

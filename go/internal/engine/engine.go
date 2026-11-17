@@ -694,7 +694,17 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 			} else if outcome, err := syncer.PollFinality(ctx, st); err != nil {
 				logf("finality poll: %v", err)
 			} else {
-				logf("finality poll: outcome %v, finalized slot %d", outcome, st.Finalized.Slot)
+				// The attested exec block rides the same line as the
+				// finalized slot so a live operator can WATCH the head
+				// side of the anchor move — the head-read freshness and
+				// the readiness dot both rest on it advancing every
+				// slot (store.FinalityOutcome's own rule: CL servers
+				// answer each poll freshly; a line where it never moves
+				// across an epoch says the servers do not)
+				// (PR #889 review).
+				optNum, _, _, optOK := st.OptimisticExecInfo()
+				logf("finality poll: outcome %v, finalized slot %d, attested exec block %d (held: %v)",
+					outcome, st.Finalized.Slot, optNum, optOK)
 				// Advanced OR Stale both mean the store's finalized header
 				// passed the full BLS path THIS cycle (Stale = verified,
 				// just not newer); Rejected / poll errors publish nothing.
@@ -839,12 +849,15 @@ type Read struct {
 	// the Rust engine's default for every verified read — false the
 	// beacon-finalized payload root. Both roots come from the same
 	// committee-signed update, so both results are "stateRootMatch";
-	// they differ in freshness (the attested root is never older than
-	// one ~6.4-min epoch — CLs regenerate the finality update's attested
-	// header once per finalized checkpoint, and no per-slot
-	// optimistic-update poll is ported yet — while the finalized root is
+	// they differ in freshness (the attested root rides the finality
+	// update the steady loop polls EVERY slot, and CL servers answer
+	// with fresh copies — the same mechanism and the same ~1-2-slot
+	// bound as the Rust twin's head, anchor.rs; the finalized root is
 	// by construction 13-19 min behind), which is exactly what the
 	// result shapes' anchor/blockNumber/matchedBeaconSlot report.
+	// Which header counts as the head is ordered by the
+	// unauthenticated signature_slot (#774) — see the note in
+	// lc/store.go before claiming more than "attested" of it.
 	Head bool
 }
 

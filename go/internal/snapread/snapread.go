@@ -1,19 +1,20 @@
-// Package snapread turns READY snap sessions plus a BLS-anchored
-// finalized exec state root into verified reads: account, storage
-// (two-hop through the proof-verified account), and bytecode
-// (keccak-checked against the proof-verified codeHash). Go twin of
-// myotis-net's snap reader, stripped to the minimal-engine policy:
+// Package snapread turns READY snap sessions plus a BLS-attested exec
+// state root into verified reads: account, storage (two-hop through
+// the proof-verified account), and bytecode (keccak-checked against
+// the proof-verified codeHash). Go twin of myotis-net's snap reader,
+// stripped to the minimal-engine policy:
 //
-//   - FINALIZED reads only. Every read queries exactly the anchored
-//     finalized exec state root, and there is NO fallback to a fresher
-//     head (the Rust engine's handshake-head fallback, #355, is a
-//     documented 3b-scope cut — the anchor is the fresh head here:
-//     the CLI publishes an anchor only once a finality poll has
-//     verified it, and advances it every poll round; a
-//     bootstrap/catch-up root that no poll has confirmed yet is
-//     hours old and routinely outside every peer's state window, so
-//     reading on it would disclose the key to peers that cannot
-//     answer it).
+//   - VERIFIED anchors only. Every read queries exactly the root the
+//     caller's anchor side names — the BLS-attested optimistic head
+//     root (the engine's default, Anchor.ReadSide) or the anchored
+//     finalized root — and there is NO fallback to a root only a peer
+//     names (neither the Rust engine's handshake-head fallback, #355,
+//     nor a peer-nominated fresher head: the CLI publishes an anchor
+//     only once a finality poll has verified it, and advances it every
+//     poll round; a bootstrap/catch-up root that no poll has confirmed
+//     yet is hours old and routinely outside every peer's state
+//     window, so reading on it would disclose the key to peers that
+//     cannot answer it).
 //   - Sequential peer attempts, capped at 3 — the address-disclosure
 //     bound the Rust twin puts on hedged reads (MAX_HEDGED_ATTEMPTS)
 //     applies the same way when one client IP would contact N peers

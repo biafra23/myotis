@@ -8,8 +8,9 @@
 // With -get-account the light client runs in parallel with EL
 // discovery/dialing, and once both halves are up the CLI answers the
 // account over snap — NONCE, BALANCE AND ROOTS PROVEN against the
-// light client's anchored finalized execution state root, never taken
-// from a peer's word.
+// light client's BLS-attested optimistic head root (the freshest
+// verified anchor, like the Rust twin's default), never taken from a
+// peer's word.
 package main
 
 import (
@@ -46,7 +47,7 @@ func main() {
 		maxReady   = flag.Int("max-ready", 8, "cap on live READY sessions; waiting candidates are held in a backlog and dialed when a slot frees")
 		logLevel   = flag.String("loglevel", "info", "log level: info|debug (debug lists each dial failure)")
 		quiet      = flag.Bool("quiet", false, "log only new peers, not the periodic summary")
-		getAccount = flag.String("get-account", "", "hex address: run the light client, wait for a snap peer, and print this account VERIFIED against the anchored finalized state root, then exit")
+		getAccount = flag.String("get-account", "", "hex address: run the light client, wait for a snap peer, and print this account VERIFIED against the light client's BLS-attested head root, then exit")
 		slot       = flag.String("slot", "", "with -get-account: 32-byte hex storage slot to read too (two-hop, anchored at the PROVEN storageRoot)")
 		jsonOut    = flag.Bool("json", false, "with -get-account: print the read in the engine-API result shape (eljson; one JSON line for the account, plus one for the slot with -slot) to stdout instead of log lines")
 	)
@@ -270,13 +271,23 @@ func classifyReadFailure(ctx context.Context, err error, addr common.Address) er
 // a slot hop that then fails would make one run answer twice, the
 // second time at a newer anchor. No line ever includes a peer's claim
 // without saying so — every printed field comes from a proof leaf,
-// verified against the anchor's root.
+// verified against the anchor root the READ selected (Anchor.ReadSide:
+// the attested head root for the default head read, the finalized pair
+// only for a finalized-side read).
 func printRead(log *slog.Logger, rd *engine.AccountRead) {
 	addr := common.Address(rd.Address).Hex()
+	// The read's OWN side of the anchor, through the same exported
+	// switch the JSON shapes use: a head read prints the attested root
+	// and slot it verified against, a finalized read the finalized
+	// pair. Asking Anchor.StateRoot here would name a root the proof
+	// never touched (PR #889 review).
+	side := rd.Anchor.ReadSide(rd.Head)
 	attrs := []any{
 		"account", addr,
-		"verifiedAt", fmt.Sprintf("0x%x", rd.Anchor.StateRoot),
-		"lcFinalizedSlot", rd.Anchor.BeaconSlot,
+		"verifiedAt", fmt.Sprintf("0x%x", side.Root),
+		"anchor", side.Name,
+		"matchedBeaconSlot", side.MatchedSlot,
+		"blockNumber", side.BlockNumber,
 		"peers", rd.Peers,
 	}
 	switch rd.Outcome.State {
