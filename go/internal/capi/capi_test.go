@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // newStartedHandle makes a handle whose `started` is true WITHOUT a
@@ -209,15 +210,24 @@ func TestCreateReturnCodes(t *testing.T) {
 		t.Errorf("alias \"Xdai\" = %d, want -2 (canonicalizes to gnosis)", h)
 	}
 	// An empty data_dir must be REFUSED (-1), not defaulted: passing
-	// "" would otherwise write nodekey.key into the host process's
+	// "" would otherwise write the node key into the host process's
 	// cwd (PR #827 review — Rust's canonicalize("") fails the same
 	// way and answers -1).
 	if h := Create("mainnet", ""); h != -1 {
 		t.Errorf("empty data_dir = %d, want -1", h)
 	}
+	// The guard is the KEY FILE NAME the engine actually writes —
+	// nodekey.Load persists it as <dir>/nodekey (internal/nodekey
+	// fileName = "nodekey"), NOT nodekey.key. An earlier draft statted
+	// the wrong name, so this assertion could never fail: a regression
+	// that let "" through would drop ./nodekey in this package dir and
+	// the nodekey.key stat would still find nothing. The name is also
+	// ignored repo-wide by .gitignore, so a stray key would not show in
+	// git status either — this stat is the only thing that catches it
+	// (final-PR review, finding 6).
 	cwd, _ := os.Getwd()
-	if _, err := os.Stat(cwd + "/nodekey.key"); err == nil {
-		t.Errorf(`Create("") must not touch the cwd (found nodekey.key there)`)
+	if _, err := os.Stat(cwd + "/nodekey"); err == nil {
+		t.Errorf(`Create("") must not touch the cwd (found nodekey there)`)
 	}
 	// The Go engine reads only its embedded checkpoint: a
 	// caller-supplied root cannot be applied, so it is refused rather
@@ -784,5 +794,56 @@ func TestCapabilitiesGolden(t *testing.T) {
 	if strings.TrimSpace(string(golden)) != string(got) {
 		t.Errorf("capabilities() drifted from testdata/capabilities.json\n golden: %s\n    got: %s",
 			strings.TrimSpace(string(golden)), got)
+	}
+}
+
+// TestRingTruncatesLongLine pins the sink-side byte cap (maxLineBytes):
+// a single line longer than the cap is cut to a bounded, valid-UTF-8
+// prefix plus a marker, so one megabyte error-chunk line cannot sit in
+// the ring and cross JNA whole into the host log. Fails if the cap is
+// removed (line stored whole) or if the cut splits a multibyte rune.
+func TestRingTruncatesLongLine(t *testing.T) {
+	// (a) plain-ASCII overrun: cut lands on a byte boundary exactly at
+	// maxLineBytes, marker appended, kept prefix is exactly that many q.
+	b := &ringBuffer{}
+	long := strings.Repeat("q", maxLineBytes+5000)
+	if _, err := b.Write([]byte(long + "\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if len(b.lines) != 1 {
+		t.Fatalf("want 1 stored line, got %d", len(b.lines))
+	}
+	line := b.lines[0]
+	if !strings.Contains(line, "truncated") {
+		t.Fatalf("long line not marked as truncated: %q…", line[:40])
+	}
+	if !strings.HasPrefix(line, strings.Repeat("q", maxLineBytes)) {
+		t.Fatal("kept prefix shorter than maxLineBytes")
+	}
+	if strings.HasPrefix(line, strings.Repeat("q", maxLineBytes+1)) {
+		t.Fatal("did not truncate — a full extra byte survived")
+	}
+	if !utf8.ValidString(line) {
+		t.Fatal("truncated ASCII line is not valid UTF-8")
+	}
+
+	// (b) multibyte straddle: a 2-byte 'é' (0xC3 0xA9) sitting across
+	// the maxLineBytes boundary must not be cut in half. Fill to
+	// maxLineBytes-1 with 'q' then 'é' then more, so byte maxLineBytes
+	// lands mid-'é'; the RuneStart backoff must drop the partial lead
+	// byte and keep the whole rune.
+	b2 := &ringBuffer{}
+	straddle := strings.Repeat("q", maxLineBytes-1) + "é" + strings.Repeat("q", 3000)
+	if _, err := b2.Write([]byte(straddle + "\n")); err != nil {
+		t.Fatalf("Write straddle: %v", err)
+	}
+	got := b2.lines[0]
+	if !utf8.ValidString(got) {
+		t.Fatalf("rune-boundary cut produced invalid UTF-8: %x", got[maxLineBytes-4:maxLineBytes+4])
+	}
+	// The complete 'é' must be intact somewhere in the kept prefix (the
+	// backoff drops the whole rune, never half of it).
+	if strings.Count(got, "é") > 1 {
+		t.Fatalf("straddle rune duplicated: %q", got)
 	}
 }

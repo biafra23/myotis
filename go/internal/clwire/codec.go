@@ -296,7 +296,17 @@ func decodeErrorChunkMessage(raw []byte, start int) string {
 	// 0 with leftover bytes — Rust surfaces "ServerError — [raw] …"
 	// there too, and "answered ServerError" vs "sent bytes that do not
 	// decode" is the census-grade distinction this function exists for.
-	return "[raw] " + strings.TrimSpace(string(raw[msgStart:]))
+	// Cap the reflected bytes at the spec's 256-byte ceiling — the SAME
+	// bound the snappy branch applies via `bound` above, but which this
+	// branch used to skip: raw is whatever the server sent, up to the
+	// 16 MiB response ceiling, so an uncapped fallback becomes a
+	// multi-megabyte log line in an embedded host (the sink ring now
+	// caps too; this is the source-side fix — final-PR review).
+	tail := raw[msgStart:]
+	if len(tail) > 256 {
+		tail = tail[:256]
+	}
+	return "[raw] " + strings.TrimSpace(string(tail))
 }
 
 // EncodeErrorResponse builds an error response chunk: result ||

@@ -16,13 +16,27 @@ package capi
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 const ringCap = 4096
+
+// maxLineBytes bounds a SINGLE ring line. ringCap bounds the line
+// COUNT but not their size, and one path feeds megabyte-long lines: a
+// corrupt/misbehaving pinned CL server's error-chunk [raw] fallback
+// (clwire.decodeErrorChunkMessage) reflects raw response bytes up to the
+// 16 MiB response ceiling. In the CLI those went to stderr and were
+// gone; here a line lives in this ring until the host drains it, then
+// crosses JNA as one String into the host log files. A few KiB is
+// ample for a slog line, so any longer line is truncated (the source is
+// ALSO capped now — this is the sink-side guard for any future long
+// source; final-PR review).
+const maxLineBytes = 8 * 1024
 
 // ringBuffer is the one shared line store per logger family; views
 // share the pointer. TextHandler performs exactly one Write per
@@ -36,6 +50,16 @@ var _ io.Writer = (*ringBuffer)(nil)
 
 func (b *ringBuffer) Write(p []byte) (int, error) {
 	line := strings.TrimSuffix(string(p), "\n")
+	if len(line) > maxLineBytes {
+		// Cut on a rune boundary so the kept prefix stays valid UTF-8,
+		// then mark how much was dropped. Return len(p) regardless — the
+		// caller (slog) only checks the count it wrote, not what we kept.
+		cut := maxLineBytes
+		for cut > 0 && !utf8.RuneStart(line[cut]) {
+			cut--
+		}
+		line = line[:cut] + fmt.Sprintf("…[truncated %d bytes]", len(line)-cut)
+	}
 	b.mu.Lock()
 	b.lines = append(b.lines, line)
 	if over := len(b.lines) - ringCap; over > 0 {

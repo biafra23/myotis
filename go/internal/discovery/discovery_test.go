@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/discover/v4wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
@@ -155,5 +156,28 @@ func TestCandidateDialEndpoint(t *testing.T) {
 	addr := net.JoinHostPort(n.IP().String(), strconv.Itoa(n.TCP()))
 	if addr != "203.0.113.9:30304" {
 		t.Errorf("dial endpoint = %s", addr)
+	}
+}
+
+// TestCountTableBuckets pins the (total, live) accounting that
+// TableCounts and Stats both share. It drives the pure helper with
+// synthetic buckets so a live routing table need not be constructed;
+// it fails if the live/dead branch or the total count is wrong — e.g.
+// counting dead nodes as live, or flattening buckets incorrectly.
+func TestCountTableBuckets(t *testing.T) {
+	node := func(live bool) discover.BucketNode { return discover.BucketNode{Live: live} }
+	buckets := [][]discover.BucketNode{
+		{},                        // empty bucket
+		{node(true), node(false)}, // one live, one dead
+		{node(true), node(true)},  // two live
+		nil,                       // nil bucket tolerated
+	}
+	total, live := countTableBuckets(buckets)
+	if total != 4 || live != 3 {
+		t.Fatalf("countTableBuckets = (%d,%d), want (4,3)", total, live)
+	}
+	// Empty input must be (0,0), not a panic or a stale count.
+	if total, live := countTableBuckets(nil); total != 0 || live != 0 {
+		t.Fatalf("empty buckets = (%d,%d), want (0,0)", total, live)
 	}
 }

@@ -297,6 +297,24 @@ profile — the shrunken catalog would otherwise prune the shared
 settings' other networks (and it keeps this engine's `nodekey`/`nodedb`
 off the regular profile too).
 
+Peer liveness over long uptime is an embed gap (final-PR review): the
+dialer's bookkeeping came verbatim from the CLI, where a run lasts minutes.
+An endpoint is dialed at most once for the life of the process — the
+`attempted` set (keyed id‖endpoint) is written at dequeue and never
+expires, discovery's `OnDiscovered` fires once per (id, endpoint) and never
+re-fires, and candidates dropped at a full backlog are gone for good. So a
+peer that once answered "too many peers", or whose session died later, is
+never re-dialed; the READY set can only be refilled from endpoints
+discovery has never seen, and once the stable part of a network has been
+tried or dropped, reads lean on node churn, with a handle restart the only
+recovery. `backedOffPeers` reports a constant 0 (no backoff machinery). The
+maps that only grow with uptime (`attempted`, and `discovery.candidates`)
+are likewise unbounded today. This is derived from the code, not yet from a
+multi-day run; the fix (expire `attempted` after a backoff, re-offer live
+table nodes when the READY set has room, bound the growing maps) is a
+dialing-behavior change that wants its own tested change plus a long-run
+check, so it is tracked rather than folded into this PR.
+
 `goBuildCShared` builds with `CGO_CFLAGS="-O2 -D__BLST_PORTABLE__"`
 (portable blst, like the Rust workspace and — since this PR's review —
 `go-engine.yml`, which built bare before: the ADX build's load-time

@@ -238,7 +238,9 @@ func (e *Engine) networkService() *discovery.Service {
 // status surfaces; 0,0 before StartNetwork.
 func (e *Engine) DiscoveryStats() (table, live int) {
 	if disc := e.networkService(); disc != nil {
-		table, live, _ = disc.Stats()
+		// TableCounts, not Stats: this is the hot status path and wants
+		// only these two numbers, so skip Stats' full candidate-map copy.
+		table, live = disc.TableCounts()
 	}
 	return table, live
 }
