@@ -48,6 +48,7 @@ import (
 	"github.com/biafra23/myotis/go/internal/clsync"
 	"github.com/biafra23/myotis/go/internal/engine"
 	"github.com/biafra23/myotis/go/internal/lc"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
@@ -794,12 +795,16 @@ func parseReadBlock(block string) (readSelector, string, bool) {
 		return readSelector{}, permanentErr("a block hash is not supported as the selector: " +
 			"pass a block number or a tag"), true
 	}
-	shown := b
+	// Rune-safe truncation: the twin takes 66 CHARS
+	// (b.chars().take(66), host.rs:2280); a byte cut mid-UTF-8 would
+	// leak a replacement rune into the refusal and drift the message.
+	shown, more := []rune(b), ""
 	if len(shown) > 66 {
-		shown = shown[:66] + "…"
+		shown, more = shown[:66], "…"
 	}
 	return readSelector{}, permanentErr(fmt.Sprintf(
-		"invalid block selector %q (expected latest, pending, finalized or a block number)", shown)), true
+		"invalid block selector %q (expected latest, pending, finalized or a block number)",
+		string(shown)+more)), true
 }
 
 // checkReadWindow mirrors check_call_block (host.rs:2332-2345) and the
@@ -881,7 +886,7 @@ func RequestAccountJSON(handle int64, address, block string) string {
 	}
 	ctx, cancel := context.WithTimeout(lifetime, ReadBudget)
 	defer cancel()
-	rd, err := e.eng.Account(ctx, address, [32]byte{}, false, sel.head)
+	rd, err := e.eng.Account(ctx, engine.Read{Address: address, Head: sel.head})
 	if err != nil {
 		return classifyReadErr("account read", err)
 	}
@@ -952,7 +957,94 @@ func GetStorageProofJSON(handle int64, address string, slot int64, holder string
 	defer e.reads.Done()
 	ctx, cancel := context.WithTimeout(lifetime, ReadBudget)
 	defer cancel()
-	rd, err := e.eng.Account(ctx, address, key, true, true)
+	rd, err := e.eng.Account(ctx, engine.Read{Address: address, Slot: key, WantSlot: true, Head: true})
+	if err != nil {
+		return classifyReadErr("storage read", err)
+	}
+	out, err := rd.StorageJSON(time.Now().Unix())
+	if err != nil {
+		return classifyReadErr("storage read", err)
+	}
+	return out
+}
+
+// parseWord32 mirrors host.rs's parse_word32: optional 0x/0X prefix,
+// then EXACTLY 64 ASCII hex digits — no short forms, no odd lengths,
+// no signs or whitespace between. Used for the raw storage position.
+func parseWord32(hex string) ([32]byte, bool) {
+	h := strings.TrimPrefix(strings.TrimPrefix(hex, "0x"), "0X")
+	if len(h) != 64 {
+		return [32]byte{}, false
+	}
+	var out [32]byte
+	for i := 0; i < 32; i++ {
+		hi, ok1 := hexDigit(h[2*i])
+		lo, ok2 := hexDigit(h[2*i+1])
+		if !ok1 || !ok2 {
+			return [32]byte{}, false
+		}
+		out[i] = hi<<4 | lo
+	}
+	return out, true
+}
+
+func hexDigit(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// GetStorageAtJSON is myotis_get_storage_at_json: one verified read of a
+// RAW 32-byte storage position at a block selector — the
+// eth_getStorageAt counterpart. It is NOT GetStorageProofJSON: the
+// proof export takes the ERC-20 mapping fold (slot + holder, the
+// operator `get-storage <token> <slot> <holder>` integration) and has
+// no selector (the header says so, and the twin agrees:
+// get_storage_proof_json is selector-less head, while
+// get_storage_at_json parses the selector and applies read_anchor,
+// host.rs:1933). The selector vocabulary and its refusals are the
+// account read's (parseReadBlock / checkReadWindow), and the position
+// parse refusals are the twin's RETRYABLE error_json shape (host.rs
+// get_storage_at_json returns error_json for a malformed address or
+// position — the request's shape error, but the twin's channel, kept
+// per-key honest rather than "improved").
+func GetStorageAtJSON(handle int64, address, position, block string) string {
+	// Request-shape faults first, in the twin's order (address,
+	// position, selector), before the handle lookup.
+	if !common.IsHexAddress(address) {
+		return retryableErr("invalid address (expected 20-byte hex)")
+	}
+	key, ok := parseWord32(position)
+	if !ok {
+		return retryableErr("invalid storage position (expected 32-byte hex)")
+	}
+	sel, msg, refused := parseReadBlock(block)
+	if refused {
+		return msg
+	}
+	e, lifetime, started, exists := beginRead(handle)
+	if !exists {
+		return retryableErr("go engine: unknown handle")
+	}
+	if !started {
+		return retryableErr("go engine: handle not started (myotis_start)")
+	}
+	defer e.reads.Done()
+	if sel.pinnedSet {
+		a, have := e.eng.Anchor()
+		if rj, _, bad := checkReadWindow(sel, a.OptimisticExecNo, have); bad {
+			return rj
+		}
+	}
+	ctx, cancel := context.WithTimeout(lifetime, ReadBudget)
+	defer cancel()
+	rd, err := e.eng.Account(ctx, engine.Read{Address: address, Slot: key, WantSlot: true, Head: sel.head})
 	if err != nil {
 		return classifyReadErr("storage read", err)
 	}

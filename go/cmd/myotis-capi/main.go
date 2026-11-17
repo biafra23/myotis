@@ -161,7 +161,7 @@ func myotis_get_code_json(h C.int64_t, a, b *C.cchar_t) *C.char {
 
 //export myotis_get_storage_at_json
 func myotis_get_storage_at_json(h C.int64_t, a, p, b *C.cchar_t) *C.char {
-	return cstr(capi.Unsupported("myotis_get_storage_at_json"))
+	return cstr(capi.GetStorageAtJSON(int64(h), gostrC(a), gostrC(p), gostrC(b)))
 }
 
 //export myotis_get_proof_json

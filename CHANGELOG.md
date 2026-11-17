@@ -39,19 +39,29 @@ its trust anchors and release checks.
   head state root instead of the beacon-finalized one — the trust
   position moves from the finality checkpoint to the sync-committee
   attestation of the head (both anchors come from the same signed
-  update; neither is a peer claim), and read freshness moves with it
-  from ~13–19 minutes to seconds. `finalized` stays APPLIED as its own
-  read (never mapped to the head); a near-head number is served from
-  head state inside the shared `RpcBlockWindow` (±64/16, enforced twice:
-  JVM adapter and engine); `safe`/`earliest` stay refused (#366).
-  Results report `anchor:"head"` with the attested slot's
-  `matchedBeaconSlot` and the head block's proven coordinates;
-  `eth_blockNumber` answers the optimistic head; the readiness dot ages
-  from the attested slot. Remaining divergence from the Rust twin,
-  documented: no `fresh_head`/header-chain fallback — a peer that
-  cannot serve the attested head loses the attempt and the read retries
-  at the next publish (the Go engine never reads at a root only a peer
-  names, even a header-chain-verified one).
+  update; neither is a peer claim), and read freshness improves from
+  ~13–19 minutes to at most one ~6.4-minute epoch — the attested
+  header rides the finality-update poll, which CLs regenerate once per
+  finalized checkpoint; the twin's seconds-fresh head needs the
+  per-slot optimistic-update poll, still the next increment.
+  `finalized` stays APPLIED as its own read (never mapped to the head);
+  a near-head number is served from head state inside the shared
+  `RpcBlockWindow` (±64/16, checked in the JVM adapter and again in the
+  engine; a refused number reaches a wallet as the typed channels'
+  retryable null until the `:myotis-api` refused-channel exists — the
+  engine's own permanent −32602 answers direct C-ABI callers);
+  `safe`/`earliest` stay refused (#366). `eth_getStorageAt` gained the
+  twin's dedicated export (`myotis_get_storage_at_json`: full 32-byte
+  positions with the selector APPLIED — hashed mapping slots ≥2^64 are
+  servable again; the int64 slot stays only on the operator
+  mapping-proof path). Results report `anchor:"head"` with the attested
+  slot's `matchedBeaconSlot` and the head block's proven coordinates;
+  `eth_blockNumber` answers the optimistic head; the readiness dot
+  ages from the attested slot. Remaining divergences from the Rust
+  twin, documented: no `fresh_head`/header-chain fallback (the Go
+  engine never reads at a root only a peer names, even a
+  header-chain-verified one) and no per-slot optimistic-update poll
+  yet.
 
 ### Fixed
 

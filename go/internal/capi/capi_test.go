@@ -992,3 +992,63 @@ func TestReadWindowConstantsMatchRustEngine(t *testing.T) {
 	pin("CALL_BLOCK_LAG_TOLERANCE", callBlockLagTolerance)
 	pin("CALL_BLOCK_AHEAD_TOLERANCE", callBlockAheadTolerance)
 }
+
+// --- myotis_get_storage_at_json: functional since the head-anchor
+// change (it used to be a named refusal). Request-shape discipline is
+// the twin's get_storage_at_json: address and position refusals are the
+// twin's error_json (retryable), the selector's are parseReadBlock's
+// permanent — all BEFORE the handle lookup. ---
+
+func TestStorageAtJSONRefusalShapes(t *testing.T) {
+	const addr = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+	const pos = "0x0000000000000000000000000000000000000000000000000000000000000007"
+
+	m := decode(t, GetStorageAtJSON(424242, "0xnope", pos, "latest"))
+	if _, has := m["code"]; has {
+		t.Errorf("malformed address is the twin's error_json (retryable), got %v", m)
+	}
+	if !strings.Contains(m["error"].(string), "invalid address") {
+		t.Errorf("want the twin's address refusal: %v", m["error"])
+	}
+	m = decode(t, GetStorageAtJSON(424242, addr, "0xdeadbeef", "latest"))
+	if _, has := m["code"]; has {
+		t.Errorf("malformed position is the twin's error_json (retryable), got %v", m)
+	}
+	if !strings.Contains(m["error"].(string), "invalid storage position") {
+		t.Errorf("want the twin's position refusal: %v", m["error"])
+	}
+	m = decode(t, GetStorageAtJSON(424242, addr, pos, "safe"))
+	if m["code"] != float64(-32602) {
+		t.Errorf("safe selector must be permanent, got %v", m)
+	}
+	// A fully-formed request passes every shape gate and meets handle
+	// state (unknown handle → retryable): position 64-hex (upper too),
+	// selector finalized.
+	if w, ok := parseWord32("0X" + "AB" + strings.Repeat("0", 62)); !ok || w[0] != 0xAB {
+		t.Errorf("parseWord32 must take 0X + mixed case: %x %v", w, ok)
+	}
+	for _, bad := range []string{"0x7", "7", "0x" + strings.Repeat("g", 64), pos + "00"} {
+		if _, ok := parseWord32(bad); ok {
+			t.Errorf("parseWord32(%q) must refuse (no short forms, no width drift)", bad)
+		}
+	}
+	m = decode(t, GetStorageAtJSON(424242, addr, pos, "finalized"))
+	if _, has := m["code"]; has {
+		t.Errorf("servable request on an unknown handle must be retryable, got %v", m)
+	}
+}
+
+// The generic selector refusal echoes the selector truncated to 66
+// CHARS like the twin (host.rs b.chars().take(66)) — rune-safe, so a
+// multi-byte selector cannot leak a replacement rune into the message.
+func TestSelectorRefusalEchoIsRuneSafe(t *testing.T) {
+	m := decode(t, RequestAccountJSON(424242,
+		"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", strings.Repeat("é", 100)))
+	msg, _ := m["error"].(string)
+	if strings.ContainsRune(msg, utf8.RuneError) {
+		t.Errorf("truncation cut a rune in half: %q", msg)
+	}
+	if !strings.Contains(msg, "…\"") {
+		t.Errorf("over-long selector must carry the twin's ellipsis: %q", msg)
+	}
+}

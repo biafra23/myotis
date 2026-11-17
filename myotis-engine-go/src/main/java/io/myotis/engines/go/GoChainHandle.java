@@ -57,9 +57,15 @@ import java.util.List;
  *       publish with the peers not yet tried (go/README.md §Deliberate
  *       cuts). Verified-head age is the anchor's TRUE wall-clock age —
  *       seconds since the attested slot's wall time, from the catalog's CL
- *       genesis (PR #832 review); with the head anchor that is seconds, so
- *       the hosts' 45 s readiness dot goes green as it does on the Rust
- *       engine, and the age only goes amber when attestation itself lags.</li>
+ *       genesis (PR #832 review). It is NOT yet the Rust twin's
+ *       seconds-fresh head: the engine's attested header rides the
+ *       FINALITY-update poll, and CLs regenerate that update when the
+ *       finalized checkpoint moves (~once per ~6.4 min epoch), so the age
+ *       saw-tooths from seconds to a few minutes and the hosts' 45 s
+ *       readiness dot reads green at the top of each epoch, amber after —
+ *       the honest age of an anchor that old. Closing the last of the gap
+ *       is porting the per-slot optimistic-update poll (the next engine-
+ *       parity increment, go/README.md §Parts), not rounding this number.</li>
  *   <li><b>No EVM, no block/tx/receipt reads, no ENS, no log index.</b> The
  *       operator queries throw {@link EngineException} (the Rust twin's
  *       NOT_AVAILABLE rule), {@link #ens()} answers an API that throws the same
@@ -496,12 +502,15 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         // from before the head-anchor parity change, or an old library,
         // reports optimisticSlot 0). The slot's wall time comes from the
         // catalog's CL genesis (PR #832 review): with the head anchor a
-        // healthy run ages SECONDS and the hosts' 45 s readiness dot goes
-        // green on merit, exactly like the Rust twin's; the amber band
-        // returns only when attestation itself lags. Without catalog values
-        // (test seams) the age falls back to the Rust-twin advance-stamp
-        // clock: pinning to "now" while not serveable so a serving stretch
-        // starts fresh instead of leaking the outage gap in.
+        // healthy run ages from seconds at the top of an epoch up to the
+        // finality-update cadence (~6.4 min) at its bottom — the attested
+        // header rides the finality-update poll, which CLs regenerate once
+        // per finalized checkpoint — so the readiness dot saw-tooths with
+        // it, honestly, until the per-slot optimistic-update poll lands.
+        // Without catalog values (test seams) the age falls back to the
+        // Rust-twin advance-stamp clock: pinning to "now" while not
+        // serveable so a serving stretch starts fresh instead of leaking
+        // the outage gap in.
         long anchorBlock = s.optimisticBlockNumber() > 0
                 ? s.optimisticBlockNumber() : s.finalizedBlockNumber();
         long anchorSlot = s.optimisticSlot() > 0 ? s.optimisticSlot() : s.finalizedSlot();
@@ -831,6 +840,52 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
                         handle, hexAddress, slot, holderHexOrNull)),
                 "storage");
         return storageFromJson(hexAddress, slot, holderHexOrNull, o);
+    }
+
+    /**
+     * Verified read of a RAW 32-byte storage position at a block selector
+     * ({@code eth_getStorageAt}, the Go twin of
+     * {@code RustChainHandle.storageAtVerified}): the engine APPLIES the
+     * selector (head tags at the attested root, {@code finalized} at the
+     * finalized root, near-head numbers from head state — the window
+     * enforced engine-side too) and permanently refuses what it cannot.
+     * Returns the full 32-byte word, or null when the read produced no
+     * verdict (failReason set) — never throws at the adapter (the
+     * {@link EngineException} from {@code gated} is contained there).
+     */
+    byte[] storageAtVerified(String hexAddress, String position32Hex, String block) {
+        return storageValueFromJson(gated(() -> GoEngineNative.nativeGetStorageAtJson(
+                handle, hexAddress, position32Hex, block)));
+    }
+
+    /** The one decode of a Go storage JSON into the 32-byte word
+     *  (engine-parity with the Rust twin's same-named method): a read
+     *  without a verifyMethod carries no verdict → null; a proven-zero
+     *  slot (valueHex null) is the all-zero word; a value wider than a
+     *  word is shape drift — throw, never truncate into a different
+     *  word (the #314 rule on the value's own width). */
+    static byte[] storageValueFromJson(String json) {
+        JsonObject o = parseResultOrThrow(json, "storage");
+        try {
+            if (stringOrNull(o, "verifyMethod") == null) return null; // unverified → can't answer
+            // valueHex is the big-endian value MINIMAL (the Go reader's
+            // mpt.DecodeStorageLeaf rejects leading zeros — slot 42 arrives
+            // as "0x2a"), or null when the slot is proven zero. The pad is
+            // the ONE shared implementation (GoVerifiedReads.toWord, pinned
+            // by the width test); a null value is the all-zero word, and a
+            // value wider than 32 bytes is shape drift — throw, never
+            // truncate into a different word (the #314 rule on the value's
+            // own width).
+            String valueHex = stringOrNull(o, "valueHex");
+            if (valueHex == null) return new byte[32];
+            byte[] word = GoVerifiedReads.toWord(valueHex);
+            if (word == null) {
+                throw new EngineException("storage value exceeds 32 bytes: " + valueHex);
+            }
+            return word;
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed storage JSON from the Go engine: " + e.getMessage(), e);
+        }
     }
 
     /** The holder shape the Go {@code storageKey} folds: an optional {@code 0x}

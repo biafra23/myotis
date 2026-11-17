@@ -61,6 +61,35 @@ func (a Anchor) ReadRoot(head bool) [32]byte {
 	return a.StateRoot
 }
 
+// readSide is the ONE switch that says which side of the anchor a read
+// reports — root, matched slot, block coordinates and the anchor name
+// are decided here and nowhere else, so the account and storage shapes
+// can never drift on which block they claim to have read (the twin
+// decides it once too, in read_anchor/verify.rs).
+type readSide struct {
+	Root        [32]byte
+	MatchedSlot int64
+	BlockNumber uint64
+	Timestamp   uint64
+	BlockHash   [32]byte
+	Name        string
+}
+
+func (a Anchor) readSide(head bool) readSide {
+	if head {
+		return readSide{
+			Root: a.OptimisticStateRoot, MatchedSlot: int64(a.OptimisticSlot),
+			BlockNumber: a.OptimisticExecNo, Timestamp: a.OptimisticExecTimestamp,
+			BlockHash: a.OptimisticExecHash, Name: "head",
+		}
+	}
+	return readSide{
+		Root: a.StateRoot, MatchedSlot: int64(a.BeaconSlot),
+		BlockNumber: a.ExecNumber, Timestamp: a.ExecTimestamp,
+		BlockHash: a.ExecBlockHash, Name: "finalized",
+	}
+}
+
 // SlotRead is one proven storage-slot outcome. Value nil means PROVEN
 // zero — either the account is absent or its storageRoot is the empty
 // trie, so no leaf walk was needed (or possible); both are proofs, not
@@ -168,28 +197,19 @@ func (r *AccountRead) AccountJSON(nowUnix int64) (string, error) {
 
 func (r *AccountRead) buildAccount(nowUnix int64) (accountJSON, error) {
 	a := r.Anchor
-	// Which proven side of the anchor the READ ran at (the Rust twin
-	// reports the same split: verify.rs head reads match at the
-	// attested slot via the anchor's optimistic root, reader.rs
-	// snap_account_at_best_root; finalized reads at the finalized
-	// slot). The read's own root, block coordinates and matched slot
-	// all follow the flag; the finalizedBlockNumber / beaconSynced
+	// The read's proven side of the anchor comes from the ONE switch
+	// (Anchor.readSide — the twin settles the same question once, in
+	// read_anchor/verify.rs); the finalizedBlockNumber / beaconSynced
 	// diagnostics always describe the FINALIZED side, as they do in
 	// the twin's shape.
-	readRoot, matched, blockNum, blockTs, blockHash, anchorName :=
-		a.StateRoot, int64(a.BeaconSlot), a.ExecNumber, a.ExecTimestamp, a.ExecBlockHash, "finalized"
-	if r.Head {
-		readRoot, matched, blockNum, blockTs, blockHash, anchorName =
-			a.OptimisticStateRoot, int64(a.OptimisticSlot), a.OptimisticExecNo,
-			a.OptimisticExecTimestamp, a.OptimisticExecHash, "head"
-	}
+	side := a.readSide(r.Head)
 	c := accountJSON{
 		Address:              r.AddressHex,
-		PeerStateRootHex:     hexHash(readRoot),
+		PeerStateRootHex:     hexHash(side.Root),
 		PeerProofValid:       true,
 		BeaconChainVerified:  true,
 		BlsVerified:          true,
-		MatchedBeaconSlot:    matched,
+		MatchedBeaconSlot:    side.MatchedSlot,
 		VerifyMethod:         strPtr(accountVerifyMethod),
 		ProofNodesHex:        []string{},
 		BeaconSynced:         beaconSynced(a.BeaconSlot, nowUnix),
@@ -197,10 +217,10 @@ func (r *AccountRead) buildAccount(nowUnix int64) (accountJSON, error) {
 		WallClockPeriod:      chain.SyncCommitteePeriod(chain.ConsensusMainnet().SlotAt(nowUnix)),
 		FinalizedBlockNumber: a.ExecNumber,
 		OptimisticBlockNum:   a.OptimisticExecNo,
-		BlockNumber:          blockNum,
-		BlockTimestamp:       blockTs,
-		BlockHash:            hexHash(blockHash),
-		Anchor:               anchorName,
+		BlockNumber:          side.BlockNumber,
+		BlockTimestamp:       side.Timestamp,
+		BlockHash:            hexHash(side.BlockHash),
+		Anchor:               side.Name,
 	}
 	switch r.Outcome.State {
 	case snapwire.AccountFound:
@@ -278,15 +298,12 @@ func (r *AccountRead) StorageJSON(nowUnix int64) (string, error) {
 	}
 	a := r.Anchor
 	s := r.Slot
-	// The read's side of the anchor drives matchedBeaconSlot,
-	// peerBlockNumber and anchor exactly as buildAccount's split does
-	// (the twin's storage reads run at the verified head,
-	// reader.rs get_storage; peerBlockNumber is the anchor's number for
-	// the served read, host.rs:6620-6623 — never a raw peer claim).
-	matched, peerBlock, anchorName := int64(a.BeaconSlot), a.ExecNumber, "finalized"
-	if r.Head {
-		matched, peerBlock, anchorName = int64(a.OptimisticSlot), a.OptimisticExecNo, "head"
-	}
+	// The read's side of the anchor comes from the same single switch
+	// buildAccount uses (Anchor.readSide — the twin's storage reads run
+	// at the verified head, reader.rs get_storage; peerBlockNumber is
+	// the anchor's number for the served read, host.rs:6620-6623 —
+	// never a raw peer claim).
+	side := a.readSide(r.Head)
 	out := storageJSON{
 		AddressHex:           r.AddressHex, // echoed as supplied, as the twin
 		HolderHex:            nil,
@@ -299,15 +316,15 @@ func (r *AccountRead) StorageJSON(nowUnix int64) (string, error) {
 		BeaconSynced:         beaconSynced(a.BeaconSlot, nowUnix),
 		BeaconChainVerified:  true,
 		BlsVerified:          true,
-		MatchedBeaconSlot:    matched,
+		MatchedBeaconSlot:    side.MatchedSlot,
 		VerifyMethod:         strPtr(accountVerifyMethod),
-		PeerBlockNumber:      peerBlock,
+		PeerBlockNumber:      side.BlockNumber,
 		FinalizedBlockNumber: a.ExecNumber,
 		OptimisticBlockNum:   a.OptimisticExecNo,
 		FinalizedSlot:        a.BeaconSlot,
 		OptimisticSlot:       a.OptimisticSlot,
 		MaxHeaderChainGap:    8192,
-		Anchor:               anchorName,
+		Anchor:               side.Name,
 	}
 	// The slot INDEX the RPC carries (the shape's "slot" is the numeric
 	// selector; the 32-byte key's high bits must be zero for it to

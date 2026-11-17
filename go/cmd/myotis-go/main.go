@@ -183,7 +183,9 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 
 	// Head read by default, twin parity (the Rust CLI / engine answer
 	// "get-account" at the verified head).
-	rd, err := e.Account(readCtx, getAccount, wantSlot, slotHex != "", true)
+	rd, err := e.Account(readCtx, engine.Read{
+		Address: getAccount, Slot: wantSlot, WantSlot: slotHex != "", Head: true,
+	})
 	close(readDone)
 	<-sumDone
 	if err != nil {
