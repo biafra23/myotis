@@ -151,8 +151,9 @@ Key Gradle modules:
   paths in the daemon, desktop, and Android don't import engine internals
   (node-core/networking/consensus types). Composition roots use the `:myotis-engines`
   selector (`Engines.engine()`; `myotis.engine=java|rust|go|auto`, default auto —
-  `-Pengine=…` on run tasks), which routes to the Java engine (node-core) or the
-  Rust engine (rust/myotis-engine via UniFFI + JSON). The engine library's default
+  `-Pengine=…` on run tasks), which routes to the Java engine (node-core), the
+  Rust engine (rust/myotis-engine via UniFFI + JSON), or the Go engine
+  (`:myotis-engine-go`; explicit only, `auto` never picks it). The engine library's default
   port actuals (`io.myotis.engine.ports`, `:myotis-engine-ports` — `Myotis.defaultPorts`)
   are part of the library's public surface, not engine internals: a host may build its
   `EnginePorts` from them, as the Android app does. Documented exemptions: the
@@ -168,8 +169,9 @@ Key Gradle modules:
   own transaction broadcast (`Tor` —
   docs/how-it-works/privacy-and-tor.md; Rust-engine-only, gated behind the Rust-engine
   toggle, and behind the `-PtorEngine` build flag that links Arti into the host
-  dylib and the Android jniLibs), the Rust log drain (`Engines.drainRustLogs` —
-  hosts pump the engine's tracing ring into their log pipeline), and the Status
+  dylib and the Android jniLibs), the native log drain (`Engines.drainRustLogs` —
+  despite the name it drains BOTH engines' tracing rings, Rust and Go, into the
+  hosts' log pipeline, routed per the selector's actual engine), and the Status
   screen's per-network engine badge (`Engines.engineKindFor`) — internal
   seams, deliberately not on the API; and `:app`'s
   `testing/MainnetPeerBootstrap` (an integration-test fixture).
