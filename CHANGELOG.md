@@ -19,6 +19,12 @@ its trust anchors and release checks.
 
 ## [Unreleased]
 
+### Added
+
+- Docs: verifying deep blocks, an analysis of reads beyond the 512-block
+  window with a measured survey of which peers still serve old blocks
+  (#882).
+
 ### Fixed
 
 - `scripts/verify_release.sh` resolves the commit of a release tag again.

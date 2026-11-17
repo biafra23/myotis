@@ -75,6 +75,7 @@ that gets built moves to `design-history/`, and its user-facing behaviour gets a
 - [address-history-plan.md](ideas/address-history-plan.md): what is missing for Punicus to show any address's past transactions through Myotis, split into workstreams for implementation plans.
 - [base-l2-evaluation.md](ideas/base-l2-evaluation.md): Base (Coinbase's L2) on Myotis, an evaluation.
 - [dapp-browser-design.md](ideas/dapp-browser-design.md): a dApp browser and RPC interception (phase 0 built as #502).
+- [deep-block-verification.md](ideas/deep-block-verification.md): verifying any historical block with a bundled checkpoint table and a header walk, with measured peer availability.
 - [inbound-connections.md](ideas/inbound-connections.md): accepting inbound devp2p connections.
 - [logindex-verified-bundle-design.md](ideas/logindex-verified-bundle-design.md): downloadable log-index bundles the walker verifies (#472).
 - [react-native.md](ideas/react-native.md): a React Native bridge for Android and iOS.
