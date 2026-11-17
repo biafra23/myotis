@@ -10,7 +10,7 @@ cryptography solves it, because the forgery is valid cryptography. Only a
 fresh anchor from outside the chain does.
 
 So when a network's anchor is older than the weak-subjectivity bound (13
-periods on mainnet and Sepolia, 3 on Gnosis), the Rust and Java engines park
+periods on mainnet and Sepolia, 3 on Gnosis), the engines park
 it in `STALE_ANCHOR` and the app asks the user what to do.
 
 ## The two choices
@@ -54,6 +54,12 @@ exactly what the bound exists to stop.
 - The **Java engine** has no fetch: its dialog offers only "continue", and of
   the remembered choices it applies only "continue" (as a pre-consent for the
   run); `setStaleAnchorPolicy` returns false for "checkpoint".
+- The **Go engine** (desktop only, `-Pengine=go`) has no fetch either: its
+  dialog offers only "continue"; `setStaleAnchorPolicy` applies "ask" and
+  "continue" (leaving a remembered "continue" withdraws its consent, as on the
+  Rust engine) and returns false for "checkpoint". Known gap: a refusal at its
+  in-run gate stalls the loop instead of parking it again (go/README.md,
+  *Desktop embed*).
 
 ## Fresh checkpoint
 

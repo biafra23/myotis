@@ -16,7 +16,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The selector's Ktor listener behind the Rust engine's {@code LoopbackRpc} port:
+ * The selector's Ktor listener behind the shared {@code LoopbackRpc} port
+ * ({@code :myotis-engine-common}, used by the Rust and Go engines alike):
  * it binds the loopback port it is given, answers HTTP there, reports its live
  * state, applies the web-page policy before and after start, and refuses a port
  * that is taken with the {@link IOException} the handle logs and continues on.

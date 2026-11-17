@@ -10,6 +10,7 @@ import io.myotis.api.ports.EnginePeerCache;
 import io.myotis.api.ports.EnginePorts;
 import io.myotis.api.ports.NodeKeyStore;
 import io.myotis.api.ports.ServedRange;
+import io.myotis.engines.go.GoMyotisEngine;
 import io.myotis.engines.rust.RustMyotisEngine;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.junit.jupiter.api.AfterEach;
@@ -107,6 +108,35 @@ class SelectorEngineTest {
         assertTrue(ex.getMessage().contains("myotis.engine=rust"),
                 "unexpected message: " + ex.getMessage());
         assertThrows(EngineException.class, () -> e.create(config("mainnet"), ports()));
+    }
+
+    @Test
+    void goIsAValidChoiceButAutoNeverPicksIt() {
+        // The normalize list grew "go" (part 1c); a typo still falls back to auto.
+        Engines.select("go");
+        assertEquals("go", Engines.choice());
+        Engines.select("cobol");
+        assertEquals("auto", Engines.choice());
+        // auto resolves via Rust/Java regardless of the Go library's presence —
+        // the catalog answer proves the resolution touched neither go fallback.
+        Engines.select("auto");
+        assertEquals(4, Engines.engine().availableNetworks().size());
+    }
+
+    @Test
+    void explicitGoWithoutLibraryThrowsNamedError() {
+        // With the library present the refusal path is untestable here (and the
+        // go-backed create is the go module's own native test's job).
+        org.junit.jupiter.api.Assumptions.assumeFalse(GoMyotisEngine.isAvailable(),
+                "libmyotis_engine_go loaded — refusal path not applicable");
+        Engines.select("go");
+        MyotisEngine e = Engines.engine();
+        EngineException ex = assertThrows(EngineException.class, e::availableNetworks);
+        assertTrue(ex.getMessage().contains("myotis.engine=go"),
+                "unexpected message: " + ex.getMessage());
+        assertThrows(EngineException.class, () -> e.create(config("mainnet"), ports()));
+        // And unlike auto, an explicit go never silently falls back to Java.
+        assertNull(Engines.engineKindFor("mainnet"));
     }
 
     @Test

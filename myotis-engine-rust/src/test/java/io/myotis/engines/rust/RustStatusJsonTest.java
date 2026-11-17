@@ -1,5 +1,6 @@
 package io.myotis.engines.rust;
 
+import io.myotis.engines.common.LoopbackRpc;
 import io.myotis.api.BeaconState;
 import io.myotis.api.BeaconStatus;
 import io.myotis.api.DataUsage;

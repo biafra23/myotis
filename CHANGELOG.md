@@ -25,6 +25,15 @@ its trust anchors and release checks.
   window with a measured survey of which peers still serve old blocks
   (#882).
 
+### Changed
+
+- Engine library: the shared `LoopbackRpc` JSON-RPC listener port moved from
+  `:myotis-engine-rust` to `:myotis-engine-common`, so the Go engine
+  (`:myotis-engine-go`) takes the same loopback listener without either engine
+  module depending on the other. Both modules are published, so a consumer that
+  reached `LoopbackRpc` through `:myotis-engine-rust` now gets it through
+  `:myotis-engine-common` (the Go-engine embed, #832).
+
 ### Fixed
 
 - `scripts/verify_release.sh` resolves the commit of a release tag again.

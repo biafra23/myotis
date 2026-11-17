@@ -553,8 +553,9 @@ private fun StaleAnchorChoiceSection(settings: Settings, controller: NodeControl
  *
  * A remembered checkpoint runs as soon as the dialog opens; if it is refused, the dialog
  * stays with both choices (and the other may be remembered instead). A remembered
- * "continue" never shows the dialog (NodeScreen consents directly). The Java engine has
- * no fetch, so it offers only "continue".
+ * "continue" never shows the dialog (NodeScreen consents directly). Engines without the
+ * fetch — the Java engine, and the Go engine until its checkpoint client lands — offer
+ * only "continue" (the Go refusal is pinned by `theGoEngineOffersOnlyContinue`).
  */
 @Composable
 private fun StaleAnchorDialog(
@@ -570,7 +571,12 @@ private fun StaleAnchorDialog(
     onDismiss: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
-    val fetchOffered = s.engine != "java"
+    // Engines without the checkpoint fetch offer only "continue": the Java
+    // engine never has it, and the Go engine refuses it by name
+    // (GoChainHandle.refreshAnchorFromCheckpointz relays the library's own
+    // no-fetch refusal, capabilities anchorRefresh:false), so a "Fresh
+    // checkpoint" button there could only ever fail (PR #877 review).
+    val fetchOffered = s.engine != "java" && s.engine != "go"
     var busy by remember(network) { mutableStateOf(false) }
     var status by remember(network) { mutableStateOf<String?>(null) }
     var rememberChoice by remember(network) { mutableStateOf(false) }
