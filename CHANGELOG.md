@@ -33,6 +33,47 @@ its trust anchors and release checks.
   module depending on the other. Both modules are published, so a consumer that
   reached `LoopbackRpc` through `:myotis-engine-rust` now gets it through
   `:myotis-engine-common` (the Go-engine embed, #832).
+- Go engine: verified reads now run at the optimistic head, as the Rust
+  engine does. The default (empty/`latest`) account, storage and
+  `eth_*`-adapter reads verify against the light client's BLS-ATTESTED
+  head state root instead of the beacon-finalized one — the trust
+  position moves from the finality checkpoint to the sync-committee
+  attestation of the head. Both anchors come from the same signed
+  update and their bytes are no peer claim, but WHICH attested header
+  counts as the head is ordered by the unauthenticated `signature_slot`
+  (#774): one polled CL pin can roll the head side back to an earlier
+  header of the current committee period and hold it there until the
+  period rolls — staleness or denial of the default read, never
+  forgery, and the finalized side keeps advancing beside it; the
+  spec-style guards that would close it change all three engines'
+  comparator and are the owner's call. Read freshness improves from
+  ~13–19 minutes to near-slot freshness: the head is the attested
+  header of the finality update polled once per slot, which CL servers
+  answer freshly (same mechanism and the same bound as the Rust twin —
+  ~1–2 slots behind wall clock), with the finalized side of every
+  result staying honest at the last proven checkpoint.
+  `finalized` stays APPLIED as its own read (never mapped to the head);
+  a near-head number is served from head state inside the shared
+  `RpcBlockWindow` (±64/16, checked in the JVM adapter and again in the
+  engine; a refused number reaches a wallet as the typed channels'
+  retryable null until the `:myotis-api` refused-channel exists — the
+  engine's own permanent −32602 answers direct C-ABI callers);
+  `safe`/`earliest` stay refused (#366). `eth_getStorageAt` gained the
+  twin's dedicated export (`myotis_get_storage_at_json`: full 32-byte
+  positions with the selector APPLIED — hashed mapping slots ≥2^64 are
+  servable again; the int64 slot stays only on the operator
+  mapping-proof path). Results report `anchor:"head"` with the attested
+  slot's `matchedBeaconSlot` and the head block's proven coordinates;
+  `eth_blockNumber` answers the optimistic head; the readiness dot
+  ages from the attested slot. Remaining divergence from the Rust
+  twin, documented: no `fresh_head`/header-chain fallback (the Go
+  engine never reads at a root only a peer names, even a
+  header-chain-verified one). Both engines source the head the same
+  way — the attested header of the once-per-slot finality poll — so
+  neither runs a separate per-slot optimistic-update poll (neither
+  ever requested, per `docs/how-it-works/verification.md`); polling
+  one is a possible future improvement for BOTH engines, not a gap of
+  Go against the twin.
 
 ### Fixed
 

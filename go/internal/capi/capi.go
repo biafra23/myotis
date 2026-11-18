@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -47,6 +48,7 @@ import (
 	"github.com/biafra23/myotis/go/internal/clsync"
 	"github.com/biafra23/myotis/go/internal/engine"
 	"github.com/biafra23/myotis/go/internal/lc"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
@@ -726,32 +728,161 @@ func capabilities() map[string]bool {
 
 func hexHash(b [32]byte) string { return "0x" + hex.EncodeToString(b[:]) }
 
-// blockPolicies: what the header's block-selector contract (v32) means
-// for an engine that reads ONLY at the beacon-finalized anchor.
-// "finalized" is applied; the head tags would need verified head state
-// this engine does not read, so they are REFUSED permanently with the
-// way forward named — never accepted and answered at a different
-// block than asked (the #314 / CLAUDE.md rule in its purest form).
-func accountBlockErr(block string) (string, bool) {
-	switch strings.ToLower(strings.TrimSpace(block)) {
-	case "finalized":
-		return "", false
-	case "":
-		// The header maps NULL/"" to the verified HEAD — an engine that
-		// cannot read head must refuse it, not silently finalize.
-		return permanentErr("go engine: the empty block selector means the verified head (myotis_engine.h v32), which this engine does not read; pass \"finalized\""), true
-	default:
-		return permanentErr(fmt.Sprintf("go engine: block selector %q needs verified head state; this engine reads only \"finalized\"", block)), true
-	}
+// The near-head window a NUMBERED read pin still runs at head state, the
+// twin's constants (host.rs CALL_BLOCK_LAG_TOLERANCE:2203 /
+// CALL_BLOCK_AHEAD_TOLERANCE:2207, which mirror RpcBlockWindow's Kotlin
+// pair). A Go-side test pins both to the Rust source so a drift on
+// either side fails a build, the way GoAbiVersionMirrorTest pins the ABI.
+const (
+	callBlockLagTolerance   = 64
+	callBlockAheadTolerance = 16
+)
+
+// readSelector is a parsed block selector — the Go twin of host.rs
+// BlockSelector. The engine now READS both anchors (head = the
+// BLS-attested optimistic payload root, finalized = the finality
+// update's), so where the twin routes a selector, this engine runs it.
+type readSelector struct {
+	head bool // false = finalized anchor
+	// pinned is a numbered selector, answered from HEAD state inside the
+	// window (the twin's "head state is the near-head trade-off",
+	// read_anchor:1799).
+	pinned    uint64
+	pinnedSet bool
 }
 
-// RequestAccountJSON runs one verified account read at the finalized
-// anchor. Errors: retryable {"error":…} for unknown handle / not
-// running / budget expiry / proof-side failures (the host may re-ask
-// once the anchor or peers move), permanent -32602 for a block
-// selector this engine cannot apply. A verification VERDICT (absent
-// account) is a normal result shape with failReason, not an error —
-// exactly as the header's comment prescribes.
+// parseReadBlock mirrors parse_call_block (host.rs:2248-2286) with the
+// SAME acceptance and the SAME refusals: empty/latest/pending → head,
+// finalized → finalized, and safe/earliest refused permanently — #366,
+// nothing here tracks the safe (justified) head, and genesis state is
+// not what verified reads run against. Numbers: 0x/0X-prefixed read as
+// HEX, bare digits as DECIMAL (#366 item 6); ASCII digits only, no sign;
+// a value past i64::MAX is malformed; a 64-hex-digit selector is a
+// block hash and refused by name (the routers resolve hashes before the
+// engine is ever asked, #641). Second return is the JSON refusal, third
+// says it is permanent (-32602): the shape the twin's
+// parse_read_block→invalid_params_json mapping produces.
+func parseReadBlock(block string) (readSelector, string, bool) {
+	b := strings.TrimSpace(block)
+	isTag := func(t string) bool { return eqASCIIFold(b, t) }
+	switch {
+	case b == "" || isTag("latest") || isTag("pending"):
+		return readSelector{head: true}, "", false
+	case isTag("finalized"):
+		return readSelector{}, "", false
+	case isTag("safe"):
+		// SAFE_TAG_REFUSAL, host.rs:2213, verbatim.
+		return readSelector{}, permanentErr("the 'safe' tag is not served: this node tracks the " +
+			"verified head and the beacon-finalized block, not the safe (justified) head; " +
+			"ask for 'latest' or 'finalized'"), true
+	case isTag("earliest"):
+		return readSelector{}, permanentErr("earliest (genesis) is not served: verified reads " +
+			"run against the head's state, or the finalized block's"), true
+	}
+	digits, radix := b, 10
+	if len(b) > 1 && (strings.HasPrefix(b, "0x") || strings.HasPrefix(b, "0X")) {
+		digits, radix = b[2:], 16
+	}
+	wellFormed := digits != ""
+	for i := 0; i < len(digits) && wellFormed; i++ {
+		c := digits[i]
+		wellFormed = (c >= '0' && c <= '9') || (radix == 16 && ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+	}
+	if n, err := strconv.ParseUint(digits, radix, 64); wellFormed && err == nil && n <= math.MaxInt64 {
+		return readSelector{head: true, pinned: n, pinnedSet: true}, "", false
+	}
+	if wellFormed && radix == 16 && len(digits) == 64 {
+		return readSelector{}, permanentErr("a block hash is not supported as the selector: " +
+			"pass a block number or a tag"), true
+	}
+	// Rune-safe truncation: the twin takes 66 CHARS
+	// (b.chars().take(66), host.rs:2280); a byte cut mid-UTF-8 would
+	// leak a replacement rune into the refusal and drift the message.
+	shown, more := []rune(b), ""
+	if len(shown) > 66 {
+		shown, more = shown[:66], "…"
+	}
+	// The ellipsis goes AFTER the closing quote, like the twin's
+	// `{shown:?}{more}` (host.rs:2280-2282) — not inside the quoted
+	// string (PR #889 review).
+	return readSelector{}, permanentErr(fmt.Sprintf(
+		"invalid block selector %q%s (expected latest, pending, finalized or a block number)",
+		string(shown), more)), true
+}
+
+// eqASCIIFold is the twin's eq_ignore_ascii_case (host.rs:2250), NOT
+// strings.EqualFold: Unicode case FOLDING maps U+017F (ſ) to 's' and
+// would accept "lateſt" as the head tag; ASCII-only folding keeps the
+// closed vocabulary closed for C-ABI callers.
+func eqASCIIFold(s, t string) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c, d := s[i], t[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if 'A' <= d && d <= 'Z' {
+			d += 'a' - 'A'
+		}
+		if c != d {
+			return false
+		}
+	}
+	return true
+}
+
+// checkReadWindow mirrors check_call_block (host.rs:2332-2345) and the
+// CallBlockRefusal JSON mapping (host.rs:2306-2322) for one numbered
+// selector against the anchor's optimistic head `head` (haveAnchor says
+// whether any anchor exists yet — the twin's head==0 "NoHead" arm).
+// Returns (json, permanent, refused). Behind the window is PERMANENT
+// (-32602 — head state will never answer for that block, and the head
+// never moves back); ahead of it is retryable (this node has not
+// verified that block YET — it clears as the head advances, the same
+// distinction geth draws for a future block).
+func checkReadWindow(sel readSelector, head uint64, haveAnchor bool) (string, bool, bool) {
+	if !sel.pinnedSet {
+		return "", false, false
+	}
+	if !haveAnchor || head == 0 {
+		// The block in HEX, like the twin's {block:#x} (host.rs:2317-2319).
+		return retryableErr(fmt.Sprintf("beacon not synced: no verified head to check block 0x%x against", sel.pinned)), false, true
+	}
+	// saturating bounds, spelled out so neither edge under/overflows:
+	// behind = head.saturating_sub(64) (a head below 64 has nothing
+	// behind it, exactly like the twin), ahead = head.saturating_add(16).
+	behind := uint64(0)
+	if head > callBlockLagTolerance {
+		behind = head - callBlockLagTolerance
+	}
+	if sel.pinned < behind {
+		return permanentErr(fmt.Sprintf("block 0x%x (%d) is more than %d blocks behind the verified head (%d); verified reads run against head state, so this node cannot answer for that block",
+			sel.pinned, sel.pinned, callBlockLagTolerance, head)), true, true
+	}
+	ahead := head + callBlockAheadTolerance
+	if ahead < head {
+		ahead = math.MaxUint64
+	}
+	if sel.pinned > ahead {
+		return retryableErr(fmt.Sprintf("block 0x%x (%d) is more than %d blocks ahead of the verified head (%d)",
+			sel.pinned, sel.pinned, callBlockAheadTolerance, head)), false, true
+	}
+	return "", false, false
+}
+
+// RequestAccountJSON runs one verified account read at the selector's
+// anchor (empty/latest/pending → the BLS-attested optimistic head, the
+// default and the Rust twin's; "finalized" → the beacon-finalized
+// payload root; a number inside the ±window → head state). Errors:
+// retryable {"error":…} for unknown handle / not running / budget
+// expiry / proof-side failures (the host may re-ask once the anchor or
+// peers move), permanent -32602 for a selector this engine cannot apply
+// (safe, earliest, a block hash, garbage, a number behind the window) —
+// exactly the twin's split. A verification VERDICT (absent account) is
+// a normal result shape with failReason, not an error — as the header's
+// comment prescribes.
 func RequestAccountJSON(handle int64, address, block string) string {
 	// Selector BEFORE the handle lookup, as the twin's
 	// parse_read_block does: a request whose selector no retry can
@@ -759,7 +890,8 @@ func RequestAccountJSON(handle int64, address, block string) string {
 	// whatever state the handle is in (the old order handed a
 	// retryable "not started" first to a request that would never
 	// have been servable anyway).
-	if msg, refused := accountBlockErr(block); refused {
+	sel, msg, refused := parseReadBlock(block)
+	if refused {
 		return msg
 	}
 	e, lifetime, started, exists := beginRead(handle)
@@ -769,10 +901,19 @@ func RequestAccountJSON(handle int64, address, block string) string {
 	if !started {
 		return retryableErr("go engine: handle not started (myotis_start)")
 	}
-	defer e.reads.Done()
+	defer e.reads.Done() // before any early return below: beginRead took the slot
+	// A numbered pin is checked against the CURRENT verified head before
+	// the read runs — the twin's read_anchor→check_call_block order
+	// (host.rs:1796), whose Behind refusal no retry can clear.
+	if sel.pinnedSet {
+		a, have := e.eng.Anchor()
+		if rj, _, bad := checkReadWindow(sel, a.OptimisticExecNo, have); bad {
+			return rj
+		}
+	}
 	ctx, cancel := context.WithTimeout(lifetime, ReadBudget)
 	defer cancel()
-	rd, err := e.eng.Account(ctx, address, [32]byte{}, false)
+	rd, err := e.eng.Account(ctx, engine.Read{Address: address, Head: sel.head})
 	if err != nil {
 		return classifyReadErr("account read", err)
 	}
@@ -791,10 +932,11 @@ func RequestAccountJSON(handle int64, address, block string) string {
 // `get-storage <token> <slot> <holder>` integration). A slot index at
 // or above 2^63 arrives as a negative int64 and is recovered by bit
 // pattern, as host.rs documents — clamping it would silently query a
-// different slot. Deliberate divergence from the twin, marked in the
-// result: the twin proves this read at the verified HEAD; this engine
-// has no head read, so it proves at the finalized anchor and the
-// result says so ("anchor":"finalized").
+// different slot. Run at the verified HEAD, twin parity (reader.rs
+// get_storage hard-codes ReadAnchor::Head, "no selector at all"): the
+// engine now reads the BLS-attested head root, so the deliberate
+// finalized-anchor divergence of the first integration is gone and the
+// result reports "anchor":"head".
 // storageKey is the twin's storage_key(slot, Some(holder)) derivation
 // (reader.rs): keccak256(pad32(holder) ‖ pad32(slot)). ok=false only
 // for a holder that is neither a hex 20-byte address nor a hex
@@ -842,7 +984,101 @@ func GetStorageProofJSON(handle int64, address string, slot int64, holder string
 	defer e.reads.Done()
 	ctx, cancel := context.WithTimeout(lifetime, ReadBudget)
 	defer cancel()
-	rd, err := e.eng.Account(ctx, address, key, true)
+	rd, err := e.eng.Account(ctx, engine.Read{Address: address, Slot: key, WantSlot: true, Head: true})
+	if err != nil {
+		return classifyReadErr("storage read", err)
+	}
+	out, err := rd.StorageJSON(time.Now().Unix())
+	if err != nil {
+		return classifyReadErr("storage read", err)
+	}
+	return out
+}
+
+// parseWord32 mirrors host.rs's parse_word32: optional 0x/0X prefix,
+// then EXACTLY 64 ASCII hex digits — no short forms, no odd lengths,
+// no signs or whitespace between. Used for the raw storage position.
+func parseWord32(hex string) ([32]byte, bool) {
+	// ONE prefix at most, like the twin's
+	// strip_prefix("0x").or_else(strip_prefix("0X")) (host.rs:4042): a
+	// second "0X"/"0x" is data and fails the length/hex checks (PR #889
+	// review — nested TrimPrefix accepted "0x0X"+64 hex).
+	h := hex
+	if len(h) >= 2 && (h[:2] == "0x" || h[:2] == "0X") {
+		h = h[2:]
+	}
+	if len(h) != 64 {
+		return [32]byte{}, false
+	}
+	var out [32]byte
+	for i := 0; i < 32; i++ {
+		hi, ok1 := hexDigit(h[2*i])
+		lo, ok2 := hexDigit(h[2*i+1])
+		if !ok1 || !ok2 {
+			return [32]byte{}, false
+		}
+		out[i] = hi<<4 | lo
+	}
+	return out, true
+}
+
+func hexDigit(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// GetStorageAtJSON is myotis_get_storage_at_json: one verified read of a
+// RAW 32-byte storage position at a block selector — the
+// eth_getStorageAt counterpart. It is NOT GetStorageProofJSON: the
+// proof export takes the ERC-20 mapping fold (slot + holder, the
+// operator `get-storage <token> <slot> <holder>` integration) and has
+// no selector (the header says so, and the twin agrees:
+// get_storage_proof_json is selector-less head, while
+// get_storage_at_json parses the selector and applies read_anchor,
+// host.rs:1933). The selector vocabulary and its refusals are the
+// account read's (parseReadBlock / checkReadWindow), and the position
+// parse refusals are the twin's RETRYABLE error_json shape (host.rs
+// get_storage_at_json returns error_json for a malformed address or
+// position — the request's shape error, but the twin's channel, kept
+// per-key honest rather than "improved").
+func GetStorageAtJSON(handle int64, address, position, block string) string {
+	// Request-shape faults first, in the twin's order (address,
+	// position, selector), before the handle lookup.
+	if !common.IsHexAddress(address) {
+		return retryableErr("invalid address (expected 20-byte hex)")
+	}
+	key, ok := parseWord32(position)
+	if !ok {
+		return retryableErr("invalid storage position (expected 32-byte hex)")
+	}
+	sel, msg, refused := parseReadBlock(block)
+	if refused {
+		return msg
+	}
+	e, lifetime, started, exists := beginRead(handle)
+	if !exists {
+		return retryableErr("go engine: unknown handle")
+	}
+	if !started {
+		return retryableErr("go engine: handle not started (myotis_start)")
+	}
+	defer e.reads.Done()
+	if sel.pinnedSet {
+		a, have := e.eng.Anchor()
+		if rj, _, bad := checkReadWindow(sel, a.OptimisticExecNo, have); bad {
+			return rj
+		}
+	}
+	ctx, cancel := context.WithTimeout(lifetime, ReadBudget)
+	defer cancel()
+	rd, err := e.eng.Account(ctx, engine.Read{Address: address, Slot: key, WantSlot: true, Head: sel.head})
 	if err != nil {
 		return classifyReadErr("storage read", err)
 	}
@@ -891,8 +1127,10 @@ func CapabilitiesJSON() string {
 		"goAbi":        1,
 		"myotisAbi":    MyotisABIVersion,
 		"capabilities": capabilities(),
-		"readBlock":    "finalized",
-		"networks":     []string{"mainnet"},
+		// The DEFAULT read anchor (empty selector = verified head, the
+		// twin's default); "finalized" remains APPLIED when asked for.
+		"readBlock": "head",
+		"networks":  []string{"mainnet"},
 	})
 	return string(b)
 }

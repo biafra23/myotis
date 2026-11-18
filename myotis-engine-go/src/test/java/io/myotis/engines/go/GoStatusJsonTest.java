@@ -140,7 +140,7 @@ class GoStatusJsonTest {
         assertEquals(57, s.attemptedDials());
         assertEquals(42, s.discv5TableSize());
         assertEquals(26404150L, s.executionBlockNumber());
-        assertEquals(0L, s.optimisticBlockNumber());  // no optimistic machinery yet
+        assertEquals(0L, s.optimisticBlockNumber());  // this fixture's anchor holds no head yet
         assertEquals(26404150L, s.finalizedBlockNumber());
         assertEquals(15634912L, s.finalizedSlot());
         // finalizedPeriod = slot / SLOTS_PER_SYNC_COMMITTEE_PERIOD, not currentPeriod.
@@ -366,6 +366,27 @@ class GoStatusJsonTest {
                 "a finalized slot ahead of the host clock must not read as fresh");
     }
 
+    @Test
+    void verifiedHeadAgeFollowsTheOptimisticAnchorWhenHeld() {
+        long genesis = 1_000_000_000L;
+        int slotSeconds = 12;
+        long wallSlot = (System.currentTimeMillis() / 1000L - genesis) / slotSeconds;
+        long finSlot = wallSlot - 100; // finalized trails by ~1200 s in this fixture
+        long optSlot = wallSlot - 2;   // the attested head, ~24 s — what reads run at
+        String json = goStatus("SYNCED", 26404150, 3, "METERED")
+                .replace("\"finalizedSlot\":15634912", "\"finalizedSlot\":" + finSlot)
+                .replace("\"optimisticSlot\":0", "\"optimisticSlot\":" + optSlot)
+                .replace("\"optimisticBlockNumber\":0", "\"optimisticBlockNumber\":26404250");
+        StatusSnapshot s = GoChainHandle.statusFromJson("mainnet", json, genesis, slotSeconds);
+        // The age follows the ATTESTED slot (seconds), not the finalized one
+        // (20 minutes): the readiness dot goes green when the reads are fresh,
+        // exactly like the Rust twin's.
+        assertTrue(s.verifiedHeadAgeMs() >= 22_000L && s.verifiedHeadAgeMs() <= 38_000L,
+                "age must follow the optimistic slot (~24 s), got " + s.verifiedHeadAgeMs());
+        assertEquals(26404250L, s.optimisticBlockNumber());
+        assertEquals(26404150L, s.finalizedBlockNumber()); // finalized diagnostics keep their truth
+    }
+
     // ---- the slot/holder labels come from the REQUEST, not the Go echo
     // (PR #832 review: eljson.go echoes Slot as an UNSIGNED decimal — a slot at
     // or above 2^63 used to throw in Long.parseLong and discard a fully-ran
@@ -479,18 +500,33 @@ class GoStatusJsonTest {
         assertNull(reads.maxPriorityFeePerGas());
     }
 
-    // ---- selector rule ----
+    // ---- selector rule (shared RpcBlockWindow policy, twin parity) ----
 
     @Test
-    void onlyFinalizedIsServable() {
-        assertTrue(GoVerifiedReads.isFinalizedSelector("finalized"));
-        assertTrue(GoVerifiedReads.isFinalizedSelector(" Finalized "));
-        // The DEFAULT (absent selector) means the head — refused, not quietly
-        // answered from finalized state (apply-or-refuse, #314).
-        assertFalse(GoVerifiedReads.isFinalizedSelector(null));
-        assertFalse(GoVerifiedReads.isFinalizedSelector(""));
-        assertFalse(GoVerifiedReads.isFinalizedSelector("latest"));
-        assertFalse(GoVerifiedReads.isFinalizedSelector("pending"));
-        assertFalse(GoVerifiedReads.isFinalizedSelector("0x1930e36"));
+    void selectorPolicyIsTheSharedWindow() {
+        Long head = 26_404_150L;
+        java.util.function.Supplier<Long> headClock = () -> head;
+        // Both anchors and the head default are served; the absent selector
+        // means the verified head — now APPLIED, not refused.
+        for (String tag : new String[] {"finalized", " Finalized ", "latest", "pending", "", null}) {
+            assertTrue(GoVerifiedReads.blockInWindow(tag, headClock), "'" + tag + "' is servable");
+        }
+        // Never served, head or no head: the engine tracks neither (#366).
+        assertFalse(GoVerifiedReads.blockInWindow("safe", headClock));
+        assertFalse(GoVerifiedReads.blockInWindow("earliest", headClock));
+        // Number pins ride the window around the ANCHOR's optimistic number —
+        // edges inclusive, one outside either side refused, hex and decimal.
+        assertTrue(GoVerifiedReads.blockInWindow("0x" + Long.toHexString(head - 64), headClock),
+                "lower edge inclusive");
+        assertTrue(GoVerifiedReads.blockInWindow("0x" + Long.toHexString(head + 16), headClock),
+                "upper edge inclusive");
+        assertTrue(GoVerifiedReads.blockInWindow(Long.toString(head), headClock),
+                "decimal pins accepted");
+        assertFalse(GoVerifiedReads.blockInWindow("0x" + Long.toHexString(head - 65), headClock),
+                "one below the window");
+        assertFalse(GoVerifiedReads.blockInWindow("0x" + Long.toHexString(head + 17), headClock),
+                "one above the window");
+        // No head yet (not synced enough) → no pin can be validated.
+        assertFalse(GoVerifiedReads.blockInWindow(Long.toString(head), () -> null));
     }
 }

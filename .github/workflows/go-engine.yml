@@ -16,6 +16,12 @@ on:
       # the shared corpus.
       - "rust/myotis-net/src/sync.rs"
       - "rust/testdata/**"
+      # The read-selector window pins (TestReadWindowConstantsMatchRustEngine)
+      # read the tolerances out of the Rust engine's host.rs, and no other Go
+      # trigger covers it: moving CALL_BLOCK_LAG_TOLERANCE there MUST turn the
+      # Go build red on its own PR, not on the next unrelated go/ touch
+      # (PR #889 review).
+      - "rust/myotis-engine/src/host.rs"
       # cmd/myotis-capi's cgo preamble INCLUDES the C ABI header, so a
       # prototype added there MUST turn the Go build red on its own PR
       # (PR #827 review: the symbol check alone compares names).
@@ -28,6 +34,7 @@ on:
       - ".github/workflows/go-engine.yml"
       - "rust/myotis-net/src/sync.rs"
       - "rust/testdata/**"
+      - "rust/myotis-engine/src/host.rs"
       - "rust/include/myotis_engine.h"
   workflow_dispatch:
 

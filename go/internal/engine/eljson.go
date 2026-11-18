@@ -23,11 +23,14 @@ import (
 )
 
 // anchor is one snapshot of the light client's trust position, extended
-// with the PROVEN exec coordinates the result shapes report: the
-// finalized anchor's block number/timestamp/hash are fields of the
-// attested execution payload header whose root the LC's execution branch
-// verified (lc.lcHeader.Exec*), so they carry the same proof as the state
-// root the read ran against — not peer claims.
+// with the PROVEN exec coordinates the result shapes report: each side's
+// block number/timestamp/hash are fields of the attested execution
+// payload header whose root the LC's execution branch verified
+// (lc.lcHeader.Exec*), so they carry the same proof as the state root
+// the read ran against — not peer claims. The finalized pair rides the
+// update's signed FINALIZED header, the optimistic pair the ATTESTED
+// header the committee actually signed: a head read verifies against
+// OptimisticStateRoot and reports the optimistic coordinates.
 type Anchor struct {
 	BeaconSlot       uint64
 	StateRoot        [32]byte
@@ -36,6 +39,54 @@ type Anchor struct {
 	ExecBlockHash    [32]byte
 	OptimisticSlot   uint64
 	OptimisticExecNo uint64
+	// OptimisticExecTimestamp / OptimisticExecHash complete the proven
+	// optimistic exec coordinates: the blockTimestamp/blockHash a head
+	// read reports, and (for the Rust twin's fresh-head fallback, which
+	// the Go engine does not implement) the block a header chain would
+	// have to walk to.
+	OptimisticExecTimestamp uint64
+	OptimisticExecHash      [32]byte
+	OptimisticStateRoot     [32]byte
+}
+
+// ReadRoot is the state root a read of the given kind verifies
+// against. No second switch on `head`: it delegates to ReadSide, so
+// the root the engine VERIFIES against and the root the result shapes
+// REPORT can never be decided apart (PR #889 review).
+func (a Anchor) ReadRoot(head bool) [32]byte {
+	return a.ReadSide(head).Root
+}
+
+// ReadSide is the ONE switch that says which side of the anchor a read
+// reports — root, matched slot, block coordinates and the anchor name
+// are decided here and nowhere else, so the account and storage shapes
+// can never drift on which block they claim to have read (the twin
+// decides it once too, in read_anchor/verify.rs). Exported so the CLI's
+// human-readable line asks the SAME switch the JSON shapes do — a
+// printed verifiedAt that names the other side's root makes an operator
+// cross-check the wrong block (PR #889 review).
+type ReadSide struct {
+	Root        [32]byte
+	MatchedSlot int64
+	BlockNumber uint64
+	Timestamp   uint64
+	BlockHash   [32]byte
+	Name        string
+}
+
+func (a Anchor) ReadSide(head bool) ReadSide {
+	if head {
+		return ReadSide{
+			Root: a.OptimisticStateRoot, MatchedSlot: int64(a.OptimisticSlot),
+			BlockNumber: a.OptimisticExecNo, Timestamp: a.OptimisticExecTimestamp,
+			BlockHash: a.OptimisticExecHash, Name: "head",
+		}
+	}
+	return ReadSide{
+		Root: a.StateRoot, MatchedSlot: int64(a.BeaconSlot),
+		BlockNumber: a.ExecNumber, Timestamp: a.ExecTimestamp,
+		BlockHash: a.ExecBlockHash, Name: "finalized",
+	}
 }
 
 // SlotRead is one proven storage-slot outcome. Value nil means PROVEN
@@ -76,11 +127,21 @@ type AccountRead struct {
 	// trie. AccountInvalid never reaches here (the read fails instead).
 	Outcome snapwire.AccountOutcome
 	Slot    *SlotRead // nil unless requested
+	// Head says the read ran against the anchor's optimistic (attested)
+	// state root rather than the finalized one. The anchor embedded
+	// above is the one the serving attempt used, so the shapes can
+	// report the read's true position: block coordinates, matched slot
+	// and anchor name all follow this flag (the Rust twin's
+	// ReadAnchor::Head / ReadAnchor::Finalized pair, host.rs read_anchor).
+	Head bool
 }
 
-// accountVerifyMethod: the read's proof was verified against the
-// beacon-finalized execution state root — eljson's "stateRootMatch"
-// verdict family (verify.rs:68). This is the value hosts gate on: a
+// accountVerifyMethod: the read's proof was verified against a
+// beacon-ATTESTED execution state root — the anchor's optimistic head
+// root for a head read, the finalized payload root for a finalized
+// read — so both are eljson's "stateRootMatch" verdict family
+// (verify.rs:68,110: the root is one the light client itself named, no
+// header-chain walk needed). This is the value hosts gate on: a
 // non-null verifyMethod is the verified mark.
 const accountVerifyMethod = "stateRootMatch"
 
@@ -102,14 +163,14 @@ type accountJSON struct {
 	BalanceWei           *string  `json:"balanceWei"` // null when absent (Java convention)
 	StorageRootHex       string   `json:"storageRootHex"`
 	CodeHashHex          string   `json:"codeHashHex"`
-	BlockNumber          uint64   `json:"blockNumber"`          // the anchor block (proven, see anchor)
+	BlockNumber          uint64   `json:"blockNumber"`          // the anchor block the READ ran at (proven, see anchor)
 	BlockTimestamp       uint64   `json:"blockTimestamp"`       // proven: from the attested payload header
 	BlockHash            string   `json:"blockHash"`            // proven: likewise
 	PeerStateRootHex     string   `json:"peerStateRootHex"`     // the root the proof verified against
 	PeerProofValid       bool     `json:"peerProofValid"`       // true: a verdict exists only past proof verification
 	BeaconChainVerified  bool     `json:"beaconChainVerified"`  // anchor: poll-verified finality, never the bootstrap checkpoint
 	BlsVerified          bool     `json:"blsVerified"`          // ditto — the BLS path ran this cycle
-	MatchedBeaconSlot    int64    `json:"matchedBeaconSlot"`    // the anchor slot the root is committed in
+	MatchedBeaconSlot    int64    `json:"matchedBeaconSlot"`    // the beacon slot that committed the read's root: the attested slot on a head read, the finalized slot on a finalized read
 	VerifyMethod         *string  `json:"verifyMethod"`         // "stateRootMatch"
 	FailReason           *string  `json:"failReason"`           // null on served reads; failures leave as Go errors
 	AccountHashHex       string   `json:"accountHashHex"`       // keccak256(address), the snap trie key
@@ -119,7 +180,7 @@ type accountJSON struct {
 	WallClockPeriod      uint64   `json:"wallClockPeriod"`      // slot arithmetic
 	FinalizedBlockNumber uint64   `json:"finalizedBlockNumber"` // proven anchor exec number
 	OptimisticBlockNum   uint64   `json:"optimisticBlockNumber"`
-	Anchor               string   `json:"anchor"` // "finalized": the Go engine reads finalized anchors only
+	Anchor               string   `json:"anchor"` // "head" | "finalized": which root the read ran at
 }
 
 // AccountJSON renders the verified read in the pinned account_json shape
@@ -135,13 +196,19 @@ func (r *AccountRead) AccountJSON(nowUnix int64) (string, error) {
 
 func (r *AccountRead) buildAccount(nowUnix int64) (accountJSON, error) {
 	a := r.Anchor
+	// The read's proven side of the anchor comes from the ONE switch
+	// (Anchor.ReadSide — the twin settles the same question once, in
+	// read_anchor/verify.rs); the finalizedBlockNumber / beaconSynced
+	// diagnostics always describe the FINALIZED side, as they do in
+	// the twin's shape.
+	side := a.ReadSide(r.Head)
 	c := accountJSON{
 		Address:              r.AddressHex,
-		PeerStateRootHex:     hexHash(a.StateRoot),
+		PeerStateRootHex:     hexHash(side.Root),
 		PeerProofValid:       true,
 		BeaconChainVerified:  true,
 		BlsVerified:          true,
-		MatchedBeaconSlot:    int64(a.BeaconSlot),
+		MatchedBeaconSlot:    side.MatchedSlot,
 		VerifyMethod:         strPtr(accountVerifyMethod),
 		ProofNodesHex:        []string{},
 		BeaconSynced:         beaconSynced(a.BeaconSlot, nowUnix),
@@ -149,10 +216,10 @@ func (r *AccountRead) buildAccount(nowUnix int64) (accountJSON, error) {
 		WallClockPeriod:      chain.SyncCommitteePeriod(chain.ConsensusMainnet().SlotAt(nowUnix)),
 		FinalizedBlockNumber: a.ExecNumber,
 		OptimisticBlockNum:   a.OptimisticExecNo,
-		BlockNumber:          a.ExecNumber,
-		BlockTimestamp:       a.ExecTimestamp,
-		BlockHash:            hexHash(a.ExecBlockHash),
-		Anchor:               "finalized",
+		BlockNumber:          side.BlockNumber,
+		BlockTimestamp:       side.Timestamp,
+		BlockHash:            hexHash(side.BlockHash),
+		Anchor:               side.Name,
 	}
 	switch r.Outcome.State {
 	case snapwire.AccountFound:
@@ -230,6 +297,12 @@ func (r *AccountRead) StorageJSON(nowUnix int64) (string, error) {
 	}
 	a := r.Anchor
 	s := r.Slot
+	// The read's side of the anchor comes from the same single switch
+	// buildAccount uses (Anchor.ReadSide — the twin's storage reads run
+	// at the verified head, reader.rs get_storage; peerBlockNumber is
+	// the anchor's number for the served read, host.rs:6620-6623 —
+	// never a raw peer claim).
+	side := a.ReadSide(r.Head)
 	out := storageJSON{
 		AddressHex:           r.AddressHex, // echoed as supplied, as the twin
 		HolderHex:            nil,
@@ -242,15 +315,15 @@ func (r *AccountRead) StorageJSON(nowUnix int64) (string, error) {
 		BeaconSynced:         beaconSynced(a.BeaconSlot, nowUnix),
 		BeaconChainVerified:  true,
 		BlsVerified:          true,
-		MatchedBeaconSlot:    int64(a.BeaconSlot),
+		MatchedBeaconSlot:    side.MatchedSlot,
 		VerifyMethod:         strPtr(accountVerifyMethod),
-		PeerBlockNumber:      a.ExecNumber,
+		PeerBlockNumber:      side.BlockNumber,
 		FinalizedBlockNumber: a.ExecNumber,
 		OptimisticBlockNum:   a.OptimisticExecNo,
 		FinalizedSlot:        a.BeaconSlot,
 		OptimisticSlot:       a.OptimisticSlot,
 		MaxHeaderChainGap:    8192,
-		Anchor:               "finalized",
+		Anchor:               side.Name,
 	}
 	// The slot INDEX the RPC carries (the shape's "slot" is the numeric
 	// selector; the 32-byte key's high bits must be zero for it to

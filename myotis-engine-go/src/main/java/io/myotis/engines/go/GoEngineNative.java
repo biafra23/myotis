@@ -234,6 +234,15 @@ final class GoEngineNative {
         return take(LIB.myotis_get_storage_proof_json(handle, nz(address), slot, holder));
     }
 
+    /** RAW 32-byte position storage read at a block selector
+     *  ({@code eth_getStorageAt}; the header's {@code
+     *  myotis_get_storage_at_json}, functional since the head-anchor
+     *  parity change — the selector-less proof export above stays the
+     *  ERC-20 mapping integration). */
+    static String nativeGetStorageAtJson(long handle, String address, String position, String block) {
+        return take(LIB.myotis_get_storage_at_json(handle, nz(address), nz(position), nz(block)));
+    }
+
     // ---- live setters / process-global toggles ----
 
     static boolean nativeSetServedBlockWindow(long handle, int blocks) {
@@ -291,6 +300,8 @@ final class GoEngineNative {
         Pointer myotis_request_account_json(long handle, String address, String block);
         Pointer myotis_get_storage_proof_json(long handle, String address, long slot,
                                               String holderOrNull);
+        Pointer myotis_get_storage_at_json(long handle, String address, String position,
+                                           String block);
         byte myotis_set_served_block_window(long handle, int blocks);
         byte myotis_set_ws_bound_periods(long handle, long periods);
         byte myotis_accept_stale_anchor(long handle);

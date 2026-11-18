@@ -13,8 +13,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
+	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -150,28 +152,53 @@ func TestLifecycleAndRefusals(t *testing.T) {
 		t.Error("second Start must be false (already-running handle)")
 	}
 
-	// (This loop runs against a never-created handle on purpose: the
-	// selector is validated BEFORE the handle lookup, as the twin's
-	// parse_read_block does, so the permanent refusal must not wait
-	// for handle state.)
-	for _, sel := range []string{"", "latest", "head", "safe", "pending", "123", "0x1c7c4"} {
+	// Block-selector policy (twin parity, parse_call_block): selectors
+	// the engine CAN apply pass the parse and only then meet handle
+	// state; selectors no retry can serve are refused permanently,
+	// BEFORE the handle lookup (a request that would never have been
+	// servable must not get a retryable "not started" first). The
+	// engine now reads both anchors, so the head vocabulary
+	// (""/latest/pending), "finalized" and numbers all pass; only
+	// safe/earliest (never tracked, #366), block hashes, numbers past
+	// i64::MAX and garbage are refused.
+	// (Unknown handle on purpose: the refusal must not wait for it.)
+	for _, sel := range []string{"safe", "earliest", "head", "soon", "+7",
+		"0x10000000000000000", // 2^64 — past the twin's i64::MAX bar
+		// A block hash: 64 hex digits, too big to parse as a number (a
+		// leading-zero 64-hex is a NUMBER to the twin too — both parse
+		// before the hash arm).
+		"0xabcfef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+	} {
 		m := decode(t, RequestAccountJSON(424242, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", sel))
 		if m["code"] != float64(-32602) {
 			t.Errorf("selector %q on an UNKNOWN handle: want the permanent refusal first, got %v", sel, m)
 		}
 	}
+	for _, sel := range []string{"", "latest", "FINALIZED", "pending", "123", "0x1c7c4"} {
+		m := decode(t, RequestAccountJSON(424242, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", sel))
+		if _, has := m["code"]; has {
+			t.Errorf("selector %q is servable and must reach handle state as a RETRYABLE error, got %v", sel, m)
+		}
+	}
 
-	// Block-selector policy: everything but "finalized" is refused
-	// permanently, the empty selector named as the head tag the
-	// header says it is, and the refusal names the way forward.
-	for _, sel := range []string{"", "latest", "head", "safe", "pending", "123", "0x1c7c4"} {
-		m := decode(t, RequestAccountJSON(h, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", sel))
+	// The started handle answers the SAME way for the refused selectors
+	// (permanent), and each refusal is the twin's text: SAFE_TAG_REFUSAL
+	// names the tags that DO work, the earliest refusal names the two
+	// anchors verified reads actually run at.
+	for _, c := range []struct{ sel, names string }{
+		{"safe", "ask for 'latest' or 'finalized'"},
+		{"earliest", "or the finalized block's"},
+	} {
+		m := decode(t, RequestAccountJSON(h, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", c.sel))
 		if m["code"] != float64(-32602) {
-			t.Errorf("selector %q: want permanent -32602, got %v", sel, m)
+			t.Errorf("selector %q: want permanent -32602, got %v", c.sel, m)
 		}
-		if !strings.Contains(m["error"].(string), "finalized") {
-			t.Errorf("selector %q: refusal must name \"finalized\": %v", sel, m["error"])
+		if !strings.Contains(m["error"].(string), c.names) {
+			t.Errorf("selector %q: refusal must contain %q: %v", c.sel, c.names, m["error"])
 		}
+	}
+	if m := decode(t, RequestAccountJSON(h, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "safe")); !strings.Contains(m["error"].(string), "safe (justified) head") {
+		t.Errorf("safe refusal must be the twin's SAFE_TAG_REFUSAL: %v", m["error"])
 	}
 
 	Stop(h)
@@ -603,7 +630,7 @@ var abiDefine = regexp.MustCompile("(?m)^#define MYOTIS_ABI_VERSION (\\d+)$")
 
 func TestCapabilitiesJSON(t *testing.T) {
 	m := decode(t, CapabilitiesJSON())
-	if m["engine"] != "go" || m["myotisAbi"] != float64(MyotisABIVersion) || m["readBlock"] != "finalized" {
+	if m["engine"] != "go" || m["myotisAbi"] != float64(MyotisABIVersion) || m["readBlock"] != "head" {
 		t.Errorf("capabilities identity wrong: %v", m)
 	}
 	caps, _ := m["capabilities"].(map[string]any)
@@ -845,5 +872,205 @@ func TestRingTruncatesLongLine(t *testing.T) {
 	// backoff drops the whole rune, never half of it).
 	if strings.Count(got, "é") > 1 {
 		t.Fatalf("straddle rune duplicated: %q", got)
+	}
+}
+
+// --- the selector parser (parse_call_block twin) and the near-head window ---
+
+func TestParseReadBlockTable(t *testing.T) {
+	type want struct {
+		head, pinnedSet bool
+		pinned          uint64
+		refused         bool
+	}
+	cases := []struct {
+		in   string
+		want want
+	}{
+		{"", want{head: true}}, // the header's verified HEAD
+		{"latest", want{head: true}},
+		{"LATEST", want{head: true}},    // tags in any case
+		{" pending ", want{head: true}}, // trimmed
+		{"finalized", want{}},           // the finalized anchor
+		{"Finalized", want{}},
+		{"123", want{head: true, pinnedSet: true, pinned: 123}},                           // bare digits DECIMAL (#366 item 6)
+		{"0x1c7c4", want{head: true, pinnedSet: true, pinned: 0x1c7c4}},                   // 0x hex
+		{"0X1C7C4", want{head: true, pinnedSet: true, pinned: 0x1c7c4}},                   // 0X too
+		{"0", want{head: true, pinnedSet: true, pinned: 0}},                               // block zero parses as a number
+		{"9223372036854775807", want{head: true, pinnedSet: true, pinned: math.MaxInt64}}, // i64::MAX is the bar
+		{"9223372036854775808", want{refused: true}},                                      // past it: malformed
+		{"safe", want{refused: true}},                                                     // #366
+		{"earliest", want{refused: true}},
+		{"head", want{refused: true}}, // NOT a tag in the vocabulary
+		{"+7", want{refused: true}},   // ASCII digits only, no sign
+		{"0x", want{refused: true}},   // no digits after the prefix
+		{"0xzz", want{refused: true}},
+		{"0x000000000000000000000000000000000000000000000000000000000000abcd", want{head: true, pinnedSet: true, pinned: 0xabcd}}, // leading-zero 64-hex parses as a number, twin's order
+		{"0xabcfef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", want{refused: true}},                               // too big → hash arm
+	}
+	for _, c := range cases {
+		sel, msg, refused := parseReadBlock(c.in)
+		if refused != c.want.refused {
+			t.Errorf("parseReadBlock(%q): refused=%v want %v (msg %q)", c.in, refused, c.want.refused, msg)
+			continue
+		}
+		if c.want.refused {
+			var probe map[string]any
+			if err := json.Unmarshal([]byte(msg), &probe); err != nil || probe["code"] != float64(-32602) {
+				t.Errorf("parseReadBlock(%q): refusal must be the -32602 envelope, got %q", c.in, msg)
+			}
+			continue
+		}
+		if sel.head != c.want.head || sel.pinnedSet != c.want.pinnedSet || sel.pinned != c.want.pinned {
+			t.Errorf("parseReadBlock(%q) = {head:%v pinnedSet:%v pinned:%d}, want {head:%v pinnedSet:%v pinned:%d}",
+				c.in, sel.head, sel.pinnedSet, sel.pinned, c.want.head, c.want.pinnedSet, c.want.pinned)
+		}
+	}
+}
+
+func TestCheckReadWindowTable(t *testing.T) {
+	const head = 21_000_100
+	num := func(n uint64) readSelector { return readSelector{head: true, pinned: n, pinnedSet: true} }
+	// Inside the twin's [head-64, head+16]: served from head state, no refusal.
+	for _, n := range []uint64{head, head - 64, head + 16, head - 1} {
+		if _, _, bad := checkReadWindow(num(n), head, true); bad {
+			t.Errorf("block %d inside the window of head %d must be served, got a refusal", n, head)
+		}
+	}
+	// One outside, each direction, with the twin's code discipline:
+	// behind PERMANENT (no retry clears it), ahead retryable (the head
+	// advances into it — geth's future-block distinction).
+	if _, perm, bad := checkReadWindow(num(head-65), head, true); !bad || !perm {
+		t.Errorf("block head-65: want permanent refusal, got perm=%v bad=%v", perm, bad)
+	}
+	if _, perm, bad := checkReadWindow(num(head+17), head, true); !bad || perm {
+		t.Errorf("block head+17: want RETRYABLE refusal, got perm=%v bad=%v", perm, bad)
+	}
+	// No anchor yet: retryable "no verified head" — clears as the LC syncs.
+	if m, perm, bad := checkReadWindow(num(123), 0, false); !bad || perm || !strings.Contains(m, "no verified head") {
+		t.Errorf("no anchor: want retryable NoHead, got perm=%v bad=%v msg=%q", perm, bad, m)
+	}
+	// Tiny head, saturating bound: nothing is "behind" a head of 10
+	// (the twin's saturating_sub), including block 0.
+	if _, _, bad := checkReadWindow(num(0), 10, true); bad {
+		t.Error("block 0 at head 10 must be window-served (saturating_sub)")
+	}
+	// Non-pinned selectors need no window at all.
+	if _, _, bad := checkReadWindow(readSelector{head: true}, head, true); bad {
+		t.Error("the head tag needs no window check")
+	}
+	if _, _, bad := checkReadWindow(readSelector{}, head, true); bad {
+		t.Error("finalized needs no window check")
+	}
+}
+
+// TestReadWindowConstantsMatchRustEngine pins the near-head window to
+// host.rs the way pins_drift_test.go pins the CL peers: a tolerance
+// moved on one side and not the other means the two engines answer
+// different questions for the same selector, and the wallet pinned the
+// number for a reason (PR #366's window is a CROSS-engine contract).
+func TestReadWindowConstantsMatchRustEngine(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "rust", "myotis-engine", "src", "host.rs"))
+	if err != nil {
+		t.Fatalf("read rust/myotis-engine/src/host.rs: %v", err)
+	}
+	src := string(raw)
+	pin := func(name string, goVal uint64) uint64 {
+		m := regexp.MustCompile(`const ` + name + `: u64 = (\d+);`).FindStringSubmatch(src)
+		if m == nil {
+			t.Fatalf("const %s not found in host.rs — renamed or restructured; update capi.go and this test together", name)
+		}
+		n, err := strconv.ParseUint(m[1], 10, 64)
+		if err != nil {
+			t.Fatalf("const %s unparseable: %v", name, err)
+		}
+		if n != goVal {
+			t.Errorf("%s drifted: host.rs says %d, capi.go says %d — move both together (a wallet pinned one window, not two)", name, n, goVal)
+		}
+		return n
+	}
+	pin("CALL_BLOCK_LAG_TOLERANCE", callBlockLagTolerance)
+	pin("CALL_BLOCK_AHEAD_TOLERANCE", callBlockAheadTolerance)
+}
+
+// --- myotis_get_storage_at_json: functional since the head-anchor
+// change (it used to be a named refusal). Request-shape discipline is
+// the twin's get_storage_at_json: address and position refusals are the
+// twin's error_json (retryable), the selector's are parseReadBlock's
+// permanent — all BEFORE the handle lookup. ---
+
+func TestStorageAtJSONRefusalShapes(t *testing.T) {
+	const addr = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+	const pos = "0x0000000000000000000000000000000000000000000000000000000000000007"
+
+	m := decode(t, GetStorageAtJSON(424242, "0xnope", pos, "latest"))
+	if _, has := m["code"]; has {
+		t.Errorf("malformed address is the twin's error_json (retryable), got %v", m)
+	}
+	if !strings.Contains(m["error"].(string), "invalid address") {
+		t.Errorf("want the twin's address refusal: %v", m["error"])
+	}
+	m = decode(t, GetStorageAtJSON(424242, addr, "0xdeadbeef", "latest"))
+	if _, has := m["code"]; has {
+		t.Errorf("malformed position is the twin's error_json (retryable), got %v", m)
+	}
+	if !strings.Contains(m["error"].(string), "invalid storage position") {
+		t.Errorf("want the twin's position refusal: %v", m["error"])
+	}
+	m = decode(t, GetStorageAtJSON(424242, addr, pos, "safe"))
+	if m["code"] != float64(-32602) {
+		t.Errorf("safe selector must be permanent, got %v", m)
+	}
+	// A fully-formed request passes every shape gate and meets handle
+	// state (unknown handle → retryable): position 64-hex (upper too),
+	// selector finalized.
+	if w, ok := parseWord32("0X" + "AB" + strings.Repeat("0", 62)); !ok || w[0] != 0xAB {
+		t.Errorf("parseWord32 must take 0X + mixed case: %x %v", w, ok)
+	}
+	// Only ONE prefix is stripped, like the twin (host.rs:4042): a second
+	// prefix is data, so this is 66 payload chars and fails the length
+	// check, not a 64-hex word with a doubled prefix (PR #889 review).
+	bad := []string{"0x7", "7", "0x" + strings.Repeat("g", 64), pos + "00", "0x0X" + strings.Repeat("0", 64)}
+	for _, bad := range bad {
+		if _, ok := parseWord32(bad); ok {
+			t.Errorf("parseWord32(%q) must refuse (no short forms, no width drift)", bad)
+		}
+	}
+	m = decode(t, GetStorageAtJSON(424242, addr, pos, "finalized"))
+	if _, has := m["code"]; has {
+		t.Errorf("servable request on an unknown handle must be retryable, got %v", m)
+	}
+}
+
+// The generic selector refusal echoes the selector truncated to 66
+// CHARS like the twin (host.rs b.chars().take(66)) — rune-safe, so a
+// multi-byte selector cannot leak a replacement rune into the message.
+func TestSelectorRefusalEchoIsRuneSafe(t *testing.T) {
+	m := decode(t, RequestAccountJSON(424242,
+		"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", strings.Repeat("é", 100)))
+	msg, _ := m["error"].(string)
+	if strings.ContainsRune(msg, utf8.RuneError) {
+		t.Errorf("truncation cut a rune in half: %q", msg)
+	}
+	// The twin formats `{shown:?}{more}`: the ellipsis sits AFTER the
+	// closing quote, never inside the quoted selector (PR #889 review —
+	// this test used to pin the inside form while claiming the twin's).
+	if !strings.Contains(msg, `"…`) {
+		t.Errorf("over-long selector must carry the twin's ellipsis after the closing quote: %q", msg)
+	}
+	if strings.Contains(msg, `…"`) {
+		t.Errorf("ellipsis must not sit inside the quoted selector: %q", msg)
+	}
+}
+
+// The tag vocabulary folds ASCII-only, like the twin's
+// eq_ignore_ascii_case (host.rs:2250): Unicode case FOLDING would read
+// "lateſt" (U+017F) as "latest" and serve it as the head tag.
+func TestSelectorTagFoldIsASCIIOnly(t *testing.T) {
+	if _, refusal, _ := parseReadBlock("lateſt"); refusal == "" {
+		t.Errorf("lateſt (U+017F) must not fold to the head tag: %q", refusal)
+	}
+	if sel, refusal, _ := parseReadBlock("LATEST"); refusal != "" || !sel.head {
+		t.Errorf("ASCII upper case must still be the head tag: %v %q", sel, refusal)
 	}
 }

@@ -98,7 +98,8 @@ policy, anchoring — is this module's own code, guided by `docs/spec/` and
    pinned by test). `myotis-go
    -get-account <addr> [-slot <n>]` runs the light client in parallel
    with EL dialing and prints the account only once the proof verifies
-   against the LC-anchored finalized exec state root. (Since the
+   against the LC-anchored ATTESTED (optimistic head) exec state root —
+   the Rust twin's default anchor. (Since the
    desktop-embed step-1 refactor this orchestration — dialer, LC loop,
    anchor publishing, and the read with its per-anchor disclosure
    memory — lives in `internal/engine`, the engine as a library; the
@@ -119,13 +120,29 @@ policy, anchoring — is this module's own code, guided by `docs/spec/` and
    that answers with a pruned state stays in the set (it *can* serve
    snap, just not at this root) — the reader rotates past it per attempt
    rather than evicting it.
-   Deliberate cuts, documented in the code: FINALIZED-anchor reads only
-   (the Rust twin's optimistic-head read — `ProcessOptimisticUpdate` +
-   the optimistic-update poll — is the next increment; a peer on a
-   pruned state scheme answers a finalized-root read with an EMPTY
-   proof, and that is precisely the `pruned-root` case the reader
-   rotates past — observed live), and no hedged reads (sequential
-   only; HEDGE_DELAY 3 s racing is 3c).
+   Deliberate cuts, documented in the code: verified reads run at the
+   BLS-ATTESTED head root (the twin's default — the finality poll
+   already BLS-verifies the update's attested header every cycle, so
+   the head anchor came with it; the explicit `"finalized"` selector
+   still runs the finalized read). Two cuts remain on this path: there
+   is NO fresh-head/header-chain fallback (the twin's `fresh_head`
+   recovery — read at the peer's own head, then walk a header chain
+   back to the attested head — is not ported, so a peer that cannot
+   serve the attested root loses the attempt and the read retries at
+   the next publish with the peers not yet tried; a peer on a pruned
+   state scheme answers a head-root read with an EMPTY proof, and that
+   is precisely the `pruned-root` case the reader rotates past —
+   observed live). The attested header rides the FINALITY update the
+   steady loop polls once per slot, and CL servers answer each poll
+   freshly — the head tracks wall clock within ~1–2 slots, the same
+   mechanism and bound as the twin's (there is no per-slot
+   optimistic-update poll on either engine to wait for). Its honest
+   caveat: which header counts as the head is ordered by the
+   unauthenticated `signature_slot` (#774) — one polled CL pin can
+   roll the head side back within the current committee period
+   (staleness or denial, never forgery; the guards are a three-engine
+   change and the owner's call, go/internal/lc/store.go). And no
+   hedged reads (sequential only; HEDGE_DELAY 3 s racing is 3c).
    Live-smoke verified 2026-11-11 from this machine: the LC finality
    poll advanced the anchor in real time (slot 15633728 → 15633856
    during the run), the first READY Geth answered the read with an
@@ -144,7 +161,10 @@ policy, anchoring — is this module's own code, guided by `docs/spec/` and
    exclusively state-pruned nodes, and a longer window then served
    the read: `verifiedAt=0xe04f511b… lcFinalizedSlot=15634912`,
    nonce/balance from the MPT leaf and the storage read anchored at
-   the PROVEN empty storageRoot.
+   the PROVEN empty storageRoot. (CLI output since names the side the
+   read actually used — `verifiedAt … anchor=head matchedBeaconSlot=…
+   blockNumber=…`, the same `Anchor.ReadSide` the JSON shapes answer
+   from; PR #889 review.)
 5. final integration PR to `main` (PR #773 — once it merges and the
    feature branch is deleted, this section is history, and the
    `feature/go-engine` entry in `go-engine.yml`'s push trigger can go
@@ -189,8 +209,19 @@ host starts it at `myotis_start`), an empty `data_dir` is refused with
 port is OS-assigned (the header's own default) unless the
 undocumented-until-now override `MYOTIS_GO_LISTEN_PORT` says otherwise
 (`0` = the network's `30303`, `-1` = ephemeral — the default). The block
-selector is applied-or-refused: only `"finalized"` runs; the head tags
-are refused with the way forward named. `myotis_status_json` answers
+selector is applied-or-refused with the twin's `parse_call_block`
+vocabulary: empty/`latest`/`pending` run at the attested head,
+`"finalized"` at the finalized root (applied, never mapped to the head),
+a number inside the shared ±window runs at head state (behind it:
+permanent `-32602`; ahead of it: retryable, it clears as the head
+advances), and `safe`/`earliest`/block hashes/garbage are refused with
+the way forward named. (Through the JVM adapter the same window gates
+first, and its refused numbers leave as the typed channels' retryable
+null until `:myotis-api` grows a refused-channel — the `-32602` here
+describes the C-ABI surface itself.) `myotis_get_storage_at_json` is
+FUNCTIONAL: raw 32-byte positions with the selector applied, the twin's
+`get_storage_at_json`; `myotis_get_code_json` and
+`myotis_get_proof_json` remain named refusals. `myotis_status_json` answers
 with the Rust engine's KEY SET (`host.rs` `status_object`: same names,
 same types — the string `networkMetering`, the 0x-less
 `finalizedRootHex`) plus three Go-only keys (`engine`, `myotisAbi`,
@@ -242,19 +273,15 @@ it via `-Dmyotis.engine.go.lib`, the daemon via `java.library.path`.
 
 Honest gaps the wrapper surfaces rather than fakes (all engine-parity
 items): no idle sleep (`pause()` refuses, lifecycle is RUNNING/STOPPED),
-reads ONLY at the finalized anchor (`latest`/numbers are refused, never
-answered from finalized state — and the hosts' 45 s readiness dot
-therefore reads amber, because the read state really is finality-old;
-`eth_blockNumber` answers the FINALIZED block, not a head, while the
-engine has no optimistic anchor — an open owner decision, PR #832),
-storage reads reach positions below 2^64 only (the ABI names the slot as
-an `int64_t`; positions ≥ 2^63 cross as their two's-complement pattern,
-pinned by the slot-echo test, while positions beyond 8 significant bytes
-cannot be named by the ABI at all and are refused before the FFI — as the
-engine's generic retryable null, which is why every hashed mapping slot
-gets a retryable code for a request no retry can serve; the fix is the
-ABI slot width, not the reader — the Go reader itself takes the full
-32-byte key), no EVM/block/tx/code reads,
+no fresh-head fallback under the head anchor (a snap peer that cannot
+serve the attested head root loses the attempt; the twin would header-
+chain to its own head — see "Deliberate cuts" under §Parts),
+storage reads reach positions below 2^64 only ON THE OPERATOR MAPPING-PROOF
+path (`get_storage_proof_json`'s `int64_t` slot contract — positions
+≥ 2^63 cross as their two's-complement pattern, pinned by the slot-echo
+test); the RPC `eth_getStorageAt` takes the full 32-byte position
+through `myotis_get_storage_at_json` like the Rust twin, so hashed
+mapping slots of any width are servable there, no EVM/block/tx/code reads,
 no ENS (the `EnsApi` throws one named refusal), no broadcast path,
 no Tor (account reads leave from the host's real IP; the desktop logs
 the mismatch instead of pretending the switch applies),

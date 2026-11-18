@@ -673,6 +673,12 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	// three peers that cannot answer it. An anchor becomes readable
 	// only once a finality poll has VERIFIED it (below), which is also
 	// what makes snapread's "the anchor is the fresh head" claim true.
+	// The same poll that verifies the finalized header BLS-verifies the
+	// update's ATTESTED header, so the first publish carries a fresh
+	// head root too: from that moment the default (head) read runs at
+	// the attested head like the Rust twin's, and the finalized side —
+	// hours old until the first poll lands, in-window after — is what
+	// the explicit "finalized" selector opts into.
 	for ctx.Err() == nil {
 		published := false
 		e.mu.Lock()
@@ -688,7 +694,17 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 			} else if outcome, err := syncer.PollFinality(ctx, st); err != nil {
 				logf("finality poll: %v", err)
 			} else {
-				logf("finality poll: outcome %v, finalized slot %d", outcome, st.Finalized.Slot)
+				// The attested exec block rides the same line as the
+				// finalized slot so a live operator can WATCH the head
+				// side of the anchor move — the head-read freshness and
+				// the readiness dot both rest on it advancing every
+				// slot (store.FinalityOutcome's own rule: CL servers
+				// answer each poll freshly; a line where it never moves
+				// across an epoch says the servers do not)
+				// (PR #889 review).
+				optNum, _, _, optOK := st.OptimisticExecInfo()
+				logf("finality poll: outcome %v, finalized slot %d, attested exec block %d (held: %v)",
+					outcome, st.Finalized.Slot, optNum, optOK)
 				// Advanced OR Stale both mean the store's finalized header
 				// passed the full BLS path THIS cycle (Stale = verified,
 				// just not newer); Rejected / poll errors publish nothing.
@@ -731,12 +747,17 @@ func snapshot(st *lc.Store) Anchor {
 	if n, t, h, ok := st.FinalizedExecInfo(); ok {
 		a.ExecNumber, a.ExecTimestamp, a.ExecBlockHash = n, t, h
 	}
-	if n, _, _, ok := st.OptimisticExecInfo(); ok {
-		a.OptimisticExecNo = n
+	if n, t, h, ok := st.OptimisticExecInfo(); ok {
+		a.OptimisticExecNo, a.OptimisticExecTimestamp, a.OptimisticExecHash = n, t, h
 	}
 	if st.Optimistic != nil {
 		a.OptimisticSlot = st.Optimistic.Slot
 	}
+	// The head read verifies against this root (reader.rs
+	// snap_account_at_best_root reads at anchor.optimistic_execution());
+	// publishing it alongside the finalized pair is what lets ONE
+	// anchor serve both selectors.
+	a.OptimisticStateRoot = st.OptimisticStateRoot()
 	return a
 }
 
@@ -804,6 +825,42 @@ type readResult struct {
 	err  error
 }
 
+// Read is one verified-read request, a struct rather than positional
+// parameters: (WantSlot, Head) are adjacent bools whose swap would be
+// type-correct and silent (PR review of the head-anchor change), and
+// three of the engine's entry points build the same request.
+type Read struct {
+	// Address is the caller's address string as given: it is echoed
+	// into the result shapes EXACTLY as supplied (the cross-engine
+	// contract), while the bytes it parses to keep the proofs honest.
+	Address string
+	// Slot is the storage position for the second hop; meaningful only
+	// when WantSlot (an ERC-20 mapping key already folded, or a raw
+	// 32-byte position — the engine does not know which, the shape
+	// reports the key it read).
+	Slot [32]byte
+	// WantSlot asks for the storage hop: the slot read runs against the
+	// PROVEN storageRoot of the account read, sharing its disclosure
+	// budget (see snapread.SlotAt).
+	WantSlot bool
+	// Head selects WHICH verified root the read verifies against, the
+	// exact twin of the Rust reader's ReadAnchor pair (host.rs
+	// read_anchor): true reads the BLS-attested optimistic head root —
+	// the Rust engine's default for every verified read — false the
+	// beacon-finalized payload root. Both roots come from the same
+	// committee-signed update, so both results are "stateRootMatch";
+	// they differ in freshness (the attested root rides the finality
+	// update the steady loop polls EVERY slot, and CL servers answer
+	// with fresh copies — the same mechanism and the same ~1-2-slot
+	// bound as the Rust twin's head, anchor.rs; the finalized root is
+	// by construction 13-19 min behind), which is exactly what the
+	// result shapes' anchor/blockNumber/matchedBeaconSlot report.
+	// Which header counts as the head is ordered by the
+	// unauthenticated signature_slot (#774) — see the note in
+	// lc/store.go before claiming more than "attested" of it.
+	Head bool
+}
+
 // Account performs one verified account read (plus the optional
 // storage-slot hop) against the newest verified anchor, retrying as
 // anchors advance and peers arrive, and returns only when a proof
@@ -826,11 +883,11 @@ type readResult struct {
 // host.rs passes the request's address_hex straight through); the
 // engine parses it here and refuses a malformed one rather than
 // accepting a parameter it cannot apply.
-func (e *Engine) Account(ctx context.Context, address string, slot [32]byte, wantSlot bool) (*AccountRead, error) {
-	if !common.IsHexAddress(address) {
-		return nil, fmt.Errorf("engine: %q is not a hex address", address)
+func (e *Engine) Account(ctx context.Context, r Read) (*AccountRead, error) {
+	head := r.Head
+	if !common.IsHexAddress(r.Address) {
+		return nil, fmt.Errorf("engine: %q is not a hex address", r.Address)
 	}
-	addr := common.HexToAddress(address)
 	// Fail fast, honestly (the C ABI in part 1b would otherwise block
 	// a host thread forever): without the light client there is no
 	// anchor and never will be on this Engine (lcStart is once-only).
@@ -866,25 +923,30 @@ func (e *Engine) Account(ctx context.Context, address string, slot [32]byte, wan
 		if inFlight {
 			return
 		}
+		root := a.ReadRoot(head)
 		peers := e.dial.snapPeers()
 		untried := make([]snapread.Peer, 0, len(peers))
-		seen := tried[a.StateRoot]
+		// The disclosure memory keys the root actually READ — a head
+		// read runs at the optimistic root, a finalized read at the
+		// finalized one, and an address disclosed at one is not
+		// disclosed at the other.
+		seen := tried[root]
 		if seen == nil {
-			// Finalized roots advance all the time; a long-running
+			// Verified roots advance all the time; a long-running
 			// read would otherwise accumulate a peer set per root
 			// forever. Keep only the current root plus the previous
 			// one (a read launched against it may still be in
 			// flight) — older roots will never be read again.
-			if haveTriedRoot && lastTriedRoot != a.StateRoot {
+			if haveTriedRoot && lastTriedRoot != root {
 				for r := range tried {
-					if r != a.StateRoot && r != lastTriedRoot {
+					if r != root && r != lastTriedRoot {
 						delete(tried, r)
 					}
 				}
 			}
 			seen = map[string]bool{}
-			tried[a.StateRoot] = seen
-			lastTriedRoot, haveTriedRoot = a.StateRoot, true
+			tried[root] = seen
+			lastTriedRoot, haveTriedRoot = root, true
 		}
 		for _, p := range peers {
 			if !seen[p.ID()] {
@@ -913,8 +975,8 @@ func (e *Engine) Account(ctx context.Context, address string, slot [32]byte, wan
 		}
 		inFlight = true
 		go func() {
-			r, err := attemptRead(a, untried, address, addr, slot, wantSlot)
-			readRes <- readResult{r, err}
+			res, err := attemptRead(a, untried, r)
+			readRes <- readResult{res, err}
 		}()
 	}
 
@@ -990,29 +1052,40 @@ func (e *Engine) Account(ctx context.Context, address string, slot [32]byte, wan
 // payload header that root was read at. The caller runs this in a
 // goroutine — hops cost up to snapread.MaxAttempts × the request
 // timeout each.
-func attemptRead(a *Anchor, peers []snapread.Peer, address string, addr common.Address, slot [32]byte, wantSlot bool) (*AccountRead, error) {
+func attemptRead(a *Anchor, peers []snapread.Peer, r Read) (*AccountRead, error) {
 	if len(peers) == 0 {
 		return nil, fmt.Errorf("no snap-capable READY peers yet (anchor is ready: slot %d)", a.BeaconSlot)
 	}
-	servedBy, out, err := snapread.Account(peers, a.StateRoot, addr)
+	addr := common.HexToAddress(r.Address)
+	// One root for both hops of this attempt: the attested head root for
+	// a head read, the finalized payload root otherwise. A peer that
+	// cannot serve the head root (a snap peer lagging further behind
+	// than the ~128-block window) fails this attempt the same way the
+	// twin's non-fresh_head attempt does — the Go engine has no
+	// fresh_head/headerChain fallback, so the read retries at the next
+	// publish with the peers not yet tried (documented divergence,
+	// README "Deliberate cuts").
+	root := a.ReadRoot(r.Head)
+	servedBy, out, err := snapread.Account(peers, root, addr)
 	if err != nil {
 		return nil, err
 	}
 	rd := &AccountRead{
 		Address:    addr,
-		AddressHex: address, // echoed as supplied, as the Rust twin
+		AddressHex: r.Address, // echoed as supplied, as the Rust twin
 		Anchor:     *a,
 		Peers:      len(peers),
 		Outcome:    out,
+		Head:       r.Head,
 	}
-	if wantSlot {
+	if r.WantSlot {
 		if out.Absent() {
 			// An absent account has no storage: the slot is provably
 			// zero with no walk to do, and the JSON says so (exists
 			// false, null value) rather than staying silent about it.
 			// The root both engines report for it is the empty-trie
 			// root (reader.rs:6996), not zeros.
-			rd.Slot = &SlotRead{Key: slot, StorageRoot: mpt.EmptyTrieRoot}
+			rd.Slot = &SlotRead{Key: r.Slot, StorageRoot: mpt.EmptyTrieRoot}
 		} else {
 			// SlotAt, not Slot: the account was just proven above — the
 			// storage hop must reuse that outcome and the SAME peer
@@ -1020,11 +1093,11 @@ func attemptRead(a *Anchor, peers []snapread.Peer, address string, addr common.A
 			// never widens the disclosure cap to 3+3 peers, never pays
 			// for the account request twice, and never re-pays a first
 			// peer's timeout on the second hop.
-			v, err := snapread.SlotAt(peers, a.StateRoot, addr, slot, out, servedBy)
+			v, err := snapread.SlotAt(peers, root, addr, r.Slot, out, servedBy)
 			if err != nil {
 				return nil, fmt.Errorf("slot read: %w", err)
 			}
-			rd.Slot = &SlotRead{Key: slot, Value: v, StorageRoot: out.Account.StorageRoot}
+			rd.Slot = &SlotRead{Key: r.Slot, Value: v, StorageRoot: out.Account.StorageRoot}
 		}
 	}
 	return rd, nil
