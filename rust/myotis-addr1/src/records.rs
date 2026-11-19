@@ -21,7 +21,9 @@ pub const SPILL_INLINE_MAX: usize = 256;
 pub const PAGE_SIZE: usize = 4096;
 /// Units the format allows (spill pages store block numbers as u32).
 pub const MAX_UNITS: u64 = (1 << 32) / UNIT_BLOCKS;
-/// Largest spill or pages file a client reads.
+/// Largest spill or pages file a client reads whole. A spill file above it (a busy address
+/// in a top-level slice) is read page by page ([`SpillPageCheck`]); a pages file never is
+/// that large (a bucket is bounded), and is refused.
 pub const MAX_FILE: usize = 256 << 20;
 
 const MAGIC: &[u8; 3] = b"E2S";
@@ -607,6 +609,151 @@ fn decode_spill_page(page: &[u8], first: u64, last: u64) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
+/// A spill file checked page by page, in order: for a file too large to read whole (above
+/// [`MAX_FILE`]), whose pages are the leaves of its chunk tree, read one at a time
+/// (`swarm::FileChunk::locate`). The same checks as [`spill_entries`]: every page decodes,
+/// the entries ascend across pages, every page but the last is full (the next page's first
+/// entry did not fit) and the last unpadded and as long as the span says, the count is the
+/// record's, and the entries do not fit inline. Memory is one page, whatever the file's size.
+/// A page that fails leaves the check as it was.
+#[derive(Debug, Clone)]
+pub struct SpillPageCheck {
+    first: u64,
+    last: u64,
+    count: u64,
+    span: u64,
+    pages: u64,
+    /// Pages and entries checked so far.
+    page: u64,
+    seen: u64,
+    /// The previous page's content length and last entry.
+    prev: Option<(usize, Entry)>,
+}
+
+impl SpillPageCheck {
+    /// For the spill file of a record of `count` entries of the slice `slice` describes,
+    /// whose root chunk states `span` bytes.
+    pub fn new(slice: &SliceRecord, count: u64, span: u64) -> Result<Self> {
+        ensure!(count > 0 && span > 0, "an empty spill file");
+        Ok(Self {
+            first: slice.first_block,
+            last: slice.last_block(),
+            count,
+            span,
+            pages: span.div_ceil(PAGE_SIZE as u64),
+            page: 0,
+            seen: 0,
+            prev: None,
+        })
+    }
+
+    /// The pages of the file.
+    pub fn pages(&self) -> u64 {
+        self.pages
+    }
+
+    /// Checks the next page (leaf) and returns its entries. After the last page, the whole
+    /// file has been checked.
+    pub fn page(&mut self, page: &[u8]) -> Result<Vec<Entry>> {
+        ensure!(self.page < self.pages, "a page after the last one");
+        let last_page = self.page + 1 == self.pages;
+        if last_page {
+            let want = self.span - (self.pages - 1) * PAGE_SIZE as u64;
+            ensure!(
+                page.len() as u64 == want,
+                "the last spill page has {} bytes, the span says {want}",
+                page.len()
+            );
+        }
+        let entries = spill_page_of(self.first, self.last, page, last_page)?;
+        if let Some((prev_content, e)) = self.prev {
+            boundary(prev_content, e, entries[0])
+                .map_err(|err| fail!("pages {} and {}: {}", self.page - 1, self.page, err.0))?;
+        }
+        let seen = self.seen + entries.len() as u64;
+        ensure!(
+            seen <= self.count,
+            "spill file holds more than the {} entries the record states",
+            self.count
+        );
+        if last_page {
+            ensure!(
+                seen == self.count,
+                "spill file holds {seen} entries, the record states {}",
+                self.count
+            );
+            // An importer spills only entries too long to stay inline (with several pages,
+            // they are).
+            ensure!(
+                self.pages > 1 || entries_len(&entries, self.first) > SPILL_INLINE_MAX,
+                "a spill file of {} entries that fit inline",
+                entries.len()
+            );
+        }
+        // Only now, once the page is accepted.
+        let content = 6 + entries_len(&entries, entries[0].block);
+        self.prev = Some((content, *entries.last().expect("a page has entries")));
+        self.seen = seen;
+        self.page += 1;
+        Ok(entries)
+    }
+
+    /// Whether every page has been checked.
+    pub fn done(&self) -> bool {
+        self.page == self.pages
+    }
+}
+
+/// The checks across two adjacent pages of a spill file, in either reading order: the older
+/// page's entries ascend into the newer page's, and the older page is full (the newer page's
+/// first entry did not fit, the writer's greedy rule). A client reading the newest pages
+/// first runs it on each pair it has read, so that what it shows is complete from the oldest
+/// entry it read on (for that slice).
+pub fn check_page_boundary(older: &[Entry], newer: &[Entry]) -> Result<()> {
+    let (Some(e), Some(next)) = (older.last(), newer.first()) else {
+        return Err(fail!("an empty spill page"));
+    };
+    boundary(6 + entries_len(older, older[0].block), *e, *next)
+}
+
+/// [`check_page_boundary`] given the older page's content length and last entry.
+fn boundary(older_content: usize, e: Entry, next: Entry) -> Result<()> {
+    ensure!(
+        (e.block, e.slot) < (next.block, next.slot),
+        "spill entries not ascending across pages"
+    );
+    ensure!(
+        older_content + entries_len(std::slice::from_ref(&next), e.block) > PAGE_SIZE,
+        "spill file not canonically encoded: a page ends early"
+    );
+    Ok(())
+}
+
+/// One page of a spill file read on its own (a client showing a busy address's newest
+/// entries reads the last pages first): decoded and checked as far as one page can be. The
+/// checks across pages need [`SpillPageCheck`], in order, or [`check_page_boundary`] for each
+/// pair read in another order.
+pub fn spill_page(slice: &SliceRecord, page: &[u8], last_page: bool) -> Result<Vec<Entry>> {
+    spill_page_of(slice.first_block, slice.last_block(), page, last_page)
+}
+
+/// The checks of a page on its own: a full page unless it is the last, which is unpadded.
+fn spill_page_of(first: u64, last: u64, page: &[u8], last_page: bool) -> Result<Vec<Entry>> {
+    ensure!(
+        page.len() == PAGE_SIZE || (last_page && page.len() < PAGE_SIZE),
+        "spill page of {} bytes",
+        page.len()
+    );
+    let entries = decode_spill_page(page, first, last)?;
+    if last_page {
+        ensure!(
+            6 + entries_len(&entries, entries[0].block) == page.len(),
+            "the last spill page is padded"
+        );
+    }
+    Ok(entries)
+}
+
 /// The entries of a spilled address record of the slice `slice` describes, from its spill
 /// file, checked: the record's count, ascending across pages, and the canonical encoding.
 pub fn spill_entries(slice: &SliceRecord, file: &[u8], count: u64) -> Result<Vec<Entry>> {
@@ -946,5 +1093,126 @@ mod tests {
             records
         );
         assert!(bucket_pages_records(&s, &file, pages_count + 1, 600).is_err());
+    }
+
+    #[test]
+    fn a_spill_file_checked_page_by_page() {
+        let entries: Vec<Entry> = (0..3000).map(|i| e(1000 + i, 1, 1)).collect();
+        let file = spill_file(&entries);
+        let s = SliceRecord {
+            level: 12,
+            index: 0,
+            first_block: 0,
+            last_block_hash: [0; 32],
+            bucket_count: 1,
+            addresses: 1,
+            appearances: 3000,
+            buckets_root: [0; 32],
+            roles: 1,
+        };
+        let pages: Vec<&[u8]> = file.chunks(PAGE_SIZE).collect();
+        assert_eq!(pages.len(), 3);
+        let check = |pages: &[&[u8]], count: u64, span: usize| -> Result<Vec<Entry>> {
+            let mut c = SpillPageCheck::new(&s, count, span as u64)?;
+            let mut out = Vec::new();
+            for p in pages {
+                out.extend(c.page(p)?);
+            }
+            ensure!(c.done(), "pages missing");
+            Ok(out)
+        };
+        // Page by page gives what the whole-file check gives.
+        assert_eq!(check(&pages, 3000, file.len()).unwrap(), entries);
+        // Each refusal for its own reason.
+        let refused = |pages: &[&[u8]], count: u64, span: usize, why: &str| {
+            let err = check(pages, count, span).unwrap_err();
+            assert!(err.0.contains(why), "expected {why:?}, got {:?}", err.0);
+        };
+        refused(
+            &[pages[1], pages[0], pages[2]],
+            3000,
+            file.len(),
+            "not ascending",
+        );
+        refused(&pages, 2999, file.len(), "more than the 2999");
+        refused(&pages, 3001, file.len(), "the record states 3001");
+        refused(&pages[..2], 3000, file.len(), "pages missing");
+        // A page ending early (its last entry moved to the next page) is not canonical: the
+        // greedy rule is checked across pages.
+        let n0 = spill_page(&s, pages[0], false).unwrap().len();
+        let mut short = spill_file(&entries[..n0 - 1]);
+        short.resize(PAGE_SIZE, 0);
+        let rest = spill_file(&entries[n0 - 1..]);
+        let refit: Vec<&[u8]> = std::iter::once(&short[..])
+            .chain(rest.chunks(PAGE_SIZE))
+            .collect();
+        refused(
+            &refit,
+            3000,
+            PAGE_SIZE + rest.len(),
+            "pages 0 and 1: spill file not canonically encoded: a page ends early",
+        );
+        // A padded last page is refused, alone and in order; so is one the span disagrees
+        // with.
+        let mut padded = pages[2].to_vec();
+        padded.push(0);
+        // (Trailing zeros on a short page are "not padding"; a full-length one would be.)
+        assert!(spill_page(&s, &padded, true)
+            .unwrap_err()
+            .0
+            .contains("padding"));
+        refused(
+            &[pages[0], pages[1], &padded],
+            3000,
+            file.len() + 1,
+            "padding",
+        );
+        refused(&pages, 3000, file.len() + 1, "the span says");
+        // Padded to a full page, the last page passes its own padding rule: only the
+        // last-page check refuses it.
+        let mut full = pages[2].to_vec();
+        full.resize(PAGE_SIZE, 0);
+        assert!(spill_page(&s, &full, true)
+            .unwrap_err()
+            .0
+            .contains("is padded"));
+        refused(
+            &[pages[0], pages[1], &full],
+            3000,
+            3 * PAGE_SIZE,
+            "is padded",
+        );
+        // Longer than a page: never a page, last or not.
+        let long = spill_file(&entries[..1500]);
+        assert!(spill_page(&s, &long, true).is_err());
+        // The boundary checks in the newest-first order: pages 2 and 1, then 1 and 0.
+        let decoded: Vec<Vec<Entry>> = pages
+            .iter()
+            .enumerate()
+            .map(|(i, p)| spill_page(&s, p, i == 2).unwrap())
+            .collect();
+        check_page_boundary(&decoded[1], &decoded[2]).unwrap();
+        check_page_boundary(&decoded[0], &decoded[1]).unwrap();
+        assert!(check_page_boundary(&decoded[1], &decoded[0]).is_err());
+        let refit_pages: Vec<Vec<Entry>> = refit
+            .iter()
+            .map(|p| decode_spill_page(p, 0, u64::MAX).unwrap())
+            .collect();
+        assert!(check_page_boundary(&refit_pages[0], &refit_pages[1])
+            .unwrap_err()
+            .0
+            .contains("ends early"));
+        // A failed page leaves the check as it was: the right page is accepted after it.
+        let mut c = SpillPageCheck::new(&s, 3000, file.len() as u64).unwrap();
+        c.page(pages[0]).unwrap();
+        assert!(c.page(pages[2]).is_err());
+        c.page(pages[1]).unwrap();
+        c.page(pages[2]).unwrap();
+        assert!(c.done());
+        // The last page alone, as a client reads the newest entries first.
+        assert_eq!(
+            spill_page(&s, pages[2], true).unwrap(),
+            entries[3000 - spill_page(&s, pages[2], true).unwrap().len()..]
+        );
     }
 }
