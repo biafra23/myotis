@@ -631,6 +631,12 @@ pub fn spill_entries(slice: &SliceRecord, file: &[u8], count: u64) -> Result<Vec
         spill_file(&entries) == file,
         "spill file not canonically encoded"
     );
+    // An importer spills only entries too long to stay inline.
+    ensure!(
+        entries_len(&entries, slice.first_block) > SPILL_INLINE_MAX,
+        "a spill file of {} entries that fit inline",
+        entries.len()
+    );
     Ok(entries)
 }
 
@@ -699,7 +705,70 @@ pub fn bucket_pages_records(
         bucket_pages_file(&records, slice.first_block) == file,
         "pages file not canonically encoded"
     );
+    // An importer pages only a bucket too large to be one chunk inline.
+    let inline: usize = INLINE_BUCKET_HEADER
+        + records
+            .iter()
+            .map(|r| {
+                let mut b = Vec::new();
+                r.encode(&mut b, slice.first_block);
+                b.len()
+            })
+            .sum::<usize>();
+    ensure!(
+        inline > PAGE_SIZE,
+        "a paged bucket of {inline} bytes that fits one chunk inline"
+    );
     Ok(records)
+}
+
+/// Header of an inline bucket (`MAGIC ‖ VERSION ‖ kind ‖ level ‖ index ‖ bucket ‖ paged ‖
+/// count`).
+const INLINE_BUCKET_HEADER: usize = 19;
+
+/// `rec` is the descriptor of slice `s` in an index from unit `first_unit`: its level and
+/// index, and the first block that start makes it hold. What a reader checks before it
+/// decodes the slice's buckets from that first block.
+pub fn check_slice(rec: &SliceRecord, s: (u8, u32), first_unit: u64) -> Result<()> {
+    ensure!(
+        (rec.level, rec.index) == s,
+        "slice ({}, {}) holds the record of ({}, {})",
+        s.0,
+        s.1,
+        rec.level,
+        rec.index
+    );
+    let first = held_first_block(s.0, s.1, first_unit);
+    ensure!(
+        rec.first_block == first,
+        "slice ({}, {}) starts at block {}, the index makes it start at {first}",
+        s.0,
+        s.1,
+        rec.first_block
+    );
+    Ok(())
+}
+
+/// `head` is head update `n` of the index whose origin is `origin`: it announces
+/// `origin.units + n` units and the origin's start, and update 0 is the origin itself.
+pub fn check_head(head: &HeadRecord, origin: &HeadRecord, n: u64) -> Result<()> {
+    ensure!(
+        head.units == origin.units + n,
+        "head update {n} announces {} units, expected {}",
+        head.units,
+        origin.units + n
+    );
+    ensure!(
+        head.first_unit == origin.first_unit,
+        "head update {n} starts at block {}, the origin at {}",
+        head.first_block(),
+        origin.first_block()
+    );
+    ensure!(
+        n > 0 || head == origin,
+        "head update 0 differs from the origin"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -785,14 +854,18 @@ mod tests {
 
         // The spill file of three entries.
         let spill = unhex(SPILL_HEX);
+        // Three entries fit inline: as a spill file they are refused (no importer writes it).
         let s = SliceRecord {
             first_block: 4096,
             level: 6,
             index: 1,
             ..slice.clone()
         };
+        let err = spill_entries(&s, &spill, 3).unwrap_err();
+        assert!(err.0.contains("fit inline"), "{err}");
+        // Its one page decodes to the three entries.
         assert_eq!(
-            spill_entries(&s, &spill, 3).unwrap(),
+            decode_spill_page(&spill, 4096, s.last_block()).unwrap(),
             vec![e(5000, 2, 0x40), e(5000, 9, 1), e(5100, 0, 0x40)]
         );
         assert!(spill_entries(&s, &spill, 4).is_err());

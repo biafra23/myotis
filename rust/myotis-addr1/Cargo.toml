@@ -9,3 +9,5 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # keccak-256 and secp256k1 recovery (a SOC's owner signature).
 myotis-core = { path = "../myotis-core" }
+# Signature recovery with low-S normalization (myotis-core's pin, no new crate).
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa"] }

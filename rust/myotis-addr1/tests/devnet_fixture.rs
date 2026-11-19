@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, HashMap};
 use myotis_addr1::cover::slices_to_read;
 use myotis_addr1::lookup::{bucket_for, in_bucket, select};
 use myotis_addr1::records::{
-    bucket_id, bucket_pages_records, head_id, origin_id, slice_id, spill_entries, BucketRecord,
-    Entry, HeadRecord, SliceRecord,
+    bucket_id, bucket_pages_records, check_head, check_slice, head_id, origin_id, slice_id,
+    spill_entries, BucketRecord, Entry, HeadRecord, SliceRecord,
 };
 use myotis_addr1::swarm::{soc_address, verify_file, verify_soc};
 
@@ -29,7 +29,7 @@ fn dir() -> std::path::PathBuf {
 
 /// The export log as a store: key → data (what Swarm would serve under that address).
 fn store() -> HashMap<[u8; 32], Vec<u8>> {
-    let log = std::fs::read(dir().join("addr1.log")).unwrap();
+    let log = std::fs::read(dir().join("addr1.export")).unwrap();
     let mut out = HashMap::new();
     let mut rest = &log[..];
     while !rest.is_empty() {
@@ -62,9 +62,10 @@ impl Reader {
 
     fn lookup(&self, address: &[u8; 20], head: &HeadRecord) -> Vec<Entry> {
         let mut out = Vec::new();
-        for s in slices_to_read(head, None) {
+        let plan = slices_to_read(head, None).unwrap();
+        for s in plan.slices.iter().copied() {
             let slice = SliceRecord::decode(&self.soc(slice_id(CHAIN, s.0, s.1))).unwrap();
-            assert_eq!((slice.level, slice.index), s);
+            check_slice(&slice, s, head.first_unit).unwrap();
             let k = bucket_for(address, &slice);
             let bucket =
                 BucketRecord::decode(&self.soc(bucket_id(CHAIN, s.0, s.1, k)), slice.first_block)
@@ -80,6 +81,7 @@ impl Reader {
                 out.extend(spill_entries(&slice, &self.file(&spill_ref), count).unwrap());
             }
         }
+        out.retain(|e| plan.keep(e.block));
         out.sort();
         out
     }
@@ -118,8 +120,13 @@ fn lookups_over_the_devnet_index_match_eth2swarm() {
     assert_eq!((origin.first_block(), origin.units), (1920, 32));
     // Head update n announces N0 + n units; the newest the fixture holds is update 1.
     let head = HeadRecord::decode(&r.soc(head_id(CHAIN, 1))).unwrap();
-    assert_eq!((head.first_unit, head.units), (origin.first_unit, 33));
-    assert_eq!(r.soc(head_id(CHAIN, 0)), r.soc(origin_id(CHAIN)));
+    check_head(&head, &origin, 1).unwrap();
+    assert_eq!(head.units, 33);
+    let head0 = HeadRecord::decode(&r.soc(head_id(CHAIN, 0))).unwrap();
+    check_head(&head0, &origin, 0).unwrap();
+    // Update 1 is not update 2, nor update 0.
+    assert!(check_head(&head, &origin, 2).is_err());
+    assert!(check_head(&head, &origin, 0).is_err());
 
     let want = expected();
     assert_eq!(want.len(), 5);

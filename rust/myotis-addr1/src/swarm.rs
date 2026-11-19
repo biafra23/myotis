@@ -2,8 +2,8 @@
 //! against its address and its owner's signature, a file against its root reference
 //! (Bee's chunker, unencrypted, without erasure coding).
 
+use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use myotis_core::keccak::{keccak256, keccak256_concat};
-use myotis_core::nodekey::recover_public_key;
 
 use crate::{ensure, fail, hex, Result};
 
@@ -92,11 +92,7 @@ pub fn verify_soc(wire: &[u8], address: &[u8; 32], owner: &[u8; 20]) -> Result<V
     // EIP-191 personal message over keccak256(identifier ‖ CAC address of the payload).
     let digest = keccak256_concat(&identifier, &cac_address(span, payload));
     let msg = keccak256_concat(b"\x19Ethereum Signed Message:\n32", &digest);
-    if sig[64] >= 27 {
-        sig[64] -= 27;
-    }
-    let public = recover_public_key(&msg, &sig).map_err(|e| fail!("bad SOC signature: {e:?}"))?;
-    let signer: [u8; 20] = keccak256(&public)[12..].try_into().expect("20");
+    let signer = recover_signer(&msg, &mut sig)?;
     ensure!(
         signer == *owner,
         "SOC signed by {}, expected owner {}",
@@ -104,6 +100,78 @@ pub fn verify_soc(wire: &[u8], address: &[u8; 32], owner: &[u8; 20]) -> Result<V
         hex(owner)
     );
     Ok(payload.to_vec())
+}
+
+/// The address that signed `hash` with `sig` (`r ‖ s ‖ v`), as the reference reader and Bee
+/// accept it: `v` as 0/1 or 27/28, and a high `s` normalized (which flips the recovery id).
+fn recover_signer(hash: &[u8; 32], sig: &mut [u8; 65]) -> Result<[u8; 20]> {
+    let v = match sig[64] {
+        v @ 0..=1 => v,
+        v @ 27..=28 => v - 27,
+        v => return Err(fail!("SOC signature with v = {v}")),
+    };
+    let mut s = Signature::from_slice(&sig[..64]).map_err(|_| fail!("malformed SOC signature"))?;
+    let mut recid = v;
+    if let Some(low) = s.normalize_s() {
+        s = low;
+        recid ^= 1;
+    }
+    let recid = RecoveryId::from_byte(recid).ok_or_else(|| fail!("bad recovery id"))?;
+    let key = VerifyingKey::recover_from_prehash(hash, &s, recid)
+        .map_err(|_| fail!("bad SOC signature: no key recovers"))?;
+    let point = key.to_encoded_point(false);
+    let public = &point.as_bytes()[1..];
+    Ok(keccak256(public)[12..].try_into().expect("20"))
+}
+
+/// A chunk of a file's tree, checked against the reference it was fetched under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileChunk {
+    /// A leaf: up to 4096 bytes of the file.
+    Leaf(Vec<u8>),
+    /// An intermediate chunk: the bytes of the file below it, and its children's references,
+    /// in order.
+    Inner { span: u64, children: Vec<[u8; 32]> },
+}
+
+impl FileChunk {
+    /// Decodes a chunk of a file tree (wire form `span ‖ payload`), fetched under
+    /// `reference`: its content address must be `reference`. A chunk whose span exceeds its
+    /// payload is an intermediate one, whose payload is a whole number of references and has
+    /// no more than the span needs.
+    pub fn decode(wire: &[u8], reference: &[u8; 32]) -> Result<Self> {
+        let payload = verify_cac(wire, reference)?;
+        let span = u64::from_le_bytes(wire[..SPAN_LEN].try_into().expect("8"));
+        if span <= CHUNK_SIZE as u64 {
+            ensure!(
+                payload.len() as u64 == span,
+                "leaf of {} bytes states span {span}",
+                payload.len()
+            );
+            return Ok(Self::Leaf(payload));
+        }
+        ensure!(
+            !payload.is_empty() && payload.len().is_multiple_of(32),
+            "intermediate chunk of {} bytes",
+            payload.len()
+        );
+        let children: Vec<[u8; 32]> = payload
+            .chunks(32)
+            .map(|c| c.try_into().expect("32"))
+            .collect();
+        // Each child covers at most `cap` bytes, where `cap` is the largest power of 128
+        // leaves below the span; the span then fixes the number of children.
+        let mut cap = CHUNK_SIZE as u64;
+        while cap * (BRANCHES as u64) < span {
+            cap *= BRANCHES as u64;
+        }
+        ensure!(
+            children.len() as u64 == span.div_ceil(cap),
+            "intermediate chunk of span {span} with {} children",
+            children.len()
+        );
+        Ok(Self::Inner { span, children })
+    }
 }
 
 /// Root reference of `data` as Bee computes it for `POST /bytes` (no encryption, no
@@ -173,6 +241,49 @@ pub fn verify_file(data: &[u8], reference: &[u8; 32]) -> Result<()> {
         hex(reference)
     );
     Ok(())
+}
+
+/// Every chunk of the file tree of `data`, under its reference, in wire form: what a Swarm
+/// node stores for `POST /bytes` of `data`. For tests, and for walking a file as a reader does.
+pub fn file_tree(data: &[u8]) -> Vec<([u8; 32], Vec<u8>)> {
+    fn wire(span: u64, payload: &[u8]) -> Vec<u8> {
+        let mut w = span.to_le_bytes().to_vec();
+        w.extend_from_slice(payload);
+        w
+    }
+    let mut out = Vec::new();
+    if data.len() <= CHUNK_SIZE {
+        out.push((
+            cac_address(data.len() as u64, data),
+            wire(data.len() as u64, data),
+        ));
+        return out;
+    }
+    let mut level: Vec<([u8; 32], u64)> = data
+        .chunks(CHUNK_SIZE)
+        .map(|leaf| {
+            let r = cac_address(leaf.len() as u64, leaf);
+            out.push((r, wire(leaf.len() as u64, leaf)));
+            (r, leaf.len() as u64)
+        })
+        .collect();
+    while level.len() > 1 {
+        let mut next = Vec::new();
+        for group in level.chunks(BRANCHES) {
+            if group.len() == 1 {
+                // Carried up unwrapped, as Bee's chunker does.
+                next.push(group[0]);
+                continue;
+            }
+            let span: u64 = group.iter().map(|(_, s)| s).sum();
+            let payload: Vec<u8> = group.iter().flat_map(|(r, _)| *r).collect();
+            let r = cac_address(span, &payload);
+            out.push((r, wire(span, &payload)));
+            next.push((r, span));
+        }
+        level = next;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -246,6 +357,67 @@ mod tests {
         let d = data(5000);
         assert!(verify_file(&d, &file_reference(&d)).is_ok());
         assert!(verify_file(&d[1..], &file_reference(&d)).is_err());
+    }
+
+    /// A file walked chunk by chunk from its root, each chunk checked, gives the file back.
+    fn walk(tree: &std::collections::HashMap<[u8; 32], Vec<u8>>, r: &[u8; 32], out: &mut Vec<u8>) {
+        match FileChunk::decode(&tree[r], r).unwrap() {
+            FileChunk::Leaf(p) => out.extend(p),
+            FileChunk::Inner { children, .. } => {
+                for c in &children {
+                    walk(tree, c, out);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn files_walk_from_their_root() {
+        for len in [1usize, 4096, 4097, 524288, 524289, 1052673] {
+            let d = data(len);
+            let tree: std::collections::HashMap<_, _> = file_tree(&d).into_iter().collect();
+            let root = file_reference(&d);
+            assert!(tree.contains_key(&root), "length {len}");
+            let mut got = Vec::new();
+            walk(&tree, &root, &mut got);
+            assert_eq!(got, d, "length {len}");
+        }
+        // A chunk under another reference is refused.
+        let d = data(8192);
+        let tree = file_tree(&d);
+        assert!(FileChunk::decode(&tree[0].1, &tree[1].0).is_err());
+    }
+
+    #[test]
+    fn signatures_normalize_like_the_reference() {
+        // A known signer: Anvil's dev key #0 signs a digest; its high-S twin (s' = n - s,
+        // v flipped) and v as 27/28 recover the same address.
+        use k256::ecdsa::SigningKey;
+        let key = SigningKey::from_slice(&crate::records::tests_support::unhex(
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        ))
+        .unwrap();
+        let hash = keccak256(b"addr1");
+        let (sig, recid) = key.sign_prehash_recoverable(&hash).unwrap();
+        let mut low = [0u8; 65];
+        low[..64].copy_from_slice(&sig.to_bytes());
+        low[64] = recid.to_byte() + 27;
+        let want = crate::records::tests_support::unhex("f39fd6e51aad88f6f4ce6ab8827279cfffb92266");
+        assert_eq!(
+            recover_signer(&hash, &mut low.clone()).unwrap().to_vec(),
+            want
+        );
+        // The high-S twin.
+        let n = k256::Scalar::ZERO - sig.s().as_ref();
+        let high = Signature::from_scalars(sig.r().as_ref().to_bytes(), n.to_bytes()).unwrap();
+        let mut h = [0u8; 65];
+        h[..64].copy_from_slice(&high.to_bytes());
+        h[64] = recid.to_byte() ^ 1;
+        assert_eq!(recover_signer(&hash, &mut h).unwrap().to_vec(), want);
+        // v outside 0/1/27/28 is refused.
+        let mut bad = low;
+        bad[64] = 37;
+        assert!(recover_signer(&hash, &mut bad).is_err());
     }
 
     #[test]

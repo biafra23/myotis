@@ -3,7 +3,8 @@
 
 use std::ops::Range;
 
-use crate::records::{HeadRecord, L_MAX};
+use crate::records::{HeadRecord, L_MAX, UNIT_BLOCKS};
+use crate::{ensure, Result};
 
 /// A slice `(level, index)`: units `[index·2^level, (index+1)·2^level)`.
 pub type SliceId = (u8, u32);
@@ -80,13 +81,45 @@ pub fn resolve_after(m: u64, n: u64, pending: &[SliceId]) -> Vec<SliceId> {
         .collect()
 }
 
-/// What a client reads for `head`, newest first: every slice from the index's start, or
-/// only those after unit `since` for an incremental sync.
-pub fn slices_to_read(head: &HeadRecord, since: Option<u64>) -> Vec<SliceId> {
+/// What a client reads for a head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// The slices, newest first.
+    pub slices: Vec<SliceId>,
+    /// The first block the answer covers: the index's start, or the incremental sync's.
+    /// A slice that starts before it is read whole; its entries before this block are not
+    /// part of the answer ([`Plan::keep`]).
+    pub from_block: u64,
+    /// The last block the answer covers (the head's).
+    pub to_block: u64,
+}
+
+impl Plan {
+    /// Whether an entry in `block` belongs to the answer.
+    pub fn keep(&self, block: u64) -> bool {
+        (self.from_block..=self.to_block).contains(&block)
+    }
+}
+
+/// What a client reads for `head`: every slice from the index's start, or only those after
+/// unit `since` for an incremental sync (a `since` before the start reads from the start). A
+/// `since` beyond the head's units is refused: that head is older than what was read.
+pub fn slices_to_read(head: &HeadRecord, since: Option<u64>) -> Result<Plan> {
+    if let Some(m) = since {
+        ensure!(
+            m <= head.units,
+            "read up to unit {m}, but this head has only {} units",
+            head.units
+        );
+    }
     let from = since.unwrap_or(0).max(head.first_unit);
-    let mut out = resolve_after(from, head.units, &head.pending);
-    out.reverse();
-    out
+    let mut slices = resolve_after(from, head.units, &head.pending);
+    slices.reverse();
+    Ok(Plan {
+        slices,
+        from_block: from * UNIT_BLOCKS,
+        to_block: head.last_block(),
+    })
 }
 
 #[cfg(test)]
@@ -121,9 +154,23 @@ mod tests {
             pending: vec![],
         };
         // Newest first; the slice before the start is not read.
-        assert_eq!(slices_to_read(&head, None), vec![(0, 12), (2, 2)]);
-        assert_eq!(slices_to_read(&head, Some(12)), vec![(0, 12)]);
-        // A `since` before the start reads from the start.
-        assert_eq!(slices_to_read(&head, Some(2)), vec![(0, 12), (2, 2)]);
+        let plan = slices_to_read(&head, None).unwrap();
+        assert_eq!(plan.slices, vec![(0, 12), (2, 2)]);
+        assert_eq!((plan.from_block, plan.to_block), (9 * 64, 13 * 64 - 1));
+        // (2, 2) holds units 9..12 here; a sync since unit 10 reads it whole and keeps only
+        // the entries from block 640 on.
+        let since = slices_to_read(&head, Some(10)).unwrap();
+        assert_eq!(since.slices, vec![(0, 12), (2, 2)]);
+        assert!(!since.keep(639) && since.keep(640));
+        assert_eq!(
+            slices_to_read(&head, Some(12)).unwrap().slices,
+            vec![(0, 12)]
+        );
+        // A `since` before the start reads from the start; one beyond the head is refused.
+        assert_eq!(
+            slices_to_read(&head, Some(2)).unwrap().slices,
+            vec![(0, 12), (2, 2)]
+        );
+        assert!(slices_to_read(&head, Some(14)).is_err());
     }
 }
