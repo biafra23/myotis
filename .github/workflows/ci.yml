@@ -10,6 +10,10 @@ on:
   # Build and Test on PRs that don't target main — e.g. the rust-engine
   # integration branch, whose checkpoint PRs previously skipped this job.
   pull_request:
+  # The merge queue's run of the queued commit (owner's request, 2026-11-19):
+  # `Build and Test` is a required check of the queue (the ruleset on main), so
+  # it runs again on the commit `main` will become, with every PR queued ahead.
+  merge_group:
   # Dispatched by gradle-pins-dependabot.yml on the commit it pushes (a
   # GITHUB_TOKEN push starts no pull_request run), and by hand.
   workflow_dispatch:

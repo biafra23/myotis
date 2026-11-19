@@ -1,22 +1,27 @@
 name: Desktop DMG (macOS)
 
 on:
-  # Scope push to main + release tags so a branch push that also has an open PR
-  # doesn't build twice (the PR is covered by pull_request below). Tags still
+  # Scope push to main + release tags: a PR's branch builds in the merge queue
+  # (merge_group below), not on a push to the branch. Tags still
   # build the release .dmg.
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
-  # pull_request stays unscoped (any base branch) so every PR shows this
-  # workflow's checks — but the JOBS below skip a PR whose base is not main
-  # (owner ruling, 2026-10-09): a part PR of a multi-PR plan targets its
-  # feature branch, and a macOS runner leg per part costs more than it tells;
-  # the final feature → main PR builds everything. Tests, clippy, the
-  # lockfile check and the Claude review stay on every PR (ci.yml and
-  # siblings). A part that needs a dmg can run this on demand from the
-  # Actions tab (workflow_dispatch): the same single arm64 leg a PR builds,
-  # not the three-leg main/tag matrix (see the matrix below).
+  # On a PR the jobs below do not build (owner's request, 2026-11-19): the dmg
+  # builds in the merge queue instead (merge_group below), once per PR on the
+  # commit `main` will become, rather than on a scarce macOS runner for every
+  # push of a PR under review. Before that, a PR into main built it on every
+  # push and a part PR into a feature branch skipped it (owner ruling,
+  # 2026-10-09); the final feature → main PR goes through the queue like any
+  # other. A PR that wants a dmg before it is queued can run this on demand
+  # from the Actions tab (workflow_dispatch): the single arm64 leg the queue
+  # builds, not the three-leg main/tag matrix (see the matrix below).
+  # pull_request stays as a trigger so the PR shows the one check the queue
+  # requires, `Desktop DMG result` (the `result` job at the end), as passed.
   pull_request:
+  # The merge queue's run of the queued commit; `Desktop DMG result` is a
+  # required check of the queue (the ruleset on main).
+  merge_group:
   workflow_dispatch:
 
 # Cancel a superseded run when new commits land on the same branch/PR (each of
@@ -42,9 +47,11 @@ jobs:
     # too (a dependent job is skipped when a needed job was, unless its `if`
     # uses always()) — and on a tag the release uploads. So an `if:` on this
     # job MUST be true on every non-pull_request event (push to main, v* tags,
-    # dispatch); the only safe test is the PR's base branch, which is all this
-    # one does (#582). The release jobs only run on tags.
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
+    # dispatch, the merge queue). It tests the event alone: on a PR nothing
+    # below builds (the header says why), and on every other event it runs
+    # (#582). The release jobs only run on tags. In the merge queue the review
+    # has finished, and the gate passes straight through.
+    if: github.event_name != 'pull_request'
     uses: ./.github/workflows/wait-for-claude-review.yml
     permissions:
       actions: read
@@ -69,12 +76,12 @@ jobs:
     # the one matching your Mac.
     strategy:
       fail-fast: false
-      # PRs — and a dispatch, which stands in for the PR leg a part PR into a
-      # feature branch skips — build only the arm64 dmg (the arch developers
-      # actually run; proves jpackage end-to-end). The x64/Rosetta leg is a
-      # release/main artifact — on PRs it doubled the macOS runner load for a
-      # result that never changes a PR decision, and a dispatch that built all
-      # three legs would cost about three times the PR leg it replaces. Gated
+      # The merge queue — and a dispatch, which stands in for it on a PR's
+      # branch — build only the arm64 dmg (the arch developers actually run;
+      # proves jpackage end-to-end). The x64/Rosetta leg is a release/main
+      # artifact — before the queue, on PRs, it doubled the macOS runner load for
+      # a result that never changes a merge decision, and a dispatch that built
+      # all three legs would cost about three times the leg it replaces. Gated
       # HERE via a conditional matrix, NOT a job-level `if`: the matrix context
       # is unavailable in job-level if (it evaluates empty), which silently
       # skipped BOTH legs on PRs.
@@ -82,7 +89,7 @@ jobs:
       # bundles the Gnosis PostageStamp log-index seed so a Swarm Bee full node
       # can use it from the first minute (app-desktop/build.gradle.kts,
       # docs/guides/bee-rpc-service.md). The PoC leg (arm64) runs on pushes to main
-      # and on release tags, NOT on PRs — the rule for every demo bundle
+      # and on release tags, NOT on PRs or in the merge queue — the rule for every demo bundle
       # (CLAUDE.md, "Demo bundles"; railgun-dmg.yml is the other one): a merge
       # to main refreshes the artifact the demo machine pulls, while on a PR
       # the leg only doubled the macOS runner load, since a change that breaks
@@ -97,7 +104,7 @@ jobs:
       # Each entry carries its own build flags, dmg name and artifact name so
       # the steps below stay data-driven.
       matrix:
-        include: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        include: ${{ (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch')
           && fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"}]')
           || fromJSON('[{"arch":"arm64","java-arch":"aarch64","flavor":"standard","gradle-args":"","dmg":"Myotis-arm64.dmg","artifact":"myotis-desktop-dmg-arm64"},{"arch":"x64","java-arch":"x64","flavor":"standard","gradle-args":"","dmg":"Myotis-x64.dmg","artifact":"myotis-desktop-dmg-x64"},{"arch":"arm64","java-arch":"aarch64","flavor":"bee-poc","gradle-args":"-PbeePoc","dmg":"Myotis-bee-poc-arm64.dmg","artifact":"myotis-bee-poc-dmg-arm64"}]') }}
     # The PoC is best-effort on TAG builds only — its failure is reported but
@@ -131,7 +138,9 @@ jobs:
           # artifact stamps a sha that resolves nowhere. Deliberately not pinned to
           # the PR head: that would change WHAT is built (head, not head-merged-into-
           # base) and lose the integration signal. The base version is still right,
-          # since the merge commit reaches the tag through its base parent.
+          # since the merge commit reaches the tag through its base parent. A PR
+          # builds no dmg now (merge queue, 2026-11-19); the queue's commit is
+          # the one main becomes, so a dmg built there stamps a sha that resolves.
           fetch-depth: 0
       # One Xcode for every macOS leg, from .xcode-version (#734).
       - name: Select the pinned Xcode
@@ -510,3 +519,32 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"
+
+  # The one check the merge queue requires of this workflow (owner's request,
+  # 2026-11-19): a fixed name, where the matrix legs' names depend on the
+  # matrix. In the queue it passes only if the build succeeded. On a PR the
+  # build does not run, and it passes, so the PR can be queued; elsewhere it
+  # fails only for a build that failed. `always()`, not `!cancelled()`: in a
+  # cancelled run this job must still run and fail, since a skipped required
+  # check counts as passed.
+  result:
+    name: Desktop DMG result
+    needs: [build]
+    if: ${{ always() }}
+    runs-on: ubuntu-26.04
+    permissions: {}
+    steps:
+      - name: Check the dmg build
+        env:
+          EVENT: ${{ github.event_name }}
+          BUILD: ${{ needs.build.result }}
+        run: |
+          echo "On $EVENT: dmg build $BUILD."
+          if [ "$EVENT" = merge_group ]; then
+            [ "$BUILD" = success ] && exit 0
+            echo "::error::The merge queue needs the dmg build to succeed."
+            exit 1
+          fi
+          case "$BUILD" in
+            failure|cancelled) echo "::error::The dmg build did not succeed."; exit 1 ;;
+          esac

@@ -109,15 +109,20 @@ on the PR workflows' `pull_request` triggers (`pull_request_target` for
 `ci.yml`, `android-apk.yml` and siblings), which is what
 gives part PRs the tests, clippy, the lockfile check and the Claude review; do
 not narrow them to `main`. **The artifact builds are the exception** (owner
-ruling, 2026-10-09): the Android APK + emulator smoke, the macOS dmg and the
-iOS framework skip a PR whose base is not `main` (a job-level `if` in those
-workflows — the checks show as skipped, not absent), because a packaging leg
-per part costs more than it tells; the final `feature/<topic>` → `main` PR
-builds everything, and a part that touches what those legs alone check (the
-Rust engine's Android/iOS cross-compiles, the engine's C ABI, the minSdk-29
-budget — `check_apk_min_api.py` runs only in the APK workflow) can dispatch
-the workflow on its branch from the Actions tab. A PR retargeted to `main`
-after it was opened keeps its skipped checks — a base change is an `edited`
-event, which these workflows do not run on — so push a commit or dispatch the
-three workflows before it merges, or the first artifact build of that head is
-the post-merge run on `main`.
+ruling, 2026-10-09): the iOS framework skips a PR whose base is not `main` (a
+job-level `if` — the check shows as skipped, not absent), because a packaging
+leg per part costs more than it tells. **The Android APK + emulator smoke and
+the macOS dmg build on no PR at all, but in the merge queue** (owner's
+request, 2026-11-19): once per PR into `main`, on the commit `main` will
+become, when the owner queues it. Their workflows still start on every PR and
+report `Android APK result` and `Desktop DMG result` as passed, the checks the
+queue requires. The final `feature/<topic>` → `main` PR goes through the queue
+like any other, so it still builds everything before it lands. A part, or any
+PR, that touches what those legs alone check (the Rust engine's Android/iOS
+cross-compiles, the engine's C ABI, the minSdk-29 budget —
+`check_apk_min_api.py` runs only in the APK workflow) can dispatch the
+workflow on its branch from the Actions tab before it is queued. A PR
+retargeted to `main` after it was opened keeps its skipped iOS framework check
+— a base change is an `edited` event, which that workflow does not run on — so
+push a commit or dispatch it before it merges, or its first build of that head
+is the post-merge run on `main`.
