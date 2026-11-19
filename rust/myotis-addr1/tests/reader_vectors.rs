@@ -10,7 +10,7 @@ use myotis_addr1::records::{
     bucket_pages_records, check_slice, spill_entries, BucketRecord, Entry, SliceRecord,
     SpillPageCheck,
 };
-use myotis_addr1::swarm::{file_reference, file_tree, verify_file, FileChunk};
+use myotis_addr1::swarm::{file_reference, file_tree, verify_file, FileChunk, Locate, MAX_SPAN};
 
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len() / 2)
@@ -92,20 +92,17 @@ fn cases() -> Vec<Case> {
 fn read_paged(slice: &SliceRecord, file: &[u8], count: u64) -> Vec<Entry> {
     let tree: HashMap<[u8; 32], Vec<u8>> = file_tree(file).into_iter().collect();
     let root = file_reference(file);
-    let top = FileChunk::decode(&tree[&root], &root, None).unwrap();
+    let top = FileChunk::decode_root(&tree[&root], &root, MAX_SPAN).unwrap();
     let mut check = SpillPageCheck::new(slice, count, top.span()).unwrap();
     let mut out = Vec::new();
     for i in 0..check.pages() {
         let (mut chunk, mut leaf) = (top.clone(), i);
-        while let Some((k, below)) = chunk.child_for(leaf) {
-            let (r, span) = chunk.child(k).unwrap();
-            chunk = FileChunk::decode(&tree[&r], &r, Some(span)).unwrap();
+        while let Locate::Down { child, below } = chunk.locate(leaf).unwrap() {
+            let (r, _) = chunk.child(child).unwrap();
+            chunk = chunk.decode_child(child, &tree[&r]).unwrap();
             leaf = below;
         }
-        let FileChunk::Leaf(page) = chunk else {
-            panic!("no leaf {i}")
-        };
-        out.extend(check.page(&page).unwrap());
+        out.extend(check.page(chunk.leaf().unwrap()).unwrap());
     }
     assert!(check.done());
     out
