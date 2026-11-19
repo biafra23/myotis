@@ -134,9 +134,15 @@ pub enum FileChunk {
     Inner { span: u64, children: Vec<[u8; 32]> },
 }
 
+/// The largest file a reader walks: 1 TiB, far above any spill file (a top-level slice's
+/// busiest address takes a few GB), and low enough that the tree arithmetic cannot overflow.
+/// A reader that reads a file whole bounds it by [`MAX_FILE`](crate::records::MAX_FILE) at its
+/// root ([`FileChunk::span`]).
+pub const MAX_SPAN: u64 = 1 << 40;
+
 /// The bytes each child of an intermediate chunk of `span` bytes covers at most: the largest
-/// power of 128 leaves below the span. `span` is at most [`MAX_FILE`](crate::records::MAX_FILE),
-/// so the product cannot overflow.
+/// power of 128 leaves below the span. `span` is at most [`MAX_SPAN`], so the product cannot
+/// overflow.
 fn child_cap(span: u64) -> u64 {
     let mut cap = CHUNK_SIZE as u64;
     while cap * (BRANCHES as u64) < span {
@@ -152,15 +158,16 @@ impl FileChunk {
     /// [`FileChunk::child_spans`] of its parent says), so a tree can be neither larger nor
     /// deeper than its root states. A chunk whose span exceeds its payload is an intermediate
     /// one, whose payload is a whole number of references and has no more than the span
-    /// needs. A span above [`MAX_FILE`](crate::records::MAX_FILE), the largest file a client
-    /// reads, is refused before any child is fetched.
+    /// needs. A span above [`MAX_SPAN`] is refused before any child is fetched; a caller that
+    /// reads the file whole checks the root's [`FileChunk::span`] against
+    /// [`MAX_FILE`](crate::records::MAX_FILE), and reads a larger one page by page
+    /// ([`FileChunk::child_for`], `records::SpillPageCheck`).
     pub fn decode(wire: &[u8], reference: &[u8; 32], expected_span: Option<u64>) -> Result<Self> {
         let payload = verify_cac(wire, reference)?;
         let span = u64::from_le_bytes(wire[..SPAN_LEN].try_into().expect("8"));
         ensure!(
-            span <= crate::records::MAX_FILE as u64,
-            "file chunk of span {span}, above the {} bytes a client reads",
-            crate::records::MAX_FILE
+            span <= MAX_SPAN,
+            "file chunk of span {span}, above the {MAX_SPAN} bytes a reader walks"
         );
         if let Some(e) = expected_span {
             ensure!(span == e, "file chunk of span {span}, its parent says {e}");
@@ -190,6 +197,58 @@ impl FileChunk {
             children.len()
         );
         Ok(Self::Inner { span, children })
+    }
+
+    /// The bytes of the file below this chunk.
+    pub fn span(&self) -> u64 {
+        match self {
+            Self::Leaf(p) => p.len() as u64,
+            Self::Inner { span, .. } => *span,
+        }
+    }
+
+    /// Decodes a file's root chunk for a reader that reads the file whole: a span above
+    /// [`MAX_FILE`](crate::records::MAX_FILE) is refused before any child is fetched.
+    pub fn decode_whole_root(wire: &[u8], reference: &[u8; 32]) -> Result<Self> {
+        let root = Self::decode(wire, reference, None)?;
+        ensure!(
+            root.span() <= crate::records::MAX_FILE as u64,
+            "file of {} bytes, above the {} a client reads whole",
+            root.span(),
+            crate::records::MAX_FILE
+        );
+        Ok(root)
+    }
+
+    /// Child `k` of an intermediate chunk: its reference and the span it must have, to pass
+    /// to [`FileChunk::decode`] when it is fetched (that binds the tree to its root).
+    pub fn child(&self, k: usize) -> Option<([u8; 32], u64)> {
+        let Self::Inner { span, children } = self else {
+            return None;
+        };
+        let cap = child_cap(*span);
+        let n = children.len();
+        let s = if k + 1 < n {
+            cap
+        } else {
+            span - cap * (n as u64 - 1)
+        };
+        children.get(k).map(|r| (*r, s))
+    }
+
+    /// For leaf `leaf` of the part of the file below this intermediate chunk (leaves are
+    /// 4096-byte pages, counted from 0): the child it lies under ([`FileChunk::child`]), and
+    /// its index below that child. `None` for a leaf chunk, or a leaf beyond the span.
+    pub fn child_for(&self, leaf: u64) -> Option<(usize, u64)> {
+        let Self::Inner { span, children } = self else {
+            return None;
+        };
+        if leaf >= span.div_ceil(CHUNK_SIZE as u64) {
+            return None;
+        }
+        let per_child = child_cap(*span) / CHUNK_SIZE as u64;
+        let k = leaf / per_child;
+        ((k as usize) < children.len()).then_some((k as usize, leaf - k * per_child))
     }
 
     /// The span of each child of an intermediate chunk, in order: every child but the last
@@ -412,6 +471,51 @@ mod tests {
         }
     }
 
+    /// Leaf `i` of the file under `root`, walking down by [`FileChunk::child_for`] and
+    /// [`FileChunk::child`].
+    fn leaf(
+        tree: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+        root: &[u8; 32],
+        i: u64,
+    ) -> Vec<u8> {
+        let mut chunk = FileChunk::decode(&tree[root], root, None).unwrap();
+        let mut i = i;
+        while let Some((k, below)) = chunk.child_for(i) {
+            let (r, span) = chunk.child(k).unwrap();
+            chunk = FileChunk::decode(&tree[&r], &r, Some(span)).unwrap();
+            i = below;
+        }
+        match chunk {
+            FileChunk::Leaf(p) => p,
+            FileChunk::Inner { .. } => panic!("leaf {i} beyond the file"),
+        }
+    }
+
+    #[test]
+    fn any_leaf_is_reached_from_the_root() {
+        // One, two and three levels (300 leaves: two full intermediate chunks and a third).
+        for len in [4096usize, 129 * 4096 + 3, 300 * 4096 + 11] {
+            let d = data(len);
+            let tree: std::collections::HashMap<_, _> = file_tree(&d).into_iter().collect();
+            let root = file_reference(&d);
+            let leaves = len.div_ceil(4096) as u64;
+            for i in [0, 1, 127, 128, 129, 200, leaves - 1] {
+                if i >= leaves {
+                    continue;
+                }
+                let start = i as usize * 4096;
+                assert_eq!(
+                    leaf(&tree, &root, i),
+                    d[start..(start + 4096).min(len)],
+                    "length {len}, leaf {i}"
+                );
+            }
+            let top = FileChunk::decode(&tree[&root], &root, Some(len as u64)).unwrap();
+            assert_eq!(top.span(), len as u64);
+            assert_eq!(top.child_for(leaves), None);
+        }
+    }
+
     #[test]
     fn files_walk_from_their_root() {
         for len in [1usize, 4096, 4097, 524288, 524289, 1052673] {
@@ -434,15 +538,30 @@ mod tests {
     }
 
     #[test]
-    fn spans_beyond_a_client_file_are_refused() {
+    fn spans_beyond_what_a_reader_walks_are_refused() {
         // A span above 2^61 overflowed the cap computation: refused, at once.
-        let payload = [7u8; 32];
-        for span in [u64::MAX, 1 << 62, crate::records::MAX_FILE as u64 + 1] {
+        // An intermediate chunk with as many references as its span needs.
+        let chunk = |span: u64| {
+            let n = if span <= MAX_SPAN {
+                span.div_ceil(child_cap(span)) as usize
+            } else {
+                1
+            };
+            let payload = vec![7u8; 32 * n];
             let mut wire = span.to_le_bytes().to_vec();
             wire.extend_from_slice(&payload);
-            let r = cac_address(span, &payload);
+            (wire, cac_address(span, &payload))
+        };
+        for span in [u64::MAX, 1 << 62, MAX_SPAN + 1] {
+            let (wire, r) = chunk(span);
             assert!(FileChunk::decode(&wire, &r, None).is_err(), "span {span}");
         }
+        // A file above MAX_FILE is walked page by page, never read whole.
+        let big = crate::records::MAX_FILE as u64 + 1;
+        let (wire, r) = chunk(big);
+        assert!(FileChunk::decode(&wire, &r, None).is_ok());
+        let err = FileChunk::decode_whole_root(&wire, &r).unwrap_err();
+        assert!(err.0.contains("reads whole"), "{}", err.0);
     }
 
     #[test]

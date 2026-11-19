@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use myotis_addr1::lookup::{bucket_for, in_bucket, select, InBucket};
 use myotis_addr1::records::{
     bucket_pages_records, check_slice, spill_entries, BucketRecord, Entry, SliceRecord,
+    SpillPageCheck,
 };
-use myotis_addr1::swarm::verify_file;
+use myotis_addr1::swarm::{file_reference, file_tree, verify_file, FileChunk};
 
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len() / 2)
@@ -86,6 +87,30 @@ fn cases() -> Vec<Case> {
     out
 }
 
+/// A spill file read leaf by leaf from its root, as a client reads one too large to fetch
+/// whole: every chunk checked, each leaf a page, the pages checked in order.
+fn read_paged(slice: &SliceRecord, file: &[u8], count: u64) -> Vec<Entry> {
+    let tree: HashMap<[u8; 32], Vec<u8>> = file_tree(file).into_iter().collect();
+    let root = file_reference(file);
+    let top = FileChunk::decode(&tree[&root], &root, None).unwrap();
+    let mut check = SpillPageCheck::new(slice, count, top.span()).unwrap();
+    let mut out = Vec::new();
+    for i in 0..check.pages() {
+        let (mut chunk, mut leaf) = (top.clone(), i);
+        while let Some((k, below)) = chunk.child_for(leaf) {
+            let (r, span) = chunk.child(k).unwrap();
+            chunk = FileChunk::decode(&tree[&r], &r, Some(span)).unwrap();
+            leaf = below;
+        }
+        let FileChunk::Leaf(page) = chunk else {
+            panic!("no leaf {i}")
+        };
+        out.extend(check.page(&page).unwrap());
+    }
+    assert!(check.done());
+    out
+}
+
 #[test]
 fn the_reader_decodes_eth2swarms_edge_cases() {
     let cases = cases();
@@ -141,10 +166,17 @@ fn the_reader_decodes_eth2swarms_edge_cases() {
             assert_eq!(record_form == "spilled", spilled, "{}: record form", c.name);
             let mut got = found.entries;
             for (r, count) in &found.spill_files {
-                got.extend(
-                    spill_entries(slice, &c.files[r], *count)
-                        .unwrap_or_else(|e| panic!("{}: spill file: {e}", c.name)),
+                let whole = spill_entries(slice, &c.files[r], *count)
+                    .unwrap_or_else(|e| panic!("{}: spill file: {e}", c.name));
+                // Page by page through its chunk tree, as a file above MAX_FILE is read: the
+                // same entries.
+                assert_eq!(
+                    read_paged(slice, &c.files[r], *count),
+                    whole,
+                    "{}: paged",
+                    c.name
                 );
+                got.extend(whole);
             }
             assert_eq!(&got, want, "{}: entries", c.name);
             checked += 1;
