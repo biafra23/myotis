@@ -1,0 +1,57 @@
+# swarm — the embedded ant Swarm node (rust/swarm, crate myotis-swarm), the reader
+# of the addr1 address index (.claude/agent/data-sources.md, the Swarm carve-out).
+#
+# Its own workflow for the same reason as roost.yml: it is deliberately NOT a
+# workspace member (rust/Cargo.toml `exclude`), so `cargo test --workspace` and
+# rust-clippy.yml do not see it. Two graphs are checked: the crate on its own
+# lock (its tests, clippy), and the engine with its `swarm` feature on the
+# engine lock, which is the graph that ships it.
+#
+# Path-filtered, so it costs CI time only when the crate, the engine's manifest
+# or the engine lock changes.
+name: swarm
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "rust/swarm/**"
+      - "rust/myotis-engine/Cargo.toml"
+      - "rust/Cargo.lock"
+      - ".github/workflows/swarm.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
+  pull_request:
+    paths:
+      - "rust/swarm/**"
+      - "rust/myotis-engine/Cargo.toml"
+      - "rust/Cargo.lock"
+      - ".github/workflows/swarm.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
+
+jobs:
+  test:
+    name: myotis-swarm tests and the engine's swarm feature
+    runs-on: ubuntu-26.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: |
+            rust/swarm
+            rust
+      - name: Tests
+        run: cargo test --manifest-path rust/swarm/Cargo.toml --locked
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path rust/swarm/Cargo.toml --all-targets -- -D warnings
+      # The graph that ships: the engine with `swarm`, on the engine lock.
+      - name: Engine with the swarm feature
+        working-directory: rust
+        run: cargo check --locked -p myotis-engine --features swarm

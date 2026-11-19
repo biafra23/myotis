@@ -110,6 +110,7 @@ updates:
       - "/rust"
       - "/rust/roost"
       - "/rust/tor-poc"
+      - "/rust/swarm"
     schedule:
       interval: monthly
     cooldown:

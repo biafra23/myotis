@@ -10,6 +10,20 @@
 //! The node runs as a task on the caller's tokio runtime and is driven through ant's command
 //! channel ([`ant_control::ControlCommand`]), the in-process interface `antd`'s own control
 //! socket uses.
+//!
+//! **Not ready for a release build** (the engine's `swarm` feature is off by default), for
+//! three reasons inside ant that this crate cannot switch off:
+//! - ant listens on `0.0.0.0` and runs libp2p's UPnP behaviour, which asks the local router
+//!   for a port mapping and announces the public address to peers: more than a fetch-only
+//!   reader should expose.
+//! - ant resolves `/dnsaddr` bootnodes with hickory-resolver 0.25.2, the version with known
+//!   advisories that `myotis-net` keeps out of every build on purpose.
+//! - ant runs inside the engine under the workspace's `panic = "abort"`: a panic anywhere in
+//!   its networking code, on input from any Swarm peer, ends the host process. Nothing here
+//!   can contain it.
+//!
+//! Each needs a change in ant (an option for no listener and no UPnP, DNS behind a feature or
+//! through the host's resolver) or an owner's decision.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -65,9 +79,17 @@ pub struct SwarmConfig {
     pub allow_private_dials: bool,
     /// File for the warm-restart peer snapshot (`None`: start cold every time).
     pub peerstore_path: Option<PathBuf>,
-    /// How long one read may take.
-    pub timeout: Duration,
+    /// Peers the node keeps connected. A reader needs few; ant's own default (100) suits a
+    /// node that serves.
+    pub target_peers: usize,
+    /// How long one chunk read may take, queueing included.
+    pub chunk_timeout: Duration,
+    /// How long one file read (up to [`MAX_FILE_BYTES`], tens of thousands of chunks) may take.
+    pub file_timeout: Duration,
 }
+
+/// Peers a reader keeps by default.
+pub const READER_PEERS: usize = 24;
 
 impl SwarmConfig {
     /// Swarm mainnet through its published bootnodes.
@@ -77,7 +99,9 @@ impl SwarmConfig {
             bootnodes: ant_p2p::default_mainnet_bootnodes(),
             allow_private_dials: false,
             peerstore_path: None,
-            timeout: Duration::from_secs(60),
+            target_peers: READER_PEERS,
+            chunk_timeout: Duration::from_secs(60),
+            file_timeout: Duration::from_secs(600),
         }
     }
 
@@ -88,7 +112,9 @@ impl SwarmConfig {
             bootnodes,
             allow_private_dials: true,
             peerstore_path: None,
-            timeout: Duration::from_secs(30),
+            target_peers: READER_PEERS,
+            chunk_timeout: Duration::from_secs(30),
+            file_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -97,7 +123,8 @@ impl SwarmConfig {
 pub struct SwarmNode {
     commands: mpsc::Sender<ControlCommand>,
     status: watch::Receiver<StatusSnapshot>,
-    timeout: Duration,
+    chunk_timeout: Duration,
+    file_timeout: Duration,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -114,16 +141,17 @@ impl SwarmNode {
             .unwrap_or_else(|_| Keypair::generate_secp256k1());
         let (commands, rx) = mpsc::channel(64);
         let (status_tx, status) = watch::channel(StatusSnapshot::default());
-        let mut node =
+        // A reader settles nothing on chain and pays nobody: free-tier retrieval only.
+        let node =
             NodeConfig::mainnet_default(signing_secret, overlay_nonce, cfg.bootnodes, keypair)
                 .with_network_id(cfg.network_id)
                 .with_allow_private_dials(cfg.allow_private_dials)
-                .with_status(status_tx);
-        node.commands = Some(rx);
-        node.peerstore_path = cfg.peerstore_path;
-        node.process_start = Instant::now();
-        // A reader settles nothing on chain and pays nobody: free-tier retrieval only.
-        node.swap_enabled = false;
+                .with_status(status_tx)
+                .with_commands(rx)
+                .with_peerstore_path(cfg.peerstore_path)
+                .with_target_peers(Some(cfg.target_peers))
+                .with_process_start(Instant::now())
+                .with_swap_enabled(false);
         let task = tokio::spawn(async move {
             if let Err(e) = run_node(node).await {
                 tracing::warn!(target: "myotis_swarm", "Swarm node stopped: {e}");
@@ -132,7 +160,8 @@ impl SwarmNode {
         Self {
             commands,
             status,
-            timeout: cfg.timeout,
+            chunk_timeout: cfg.chunk_timeout,
+            file_timeout: cfg.file_timeout,
             task,
         }
     }
@@ -157,59 +186,48 @@ impl SwarmNode {
         address: [u8; 32],
         expect_missing: bool,
     ) -> Result<Option<Vec<u8>>, SwarmError> {
-        let (ack, rx) = oneshot::channel();
-        self.send(ControlCommand::GetChunkRaw {
-            reference: address,
-            fast_miss: expect_missing,
-            bypass_cache: false,
-            ack,
-        })
-        .await?;
-        match tokio::time::timeout(self.timeout, rx).await {
-            Err(_) => Err(SwarmError::Timeout),
-            Ok(Err(_)) => Err(SwarmError::Stopped),
-            Ok(Ok(ControlAck::Bytes { data })) => Ok(Some(data)),
-            Ok(Ok(ControlAck::NotFound { .. })) => Ok(None),
-            Ok(Ok(other)) => Err(unexpected(other)),
-        }
+        let read = async {
+            let (ack, rx) = oneshot::channel();
+            self.send(ControlCommand::GetChunkRaw {
+                reference: address,
+                fast_miss: expect_missing,
+                bypass_cache: false,
+                ack,
+            })
+            .await?;
+            match rx.await {
+                Err(_) => Err(SwarmError::Stopped),
+                Ok(ControlAck::Bytes { data }) => Ok(Some(data)),
+                Ok(ControlAck::NotFound { .. }) => Ok(None),
+                Ok(other) => Err(classify(other)),
+            }
+        };
+        tokio::time::timeout(self.chunk_timeout, read)
+            .await
+            .unwrap_or(Err(SwarmError::Timeout))
     }
 
     /// The file (an unencrypted chunk tree, Bee's `/bytes`) rooted at `reference`, joined, at
-    /// most [`MAX_FILE_BYTES`].
+    /// most [`MAX_FILE_BYTES`]. ant answers a whole file or an error; a missing file and a
+    /// node without peers come back as errors, told apart by [`classify`].
     pub async fn file(&self, reference: [u8; 32]) -> Result<Vec<u8>, SwarmError> {
-        let (ack, mut rx) = mpsc::channel(16);
-        self.send(ControlCommand::GetBytes {
-            reference,
-            bypass_cache: false,
-            progress: false,
-            max_bytes: Some(MAX_FILE_BYTES),
-            ack,
-        })
-        .await?;
         let read = async {
-            let mut out: Option<Vec<u8>> = None;
-            while let Some(a) = rx.recv().await {
-                match a {
-                    ControlAck::Bytes { data } => return Ok(data),
-                    ControlAck::BytesStreamStart { total_bytes } => {
-                        if total_bytes > MAX_FILE_BYTES {
-                            return Err(SwarmError::Failed(format!(
-                                "file of {total_bytes} bytes, above {MAX_FILE_BYTES}"
-                            )));
-                        }
-                        out = Some(Vec::with_capacity(total_bytes as usize));
-                    }
-                    ControlAck::BytesChunk { data } => {
-                        out.get_or_insert_with(Vec::new).extend_from_slice(&data)
-                    }
-                    ControlAck::StreamDone => return Ok(out.unwrap_or_default()),
-                    ControlAck::Progress(_) => {}
-                    other => return Err(unexpected(other)),
-                }
+            let (ack, mut rx) = mpsc::channel(4);
+            self.send(ControlCommand::GetBytes {
+                reference,
+                bypass_cache: false,
+                progress: false,
+                max_bytes: Some(MAX_FILE_BYTES),
+                ack,
+            })
+            .await?;
+            match rx.recv().await {
+                None => Err(SwarmError::Stopped),
+                Some(ControlAck::Bytes { data }) => Ok(data),
+                Some(other) => Err(classify(other)),
             }
-            Err(SwarmError::Stopped)
         };
-        tokio::time::timeout(self.timeout, read)
+        tokio::time::timeout(self.file_timeout, read)
             .await
             .unwrap_or(Err(SwarmError::Timeout))
     }
@@ -228,11 +246,23 @@ impl Drop for SwarmNode {
     }
 }
 
-fn unexpected(ack: ControlAck) -> SwarmError {
+/// What a failed read means. ant reports a node without peers and a missing chunk inside
+/// a plain error message on some paths ("no BZZ peers available" from the fetcher, "no peers
+/// available" from a file join, "not found" from peers), so those messages are matched too.
+fn classify(ack: ControlAck) -> SwarmError {
     match ack {
         ControlAck::NotFound { message } => SwarmError::NotFound(message),
         ControlAck::NotReady { message } => SwarmError::NotReady(message),
-        ControlAck::Error { message } => SwarmError::Failed(message),
+        ControlAck::Error { message } => {
+            let m = message.to_ascii_lowercase();
+            if m.contains("no bzz peers") || m.contains("no peers available") {
+                SwarmError::NotReady(message)
+            } else if m.contains("not found") {
+                SwarmError::NotFound(message)
+            } else {
+                SwarmError::Failed(message)
+            }
+        }
         other => SwarmError::Failed(format!("unexpected answer {other:?}")),
     }
 }
@@ -246,7 +276,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_node_without_peers_answers_and_stops() {
         let mut cfg = SwarmConfig::dev(4020, Vec::new());
-        cfg.timeout = Duration::from_secs(5);
+        cfg.chunk_timeout = Duration::from_secs(5);
         let node = SwarmNode::start(cfg);
         assert_eq!(node.connected_peers(), 0);
         let got = node.chunk([7u8; 32], true).await;
@@ -280,6 +310,31 @@ mod tests {
             .unwrap()
             .expect("chunk exists");
         println!("chunk of {} bytes", chunk.len());
+    }
+
+    #[test]
+    fn errors_are_classified() {
+        let err = |m: &str| {
+            classify(ControlAck::Error {
+                message: m.to_string(),
+            })
+        };
+        assert!(matches!(
+            err("retrieval: no BZZ peers available"),
+            SwarmError::NotReady(_)
+        ));
+        assert!(matches!(err("no peers available"), SwarmError::NotReady(_)));
+        assert!(matches!(
+            err("chunk abc: storage: not found"),
+            SwarmError::NotFound(_)
+        ));
+        assert!(matches!(err("bad span"), SwarmError::Failed(_)));
+        assert!(matches!(
+            classify(ControlAck::NotReady {
+                message: String::new()
+            }),
+            SwarmError::NotReady(_)
+        ));
     }
 
     fn hex_32(s: &str) -> [u8; 32] {

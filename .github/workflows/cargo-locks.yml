@@ -91,7 +91,7 @@ jobs:
         run: |
           set -eu
           fail=0
-          for lock in rust/Cargo.lock rust/roost/Cargo.lock rust/tor-poc/Cargo.lock; do
+          for lock in rust/Cargo.lock rust/roost/Cargo.lock rust/tor-poc/Cargo.lock rust/swarm/Cargo.lock; do
             versions=$(awk '/^\[\[package\]\]/{n=""} /^name = /{n=$3} /^version = /{if (n=="\"k256\"") print $3}' "$lock" | tr -d '"' | sort -u)
             count=$(printf '%s\n' "$versions" | grep -c . || true)
             echo "$lock: k256 $(echo ${versions:-none})"
