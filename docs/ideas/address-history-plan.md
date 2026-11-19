@@ -1,6 +1,7 @@
 # Past transactions for any address: what is missing
 
-Status: **planning basis — nothing here is built.** It lists everything needed for
+Status: **planning basis; the tracer bullet is being built** (`feature/swarm-addr1`: the
+Swarm carve-out, an embedded `ant` node, the addr1 reader and `myotis_getAddressHistory`). It lists everything needed for
 [Punicus](https://github.com/biafra23/punicus) to show the past transactions of any
 address with Myotis as its data access layer. The work is split into workstreams, and
 each is meant to become an implementation plan of its own. It builds on two designs:
@@ -85,7 +86,9 @@ built on an undecided rule can ship.
   the sync-committee checkpoint and the historical accumulators, only as good as the walk
   that produced it. Covered in
   [deep-block-verification.md §Open decisions](deep-block-verification.md#open-decisions).
-- **D2. Swarm as a data source** (item 14). `CLAUDE.md` allows devp2p and libp2p only. A
+- **D2. Swarm as a data source** (item 14). **Decided (owner, 2026-11-19): an embedded
+  client, `ant` linked into the Rust engine; the carve-out is in
+  `.claude/agent/data-sources.md`.** The considerations it settled: `CLAUDE.md` allows devp2p and libp2p only. A
   carve-out in the shape of the existing ones (`.claude/agent/data-sources.md`): what may be
   read from Swarm (addr1 records and spill files only), and that every entry read is
   checked before it is shown. It must also name **the form of the reader**, because the
@@ -102,14 +105,19 @@ built on an undecided rule can ship.
     withhold but not forge, but it sees every bucket request together with the user's IP —
     item 19 in concentrated form. It needs its own line in D2, as the checkpoint servers
     needed their own carve-out, or it is ruled out.
-- **D3. Completeness and TRACE on the importer's word** (items 13, 15). Like the seeded-log
+- **D3. Completeness and TRACE on the importer's word** (items 13, 15). **For the first
+  version (owner, 2026-11-19): accepted with one importer, labelled, entries unverified
+  until checked; whether a second importer is required stays open.** Like the seeded-log
   carve-out (2026-09-25), the displayed history then rests on the publisher for what it
   leaves out. Whether that is acceptable with one importer, or only with two that agree,
   and what Punicus must say about it. Before Amsterdam this is permanent for TRACE; from
   Amsterdam on, block access lists make most TRACE entries checkable (see the table above),
   which shrinks D3 over time and bears on whether the first version needs a tracing archive
   node at all.
-- **D4. Which importer keys Myotis trusts** (item 16). SOC addresses are derived from the
+- **D4. Which importer keys Myotis trusts** (item 16). **For the first version (owner,
+  2026-11-19): a key the user configures at runtime, an experimental setting labelled as
+  trusting that importer; pinning, rotation and the reaction to a contradicted entry stay
+  open.** SOC addresses are derived from the
   identifier and the owner, so Myotis pins the importer's address or addresses; rotating a
   key needs a release or a signed handover. D3 and D4 also have to say **what follows when a
   pinned key is caught publishing a false entry** — an entry whose address is not where its

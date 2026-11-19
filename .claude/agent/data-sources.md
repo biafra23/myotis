@@ -19,6 +19,11 @@
   the user told the app to remember), a fresh checkpoint that every answering
   checkpoint-sync server names (at least two independent operators). Scope and
   limits: the carve-out under *Data sources*.
+- **And one more (owner's decision, 2026-11-19):** the entries of an address's
+  history read from the addr1 index on Swarm are candidates; each is shown as
+  verified only after it is checked against verified chain data, and the
+  list's completeness (and `TRACE` entries) rests on the importer whose key
+  the user configured. Scope and limits: the carve-out under *Data sources*.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** A well-formed result computed against
   something other than what the caller asked for is indistinguishable from a
@@ -117,6 +122,38 @@
   and call data still come only from devp2p peers. But every one of them is
   verified against the store this source initializes, so for the root of
   trust it does count.
+- **Carve-out for Swarm reads of the address index (owner's decision,
+  2026-11-19, the tracer bullet of docs/ideas/address-history-plan.md).** The
+  Rust engine MAY read the published addr1 address index
+  (eth2swarm `docs/address-index.md`) from Swarm, and nothing else from it.
+  - **The reader is an embedded Swarm light node**: `ant`
+    (https://github.com/freedom-hq/ant), linked into the engine, which reaches
+    Swarm over libp2p. Never a separate Swarm process or a local Bee/ant HTTP
+    API (that is the debug-only "local client over HTTP" of the rule above),
+    and never a Swarm HTTP gateway (one operator's server, which sees every
+    request with the user's IP).
+  - **What may be read**: the index's SOCs (head updates, the origin, slice
+    descriptors, buckets) and its spill and pages files. Every chunk is checked
+    before use: a content-addressed chunk against its address, a SOC against
+    its signature by the importer key, and every record by the decoder's
+    canonical checks. Swarm is transport only.
+  - **What it is trusted for**: an entry is a candidate, shown as verified only
+    once Myotis has checked it against verified chain data (the header and the
+    body or receipts, per role), else as unverified. Completeness (an entry
+    left out) and `TRACE` entries rest on the importer's word, as the seed
+    carve-out's displayed balance rests on its publisher's; the answer says
+    which block range rests on which importer key and names every range nobody
+    covered as a gap, never a shorter list.
+  - **Whose index**: for this first version the importer key is configured at
+    runtime by the user (an experimental setting, labelled as trusting that
+    importer), not pinned in a release; a pinned key, a key rotation and what
+    follows a contradicted entry are open (D3/D4 of the plan).
+  Two boundaries this carve-out does **not** cross:
+  - **The address index only.** Block bodies, receipts, state or any other
+    data on Swarm needs its own decision, even when the same embedded node
+    could fetch it.
+  - **Candidates, never answers.** No read the engine serves (an account, a
+    log, a block) is answered from Swarm; the index only says where to look.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the
