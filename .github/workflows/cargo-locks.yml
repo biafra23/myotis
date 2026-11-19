@@ -1,10 +1,14 @@
 # Cargo.lock freshness for every lock in the tree.
 #
-# Three locks exist under rust/ because tor-poc and roost are deliberately NOT
-# workspace members (rust/Cargo.toml `exclude`), so each resolves its own graph:
-#   rust/Cargo.lock          the engine workspace
-#   rust/roost/Cargo.lock    the light-client server
-#   rust/tor-poc/Cargo.lock  the Tor proof-of-concept
+# Four locks exist under rust/ because tor-poc, roost and swarm are
+# deliberately NOT workspace members (rust/Cargo.toml `exclude`), so each
+# resolves its own graph:
+#   rust/Cargo.lock               the engine workspace
+#   rust/roost/Cargo.lock         the light-client server
+#   rust/tor-poc/Cargo.lock       the Tor proof-of-concept
+#   rust/swarm/Cargo.lock         the embedded Swarm node (crate myotis-swarm), for
+#                                 its own tests (the engine's `swarm` feature
+#                                 builds it from the engine lock)
 # plus the Rust tour's workbook (docs/tour/workbook), a standalone crate whose
 # solution/Cargo.lock is checked here and whose starter/ is generated from
 # solution/ by make_starter.py — `--check` fails if the two differ, lock
@@ -68,7 +72,7 @@ jobs:
         run: |
           set -eu
           for manifest in rust/Cargo.toml rust/roost/Cargo.toml rust/tor-poc/Cargo.toml \
-                          docs/tour/workbook/solution/Cargo.toml; do
+                          rust/swarm/Cargo.toml docs/tour/workbook/solution/Cargo.toml; do
             echo "== $manifest"
             cargo update --workspace --locked --manifest-path "$manifest"
           done

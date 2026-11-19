@@ -1,0 +1,32 @@
+[package]
+name = "myotis-swarm"
+# Not a member of ../Cargo.toml's workspace (like tor-poc): a member is built by every
+# `cargo build --workspace`, the release build included, and would pull ant's libp2p
+# features into the engine. myotis-engine links it only with its `swarm` feature.
+# Not a release crate of its own (it is linked into myotis-engine), so, like tor-poc and
+# roost, no version of its own to keep in step and nothing to publish.
+version = "0.0.0"
+publish = false
+edition = "2021"
+# ant's floor (its rust-version), above the workspace's.
+rust-version = "1.99"
+description = "Myotis's embedded Swarm reader: an ant light node linked into the engine (libp2p), for the addr1 address index only (.claude/agent/data-sources.md)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# ant (https://github.com/freedom-hq/ant), pinned by commit; its crates are not on
+# crates.io. default-features = false drops ant-chain's JSON-RPC writer (reqwest,
+# rustls): reads need no chain access.
+ant-node = { git = "https://github.com/freedom-hq/ant", rev = "b138f6bc074d8c28149017d4e7b1e80db8c67d4d", default-features = false }
+ant-control = { git = "https://github.com/freedom-hq/ant", rev = "b138f6bc074d8c28149017d4e7b1e80db8c67d4d" }
+ant-p2p = { git = "https://github.com/freedom-hq/ant", rev = "b138f6bc074d8c28149017d4e7b1e80db8c67d4d", default-features = false }
+ant-crypto = { git = "https://github.com/freedom-hq/ant", rev = "b138f6bc074d8c28149017d4e7b1e80db8c67d4d" }
+libp2p = { version = "=0.56.0", features = ["secp256k1"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "=0.1.44"
+
+# Own workspace root: keeps this out of the parent workspace entirely.
+[workspace]
+
+[dev-dependencies]
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time"] }

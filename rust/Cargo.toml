@@ -53,7 +53,13 @@ members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-wire", "myot
 # in a process holding 1000+ wallet connections that turns one panic into an
 # outage for all of them. Excluded, it carries its own profile with
 # `panic = "unwind"`. It also pulls an HTTP stack no engine target links.
-exclude = ["tor-poc", "roost"]
+#
+# swarm (crate myotis-swarm, the embedded ant Swarm node) is excluded too: a member is built
+# by every `cargo build --workspace`, the release build included, and would pull
+# ant's libp2p features (dns, ping, upnp) into the engine. myotis-engine links it
+# only with its `swarm` feature (off by default); its own lock is
+# rust/swarm/Cargo.lock.
+exclude = ["tor-poc", "roost", "swarm"]
 
 # ONE version for every myotis-* release crate (`version.workspace = true` in each
 # member). The Gradle build is the source of truth for the release version
@@ -66,13 +72,15 @@ exclude = ["tor-poc", "roost"]
 # ONE minimum rustc (`rust-version.workspace = true` in each member), and the
 # single source of it: the root build.gradle.kts reads this line to decide
 # whether a toolchain builds the workspace or skips it like a missing cargo.
-# The dependency graph sets it — today Arti 0.48 (the `tor` feature's
-# arti-client / tor-rtcompat tree) needs 1.92; without it, revm 43 and
-# alloy-eips 2.1 would set 1.91 — and `verifyRustVersionFloor` fails `check`
-# when a lock update pulls in a crate that needs more.
+# The dependency graph sets it — today ant (the `swarm` feature's embedded Swarm
+# node, rust/swarm) needs 1.99, which the pinned toolchain (1.99.1) meets;
+# without it Arti 0.48 (the `tor` feature) would set 1.92, and revm 43 and
+# alloy-eips 2.1 1.91 — and `verifyRustVersionFloor` fails `check` when a lock
+# update pulls in a crate that needs more (it reads `--all-features`, so an
+# optional feature's crates count).
 [workspace.package]
 version = "0.1.21"
-rust-version = "1.92"
+rust-version = "1.99"
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.
