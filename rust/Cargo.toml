@@ -22,6 +22,10 @@
 #                      discovery, RLPx/eth/snap sessions, libp2p eth2 req/resp,
 #                      and the sync loop driving myotis-consensus. Depends on
 #                      myotis-consensus; never the other way around.
+#   myotis-addr1     — the addr1 address index's reader (pure Rust lib, sans-I/O like
+#                      myotis-consensus): its records, the cover math and the checks of
+#                      what Swarm delivered (SOC signatures, chunk and file addresses).
+#                      Depends on myotis-core only; the fetching is rust/swarm's.
 #   myotis-evm       — the EVM: eth_call / gas-estimation over SNAP-proof-verified
 #                      state (revm behind a SnapStateOracle trait; sans-I/O). THE
 #                      one heavy EL dep (revm) is gated to this crate. Grows through
@@ -42,7 +46,7 @@
 
 [workspace]
 resolver = "2"
-members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-wire", "myotis-evm", "myotis-engine", "myotis-net", "myotis-node", "myotis-rpcd", "uniffi-bindgen"]
+members = ["myotis-addr1", "myotis-bls", "myotis-consensus", "myotis-core", "myotis-wire", "myotis-evm", "myotis-engine", "myotis-net", "myotis-node", "myotis-rpcd", "uniffi-bindgen"]
 # tor-poc (docs/how-it-works/privacy-and-tor.md §3 proof-of-concept) is a STANDALONE crate,
 # excluded on purpose: it pulls the whole Arti dependency tree, which must never
 # burden the pure-engine build or CI. It depends on myotis-net/myotis-core by
