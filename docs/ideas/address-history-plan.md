@@ -90,8 +90,9 @@ built on an undecided rule can ship.
   [deep-block-verification.md §Open decisions](deep-block-verification.md#open-decisions).
 - **D2. Swarm as a data source** (item 14). **Decided (owner, 2026-11-19): an embedded
   client, `ant` linked into the Rust engine; the carve-out is in
-  `.claude/agent/data-sources.md`, whose scope supersedes the sketch below (the index's SOCs
-  and its spill and pages files).** The considerations it settled: `CLAUDE.md` allows devp2p and libp2p only. A
+  `.claude/agent/data-sources.md`, which supersedes the sketch below in both halves: what is
+  read (the index's SOCs and its spill and pages files), and how entries are shown (as
+  verified, contradicted or unverified, labelled, rather than only once checked).** The considerations it settled: `CLAUDE.md` allows devp2p and libp2p only. A
   carve-out in the shape of the existing ones (`.claude/agent/data-sources.md`): what may be
   read from Swarm (addr1 records and spill files only), and that every entry read is
   checked before it is shown. It must also name **the form of the reader**, because the
