@@ -1,7 +1,7 @@
 # Trust and data sources
 
 > Moved verbatim from `CLAUDE.md` (the always-loaded core keeps a summary and points here).
-> Read before adding any data source or touching roost, log-index seeds, `:tx-history`, or anything Portal would have solved.
+> Read before adding any data source or touching roost, log-index seeds, `:tx-history`, the Swarm reader (`ant`, the addr1 index, the importer-key setting), or anything Portal would have solved.
 
 ## Trust
 
@@ -128,18 +128,24 @@
   (eth2swarm `docs/address-index.md`) from Swarm, and nothing else from it.
   - **The reader is an embedded Swarm light node**: `ant`
     (https://github.com/freedom-hq/ant), linked into the engine, which reaches
-    Swarm over libp2p. Never a separate Swarm process or a local Bee/ant HTTP
-    API (that is the debug-only "local client over HTTP" of the rule above),
-    and never a Swarm HTTP gateway (one operator's server, which sees every
-    request with the user's IP).
+    Swarm over libp2p. In production never a separate Swarm process or a local
+    Bee/ant HTTP API (that stays the debug-only "local client over HTTP" of the
+    rule above, usable for debugging as before), and never a Swarm HTTP gateway
+    (one operator's server, which sees every request with the user's IP).
+  - **The Rust engine only.** The Java and Go engines refuse the address
+    history with the permanent `-32602`, never an empty list and never a
+    reader of their own.
   - **What may be read**: the index's SOCs (head updates, the origin, slice
     descriptors, buckets) and its spill and pages files. Every chunk is checked
     before use: a content-addressed chunk against its address, a SOC against
     its signature by the importer key, and every record by the decoder's
     canonical checks. Swarm is transport only.
   - **What it is trusted for**: an entry is a candidate, shown as verified only
-    once Myotis has checked it against verified chain data (the header and the
-    body or receipts, per role), else as unverified. Completeness (an entry
+    once Myotis has checked it against verified chain data (a header verified
+    through the existing trust anchors, and the body or receipts, per role),
+    else as unverified. A header that only the planned checkpoint table could
+    verify (D1 of the plan, undecided) leaves its entry unverified; this
+    carve-out does not decide D1. Completeness (an entry
     left out) and `TRACE` entries rest on the importer's word, as the seed
     carve-out's displayed balance rests on its publisher's; the answer says
     which block range rests on which importer key and names every range nobody
@@ -152,8 +158,12 @@
   - **The address index only.** Block bodies, receipts, state or any other
     data on Swarm needs its own decision, even when the same embedded node
     could fetch it.
-  - **Candidates, never answers.** No read the engine serves (an account, a
-    log, a block) is answered from Swarm; the index only says where to look.
+  - **The history list only.** The address history may list entries that are
+    still unverified, labelled as such; no other read the engine serves (an
+    account, a log, a block, a receipt) is answered from Swarm, verified or
+    not. The index only says where to look.
+  - **Not a decision on the TrueBlocks plan below** (D5 of the plan stays
+    open), and no sanction for an IPFS reader.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the

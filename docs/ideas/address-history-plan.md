@@ -1,7 +1,9 @@
 # Past transactions for any address: what is missing
 
 Status: **planning basis; the tracer bullet is being built** (`feature/swarm-addr1`: the
-Swarm carve-out, an embedded `ant` node, the addr1 reader and `myotis_getAddressHistory`). It lists everything needed for
+Swarm carve-out, an embedded `ant` node, the addr1 reader and `myotis_getAddressHistory`).
+D1 stays open: an entry whose header only the checkpoint table could verify stays
+unverified in the tracer bullet. It lists everything needed for
 [Punicus](https://github.com/biafra23/punicus) to show the past transactions of any
 address with Myotis as its data access layer. The work is split into workstreams, and
 each is meant to become an implementation plan of its own. It builds on two designs:
@@ -20,7 +22,7 @@ data, and says which ones it could not check.
 ```text
  importer ──▶ Swarm (addr1 slices, head feed)
                 │
-                ▼  antd, inside Myotis
+                ▼  ant, embedded in Myotis
  Myotis: head → cover → one bucket per slice → entries (block, slot, role)
                 │
                 ├─▶ header: checkpoint table + header walk (devp2p)
@@ -56,7 +58,7 @@ collects its items.
 | 2 | A fully synced node behind the importer | W1 |
 | 3 | A script that generates the table of every k-th block hash | W3 |
 | 4 | Publishing the addr1 index to Swarm | W1 |
-| 5 | antd bundled with Myotis | W5 |
+| 5 | ant embedded in Myotis | W5 |
 | 6 | Myotis code to query the index | W6 |
 | 7 | Myotis code to bridge the header gap | W3 |
 | 8 | Punicus code to query and show the history | W8 |
@@ -70,7 +72,7 @@ collects its items.
 | 16 | The importer's signing key as a trust input | W2 |
 | 17 | The head gap: the newest 13–32 minutes | W6 |
 | 18 | Who pays for Swarm reads (not the index: it reads within the free rate) | W5 |
-| 19 | antd on mobile, and the privacy of bucket requests and of block fetches | W5, W6 |
+| 19 | ant on mobile, and the privacy of bucket requests and of block fetches | W5, W6 |
 | 20 | Postage and running the importer continuously | W1 |
 | 21 | The engine contract and a JSON-RPC method | W7 |
 | 22 | Golden vectors shared by the importer and Myotis | W6 |
@@ -88,7 +90,8 @@ built on an undecided rule can ship.
   [deep-block-verification.md §Open decisions](deep-block-verification.md#open-decisions).
 - **D2. Swarm as a data source** (item 14). **Decided (owner, 2026-11-19): an embedded
   client, `ant` linked into the Rust engine; the carve-out is in
-  `.claude/agent/data-sources.md`.** The considerations it settled: `CLAUDE.md` allows devp2p and libp2p only. A
+  `.claude/agent/data-sources.md`, whose scope supersedes the sketch below (the index's SOCs
+  and its spill and pages files).** The considerations it settled: `CLAUDE.md` allows devp2p and libp2p only. A
   carve-out in the shape of the existing ones (`.claude/agent/data-sources.md`): what may be
   read from Swarm (addr1 records and spill files only), and that every entry read is
   checked before it is shown. It must also name **the form of the reader**, because the
@@ -124,7 +127,8 @@ built on an undecided rule can ship.
   role says. That is not a row to skip but evidence against the party completeness and TRACE
   rest on: the checkpoint-server rule treats one differing answer as an alarm, and this
   needs a decision of the same kind (stop trusting the key, warn, report).
-- **D5. This plan against the one in `data-sources.md`.** That file records the plan to run
+- **D5. This plan against the one in `data-sources.md`.** Still open: the Swarm carve-out
+  (2026-11-19) does not decide it. That file records the plan to run
   our own TrueBlocks scraper and add its IPFS peer to Myotis for `:tx-history`. addr1 on
   Swarm would replace it; `:tx-history` stays debug-only either way.
 
@@ -207,7 +211,8 @@ first, because deep `eth_getBlockByNumber` and receipt reads are useful on their
 
 ### W5. Swarm access in Myotis (items 5, 18, 19)
 
-- **antd (item 5)**, linked into the engine (the form D2 names), in the desktop app, the
+- **ant (item 5)**, its crates linked into the engine (the form D2 names; not the `antd`
+  daemon), in the desktop app, the
   daemon, `myotis-rpcd`, Android and iOS. Besides APK and app size, background execution,
   battery and iOS suspending the app, linking it costs this repository:
   - **The panic contract.** The workspace builds `panic = "abort"` (`rust/Cargo.toml`,
