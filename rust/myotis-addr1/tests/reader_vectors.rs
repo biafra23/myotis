@@ -94,11 +94,14 @@ fn the_reader_decodes_eth2swarms_edge_cases() {
         names,
         [
             "spill-pages",
+            "spill-page-full",
             "spill-limit",
             "bucket-4096",
             "bucket-4097",
             "bucket-pages",
-            "late-start"
+            "bucket-page-full",
+            "late-start",
+            "mainnet-height"
         ]
     );
     let mut checked = 0;
@@ -147,6 +150,6 @@ fn the_reader_decodes_eth2swarms_edge_cases() {
             checked += 1;
         }
     }
-    // Every address of every case was compared: 1 + 2 + 32 + 32 + 64 + 2.
-    assert_eq!(checked, 133);
+    // Every address of every case was compared: 1 + 1 + 2 + 32 + 32 + 64 + 42 + 2 + 2.
+    assert_eq!(checked, 178);
 }
