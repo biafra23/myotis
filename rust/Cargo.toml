@@ -53,7 +53,14 @@ members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-wire", "myot
 # in a process holding 1000+ wallet connections that turns one panic into an
 # outage for all of them. Excluded, it carries its own profile with
 # `panic = "unwind"`. It also pulls an HTTP stack no engine target links.
-exclude = ["tor-poc", "roost"]
+#
+# swarm (crate myotis-swarm, the embedded ant Swarm node) is excluded too: a member is
+# built by every `cargo build --workspace`, the release build included, and would pull
+# ant's libp2p features (dns, ping, upnp) into the engine. No engine crate depends on it
+# yet either: ant is a git dependency, and in this lock it would make every cold build of
+# the workspace fetch it (rust/swarm/src/lib.rs, "Not linked into the engine yet"). Its own
+# lock is rust/swarm/Cargo.lock, seeded from this one.
+exclude = ["tor-poc", "roost", "swarm"]
 
 # ONE version for every myotis-* release crate (`version.workspace = true` in each
 # member). The Gradle build is the source of truth for the release version
