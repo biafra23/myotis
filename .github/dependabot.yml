@@ -26,9 +26,9 @@
 # Gradle one the pin regeneration), and, moving a pin, needs a dispatched
 # `reproducible builds` run before it merges — per dependency, that cost
 # multiplied by every crate and library in the tree. A group without
-# `group-by` is ONE PR across all directories of its entry, so the three
-# Cargo workspaces, which share myotis-net by path, move together and their
-# three locks with them.
+# `group-by` is ONE PR across all directories of its entry, so the four
+# Cargo workspaces (three of which share myotis-net by path) move together and
+# their four locks with them.
 #
 # One routine group per ecosystem holds what should not break; every update
 # that may break comes as a PR of its own (owner's decision, 2026-11-12), so
@@ -43,8 +43,8 @@
 #   0.x minor (0.11 -> 0.12) as breaking, and most of this tree's `=` pins
 #   are 0.x (libp2p, discv5, k256, sha2, sha3, aes, hmac, Arti ...). 1.x
 #   minors come one by one with them. `group-by: dependency-name` makes each
-#   one PR across the three workspaces; left ungrouped, a crate would move
-#   in three PRs, each regenerating one lock of three.
+#   one PR across the four workspaces; left ungrouped, a crate would move
+#   in four PRs, each regenerating one lock of four.
 #
 # The actions stay weekly and in one group: GitHub raises no Dependabot
 # alerts for actions pinned by SHA, which every action here is, so this run

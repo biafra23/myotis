@@ -21,10 +21,6 @@ crate-type = ["cdylib", "rlib"]
 # `set_tor_enabled`/`tor_status`/`set_tor_storage_dirs` FFI functions exist either
 # way (they no-op / report "not compiled" / refuse without this feature).
 tor = ["myotis-net/tor"]
-# Swarm reads of the addr1 address index through an embedded ant node
-# (rust/swarm, .claude/agent/data-sources.md) -- OFF by default, so default and mobile builds
-# neither compile nor link ant.
-swarm = ["dep:myotis-swarm"]
 
 [dependencies]
 myotis-consensus = { path = "../myotis-consensus" }
@@ -36,7 +32,6 @@ myotis-net = { path = "../myotis-net" }
 # Direct dep for U256 (value parsing) + the eth_call bridge types; also pulled
 # transitively via myotis-net. revm is gated inside myotis-evm.
 myotis-evm = { path = "../myotis-evm" }
-myotis-swarm = { path = "../swarm", optional = true }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread"] }
 # The JVM boundary: UniFFI proc-macro scaffolding (replaces the old hand-JNI —
 # the generated Kotlin bindings live in :myotis-engine-rust and are pinned to this

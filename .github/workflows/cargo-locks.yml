@@ -6,9 +6,8 @@
 #   rust/Cargo.lock               the engine workspace
 #   rust/roost/Cargo.lock         the light-client server
 #   rust/tor-poc/Cargo.lock       the Tor proof-of-concept
-#   rust/swarm/Cargo.lock         the embedded Swarm node (crate myotis-swarm), for
-#                                 its own tests (the engine's `swarm` feature
-#                                 builds it from the engine lock)
+#   rust/swarm/Cargo.lock         the embedded Swarm node (crate myotis-swarm),
+#                                 seeded from rust/Cargo.lock
 # plus the Rust tour's workbook (docs/tour/workbook), a standalone crate whose
 # solution/Cargo.lock is checked here and whose starter/ is generated from
 # solution/ by make_starter.py — `--check` fails if the two differ, lock
@@ -26,12 +25,12 @@
 # "the lock file … needs to be updated but --locked was passed" for a missing
 # edge, a missing package or a wrong version. (`cargo metadata --locked` would
 # do the same check but has to read every dependency's manifest, i.e. download
-# and unpack the whole graph — ~1 GB across the three, mostly tor-poc's Arti
+# and unpack the whole graph — ~1 GB across the four, mostly tor-poc's Arti
 # tree, which rust/Cargo.toml says must never burden CI.)
 #
 # Trigger shape as the other workflows: push scoped to main + release tags so a
 # branch push with an open PR runs once (under pull_request), and tags so a
-# release's three locks are checked together, tor-poc's included.
+# release's four locks are checked together, tor-poc's included.
 name: cargo locks
 
 on:

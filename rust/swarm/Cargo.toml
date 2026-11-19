@@ -1,8 +1,7 @@
 [package]
 name = "myotis-swarm"
-# Not a member of ../Cargo.toml's workspace (like tor-poc): a member is built by every
-# `cargo build --workspace`, the release build included, and would pull ant's libp2p
-# features into the engine. myotis-engine links it only with its `swarm` feature.
+# Not a member of ../Cargo.toml's workspace (like tor-poc), and no engine crate depends on it
+# yet (rust/Cargo.toml `exclude`, and the crate doc's "Not linked into the engine yet").
 # Not a release crate of its own (it is linked into myotis-engine), so, like tor-poc and
 # roost, no version of its own to keep in step and nothing to publish.
 version = "0.0.0"
@@ -29,4 +28,4 @@ tracing = "=0.1.44"
 [workspace]
 
 [dev-dependencies]
-tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "time"] }

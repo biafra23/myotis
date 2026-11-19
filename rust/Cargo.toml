@@ -54,11 +54,12 @@ members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-wire", "myot
 # outage for all of them. Excluded, it carries its own profile with
 # `panic = "unwind"`. It also pulls an HTTP stack no engine target links.
 #
-# swarm (crate myotis-swarm, the embedded ant Swarm node) is excluded too: a member is built
-# by every `cargo build --workspace`, the release build included, and would pull
-# ant's libp2p features (dns, ping, upnp) into the engine. myotis-engine links it
-# only with its `swarm` feature (off by default); its own lock is
-# rust/swarm/Cargo.lock.
+# swarm (crate myotis-swarm, the embedded ant Swarm node) is excluded too: a member is
+# built by every `cargo build --workspace`, the release build included, and would pull
+# ant's libp2p features (dns, ping, upnp) into the engine. No engine crate depends on it
+# yet either: ant is a git dependency, and in this lock it would make every cold build of
+# the workspace fetch it (rust/swarm/src/lib.rs, "Not linked into the engine yet"). Its own
+# lock is rust/swarm/Cargo.lock, seeded from this one.
 exclude = ["tor-poc", "roost", "swarm"]
 
 # ONE version for every myotis-* release crate (`version.workspace = true` in each
@@ -72,15 +73,13 @@ exclude = ["tor-poc", "roost", "swarm"]
 # ONE minimum rustc (`rust-version.workspace = true` in each member), and the
 # single source of it: the root build.gradle.kts reads this line to decide
 # whether a toolchain builds the workspace or skips it like a missing cargo.
-# The dependency graph sets it — today ant (the `swarm` feature's embedded Swarm
-# node, rust/swarm) needs 1.99, which the pinned toolchain (1.99.1) meets;
-# without it Arti 0.48 (the `tor` feature) would set 1.92, and revm 43 and
-# alloy-eips 2.1 1.91 — and `verifyRustVersionFloor` fails `check` when a lock
-# update pulls in a crate that needs more (it reads `--all-features`, so an
-# optional feature's crates count).
+# The dependency graph sets it — today Arti 0.48 (the `tor` feature's
+# arti-client / tor-rtcompat tree) needs 1.92; without it, revm 43 and
+# alloy-eips 2.1 would set 1.91 — and `verifyRustVersionFloor` fails `check`
+# when a lock update pulls in a crate that needs more.
 [workspace.package]
 version = "0.1.21"
-rust-version = "1.99"
+rust-version = "1.92"
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.
