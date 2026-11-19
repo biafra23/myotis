@@ -611,11 +611,11 @@ fn decode_spill_page(page: &[u8], first: u64, last: u64) -> Result<Vec<Entry>> {
 /// file, checked: the record's count, ascending across pages, and the canonical encoding.
 pub fn spill_entries(slice: &SliceRecord, file: &[u8], count: u64) -> Result<Vec<Entry>> {
     ensure!(file.len() <= MAX_FILE, "spill file of {} bytes", file.len());
-    let entries = pages(file)?
-        .into_iter()
-        .map(|p| decode_spill_page(p, slice.first_block, slice.last_block()))
-        .collect::<Result<Vec<_>>>()?
-        .concat();
+    // One vector, extended page by page (a collect and concat would hold two copies).
+    let mut entries = Vec::new();
+    for p in pages(file)? {
+        entries.extend(decode_spill_page(p, slice.first_block, slice.last_block())?);
+    }
     ensure!(
         entries.len() as u64 == count,
         "spill file holds {} entries, the record states {count}",
@@ -690,11 +690,14 @@ pub fn bucket_pages_records(
         "pages file has {} pages, the bucket states {pages_count}",
         split.len()
     );
-    let records = split
-        .into_iter()
-        .map(|p| decode_bucket_page(p, slice.first_block, slice.last_block()))
-        .collect::<Result<Vec<_>>>()?
-        .concat();
+    let mut records = Vec::new();
+    for p in split {
+        records.extend(decode_bucket_page(
+            p,
+            slice.first_block,
+            slice.last_block(),
+        )?);
+    }
     ensure!(
         records.len() as u64 == record_count as u64,
         "pages file holds {} records, the bucket states {record_count}",
@@ -752,11 +755,12 @@ pub fn check_slice(rec: &SliceRecord, s: (u8, u32), first_unit: u64) -> Result<(
 /// `head` is head update `n` of the index whose origin is `origin`: it announces
 /// `origin.units + n` units and the origin's start, and update 0 is the origin itself.
 pub fn check_head(head: &HeadRecord, origin: &HeadRecord, n: u64) -> Result<()> {
+    let expected = origin.units.checked_add(n);
     ensure!(
-        head.units == origin.units + n,
-        "head update {n} announces {} units, expected {}",
+        expected == Some(head.units),
+        "head update {n} announces {} units, expected the origin's {} plus {n}",
         head.units,
-        origin.units + n
+        origin.units
     );
     ensure!(
         head.first_unit == origin.first_unit,

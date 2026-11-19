@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use myotis_addr1::cover::slices_to_read;
-use myotis_addr1::lookup::{bucket_for, in_bucket, select};
+use myotis_addr1::lookup::{bucket_for, in_bucket, select, InBucket};
 use myotis_addr1::records::{
     bucket_id, bucket_pages_records, check_head, check_slice, head_id, origin_id, slice_id,
     spill_entries, BucketRecord, Entry, HeadRecord, SliceRecord,
@@ -70,12 +70,17 @@ impl Reader {
             let bucket =
                 BucketRecord::decode(&self.soc(bucket_id(CHAIN, s.0, s.1, k)), slice.first_block)
                     .unwrap();
-            let mut found = in_bucket(address, &slice, &bucket).unwrap();
-            if let Some((pages_ref, pages, count)) = found.pages_file {
-                let records =
-                    bucket_pages_records(&slice, &self.file(&pages_ref), pages, count).unwrap();
-                found = select(address, &records);
-            }
+            let found = match in_bucket(address, &slice, &bucket).unwrap() {
+                InBucket::Records(found) => found,
+                InBucket::Paged {
+                    pages_ref,
+                    pages,
+                    records,
+                } => select(
+                    address,
+                    &bucket_pages_records(&slice, &self.file(&pages_ref), pages, records).unwrap(),
+                ),
+            };
             out.extend(found.entries);
             for (spill_ref, count) in found.spill_files {
                 out.extend(spill_entries(&slice, &self.file(&spill_ref), count).unwrap());

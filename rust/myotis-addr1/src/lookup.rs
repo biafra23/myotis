@@ -30,17 +30,30 @@ pub fn bucket_for(address: &[u8; 20], slice: &SliceRecord) -> u32 {
     bucket_of(&address_hash(address), slice.bucket_count)
 }
 
-/// What one slice holds for an address, once its bucket is read: entries inline, and
-/// files still to read.
+/// What one slice holds for an address, once its records are read: entries inline, and
+/// spill files still to read.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct InSlice {
-    /// Entries stored in the bucket itself.
+    /// Entries stored in the record itself.
     pub entries: Vec<Entry>,
     /// Spill files to read (reference, entry count): see `records::spill_entries`.
     pub spill_files: Vec<([u8; 32], u64)>,
-    /// The bucket's pages file, if the bucket is paged (reference, pages, records): read it
-    /// with `records::bucket_pages_records`, then [`select`] again.
-    pub pages_file: Option<([u8; 32], u32, u32)>,
+}
+
+/// What a bucket gives for an address: its records, or, for a paged bucket, the pages file
+/// that holds them. A paged bucket has no entries of its own, so the two are separate cases
+/// a caller cannot mistake for an empty answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InBucket {
+    /// The address's records, from an inline bucket.
+    Records(InSlice),
+    /// A paged bucket: read its pages file with `records::bucket_pages_records(slice, file,
+    /// pages, records)`, then [`select`] the address's records from it.
+    Paged {
+        pages_ref: [u8; 32],
+        pages: u32,
+        records: u32,
+    },
 }
 
 /// The records of `address` in a decoded bucket, which must be the bucket
@@ -49,7 +62,7 @@ pub fn in_bucket(
     address: &[u8; 20],
     slice: &SliceRecord,
     bucket: &BucketRecord,
-) -> Result<InSlice> {
+) -> Result<InBucket> {
     let k = bucket_for(address, slice);
     ensure!(
         (bucket.level, bucket.index, bucket.bucket) == (slice.level, slice.index, k),
@@ -61,14 +74,15 @@ pub fn in_bucket(
         slice.index
     );
     Ok(match &bucket.body {
-        BucketBody::Inline(records) => select(address, records),
+        BucketBody::Inline(records) => InBucket::Records(select(address, records)),
         BucketBody::Paged {
             count,
             pages,
             pages_ref,
-        } => InSlice {
-            pages_file: Some((*pages_ref, *pages, *count)),
-            ..Default::default()
+        } => InBucket::Paged {
+            pages_ref: *pages_ref,
+            pages: *pages,
+            records: *count,
         },
     })
 }

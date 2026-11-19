@@ -71,9 +71,10 @@ pub fn resolve(n: u64, pending: &[SliceId]) -> Vec<SliceId> {
     out
 }
 
-/// The slices of [`resolve`] that end after unit `m`. For an index from unit `S`,
-/// `resolve_after(S, …)` is everything a client reads; for an incremental sync, `m` is the
-/// last unit it has read (at least `S`).
+/// The slices of [`resolve`] that hold a unit at or after `m` (units below `m` are not wanted).
+/// For an index from unit `S`, `resolve_after(S, …)` is everything a client reads; for an
+/// incremental sync, `m` is the `units` of the head it last read (at least `S`): units below it
+/// are read already.
 pub fn resolve_after(m: u64, n: u64, pending: &[SliceId]) -> Vec<SliceId> {
     resolve(n, pending)
         .into_iter()
@@ -101,9 +102,10 @@ impl Plan {
     }
 }
 
-/// What a client reads for `head`: every slice from the index's start, or only those after
-/// unit `since` for an incremental sync (a `since` before the start reads from the start). A
-/// `since` beyond the head's units is refused: that head is older than what was read.
+/// What a client reads for `head`: every slice from the index's start, or for an incremental
+/// sync only what is new since the head it read before, whose `units` is `since` (units below
+/// `since` are read already; a `since` before the start reads from the start). A `since`
+/// beyond the head's units is refused: that head is older than what was read.
 pub fn slices_to_read(head: &HeadRecord, since: Option<u64>) -> Result<Plan> {
     if let Some(m) = since {
         ensure!(

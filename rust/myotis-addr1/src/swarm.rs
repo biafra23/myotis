@@ -15,8 +15,9 @@ const ID_LEN: usize = 32;
 const SIG_LEN: usize = 65;
 const SPAN_LEN: usize = 8;
 
-/// BMT root of a payload of at most [`CHUNK_SIZE`] bytes.
-pub fn bmt_root(payload: &[u8]) -> [u8; 32] {
+/// BMT root of a payload of at most [`CHUNK_SIZE`] bytes (every caller in this crate checks
+/// the length first).
+pub(crate) fn bmt_root(payload: &[u8]) -> [u8; 32] {
     assert!(
         payload.len() <= CHUNK_SIZE,
         "chunk payload over {CHUNK_SIZE}"
@@ -24,16 +25,13 @@ pub fn bmt_root(payload: &[u8]) -> [u8; 32] {
     let mut level = vec![0u8; CHUNK_SIZE];
     level[..payload.len()].copy_from_slice(payload);
     while level.len() > SEGMENT {
-        level = level
-            .chunks(2 * SEGMENT)
-            .flat_map(|pair| keccak256(pair))
-            .collect();
+        level = level.chunks(2 * SEGMENT).flat_map(keccak256).collect();
     }
     level.try_into().expect("32 bytes")
 }
 
 /// Address of a content-addressed chunk with the given span and payload.
-pub fn cac_address(span: u64, payload: &[u8]) -> [u8; 32] {
+pub(crate) fn cac_address(span: u64, payload: &[u8]) -> [u8; 32] {
     keccak256_concat(&span.to_le_bytes(), &bmt_root(payload))
 }
 
@@ -43,8 +41,10 @@ pub fn soc_address(identifier: &[u8; 32], owner: &[u8; 20]) -> [u8; 32] {
 }
 
 /// The payload of a content-addressed chunk in wire form (`span ‖ payload`), checked against
-/// `address`.
-pub fn verify_cac(wire: &[u8], address: &[u8; 32]) -> Result<Vec<u8>> {
+/// `address`. The address does not commit to the payload's length: the BMT pads it with
+/// zeros, so trailing zero bytes can be added or removed (up to 4096) without changing it. A
+/// caller binds the length itself: [`FileChunk::decode`] to the span, [`verify_soc`] too.
+pub(crate) fn verify_cac(wire: &[u8], address: &[u8; 32]) -> Result<Vec<u8>> {
     ensure!(
         wire.len() >= SPAN_LEN && wire.len() <= SPAN_LEN + CHUNK_SIZE,
         "chunk of {} bytes",
@@ -73,7 +73,7 @@ pub fn verify_soc(wire: &[u8], address: &[u8; 32], owner: &[u8; 20]) -> Result<V
         wire.len()
     );
     let identifier: [u8; 32] = wire[..ID_LEN].try_into().expect("32");
-    let mut sig: [u8; 65] = wire[ID_LEN..ID_LEN + SIG_LEN].try_into().expect("65");
+    let sig: [u8; 65] = wire[ID_LEN..ID_LEN + SIG_LEN].try_into().expect("65");
     let span_at = ID_LEN + SIG_LEN;
     let span = u64::from_le_bytes(wire[span_at..span_at + SPAN_LEN].try_into().expect("8"));
     let payload = &wire[span_at + SPAN_LEN..];
@@ -92,7 +92,7 @@ pub fn verify_soc(wire: &[u8], address: &[u8; 32], owner: &[u8; 20]) -> Result<V
     // EIP-191 personal message over keccak256(identifier ‖ CAC address of the payload).
     let digest = keccak256_concat(&identifier, &cac_address(span, payload));
     let msg = keccak256_concat(b"\x19Ethereum Signed Message:\n32", &digest);
-    let signer = recover_signer(&msg, &mut sig)?;
+    let signer = recover_signer(&msg, &sig)?;
     ensure!(
         signer == *owner,
         "SOC signed by {}, expected owner {}",
@@ -104,7 +104,7 @@ pub fn verify_soc(wire: &[u8], address: &[u8; 32], owner: &[u8; 20]) -> Result<V
 
 /// The address that signed `hash` with `sig` (`r ‖ s ‖ v`), as the reference reader and Bee
 /// accept it: `v` as 0/1 or 27/28, and a high `s` normalized (which flips the recovery id).
-fn recover_signer(hash: &[u8; 32], sig: &mut [u8; 65]) -> Result<[u8; 20]> {
+fn recover_signer(hash: &[u8; 32], sig: &[u8; 65]) -> Result<[u8; 20]> {
     let v = match sig[64] {
         v @ 0..=1 => v,
         v @ 27..=28 => v - 27,
@@ -134,14 +134,37 @@ pub enum FileChunk {
     Inner { span: u64, children: Vec<[u8; 32]> },
 }
 
+/// The bytes each child of an intermediate chunk of `span` bytes covers at most: the largest
+/// power of 128 leaves below the span. `span` is at most [`MAX_FILE`](crate::records::MAX_FILE),
+/// so the product cannot overflow.
+fn child_cap(span: u64) -> u64 {
+    let mut cap = CHUNK_SIZE as u64;
+    while cap * (BRANCHES as u64) < span {
+        cap *= BRANCHES as u64;
+    }
+    cap
+}
+
 impl FileChunk {
     /// Decodes a chunk of a file tree (wire form `span ‖ payload`), fetched under
-    /// `reference`: its content address must be `reference`. A chunk whose span exceeds its
-    /// payload is an intermediate one, whose payload is a whole number of references and has
-    /// no more than the span needs.
-    pub fn decode(wire: &[u8], reference: &[u8; 32]) -> Result<Self> {
+    /// `reference`: its content address must be `reference`, and its span `expected_span`
+    /// (for the root, the file's size if the caller knows it; for a child, what
+    /// [`FileChunk::child_spans`] of its parent says), so a tree can be neither larger nor
+    /// deeper than its root states. A chunk whose span exceeds its payload is an intermediate
+    /// one, whose payload is a whole number of references and has no more than the span
+    /// needs. A span above [`MAX_FILE`](crate::records::MAX_FILE), the largest file a client
+    /// reads, is refused before any child is fetched.
+    pub fn decode(wire: &[u8], reference: &[u8; 32], expected_span: Option<u64>) -> Result<Self> {
         let payload = verify_cac(wire, reference)?;
         let span = u64::from_le_bytes(wire[..SPAN_LEN].try_into().expect("8"));
+        ensure!(
+            span <= crate::records::MAX_FILE as u64,
+            "file chunk of span {span}, above the {} bytes a client reads",
+            crate::records::MAX_FILE
+        );
+        if let Some(e) = expected_span {
+            ensure!(span == e, "file chunk of span {span}, its parent says {e}");
+        }
         if span <= CHUNK_SIZE as u64 {
             ensure!(
                 payload.len() as u64 == span,
@@ -159,18 +182,29 @@ impl FileChunk {
             .chunks(32)
             .map(|c| c.try_into().expect("32"))
             .collect();
-        // Each child covers at most `cap` bytes, where `cap` is the largest power of 128
-        // leaves below the span; the span then fixes the number of children.
-        let mut cap = CHUNK_SIZE as u64;
-        while cap * (BRANCHES as u64) < span {
-            cap *= BRANCHES as u64;
-        }
+        // The span fixes the number of children.
+        let cap = child_cap(span);
         ensure!(
             children.len() as u64 == span.div_ceil(cap),
             "intermediate chunk of span {span} with {} children",
             children.len()
         );
         Ok(Self::Inner { span, children })
+    }
+
+    /// The span of each child of an intermediate chunk, in order: every child but the last
+    /// covers exactly the cap, the last one the rest. Empty for a leaf.
+    pub fn child_spans(&self) -> Vec<u64> {
+        match self {
+            Self::Leaf(_) => Vec::new(),
+            Self::Inner { span, children } => {
+                let cap = child_cap(*span);
+                let n = children.len() as u64;
+                (0..n)
+                    .map(|i| if i + 1 < n { cap } else { span - cap * (n - 1) })
+                    .collect()
+            }
+        }
     }
 }
 
@@ -360,12 +394,19 @@ mod tests {
     }
 
     /// A file walked chunk by chunk from its root, each chunk checked, gives the file back.
-    fn walk(tree: &std::collections::HashMap<[u8; 32], Vec<u8>>, r: &[u8; 32], out: &mut Vec<u8>) {
-        match FileChunk::decode(&tree[r], r).unwrap() {
+    fn walk(
+        tree: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+        r: &[u8; 32],
+        span: Option<u64>,
+        out: &mut Vec<u8>,
+    ) {
+        let chunk = FileChunk::decode(&tree[r], r, span).unwrap();
+        let spans = chunk.child_spans();
+        match chunk {
             FileChunk::Leaf(p) => out.extend(p),
             FileChunk::Inner { children, .. } => {
-                for c in &children {
-                    walk(tree, c, out);
+                for (c, s) in children.iter().zip(spans) {
+                    walk(tree, c, Some(s), out);
                 }
             }
         }
@@ -379,13 +420,29 @@ mod tests {
             let root = file_reference(&d);
             assert!(tree.contains_key(&root), "length {len}");
             let mut got = Vec::new();
-            walk(&tree, &root, &mut got);
+            walk(&tree, &root, Some(len as u64), &mut got);
             assert_eq!(got, d, "length {len}");
         }
         // A chunk under another reference is refused.
         let d = data(8192);
         let tree = file_tree(&d);
-        assert!(FileChunk::decode(&tree[0].1, &tree[1].0).is_err());
+        assert!(FileChunk::decode(&tree[0].1, &tree[1].0, None).is_err());
+        // A root whose span is not the file's size is refused.
+        let root = file_reference(&d);
+        let wire = &tree.iter().find(|(r, _)| *r == root).unwrap().1;
+        assert!(FileChunk::decode(wire, &root, Some(8191)).is_err());
+    }
+
+    #[test]
+    fn spans_beyond_a_client_file_are_refused() {
+        // A span above 2^61 overflowed the cap computation: refused, at once.
+        let payload = [7u8; 32];
+        for span in [u64::MAX, 1 << 62, crate::records::MAX_FILE as u64 + 1] {
+            let mut wire = span.to_le_bytes().to_vec();
+            wire.extend_from_slice(&payload);
+            let r = cac_address(span, &payload);
+            assert!(FileChunk::decode(&wire, &r, None).is_err(), "span {span}");
+        }
     }
 
     #[test]
@@ -403,21 +460,18 @@ mod tests {
         low[..64].copy_from_slice(&sig.to_bytes());
         low[64] = recid.to_byte() + 27;
         let want = crate::records::tests_support::unhex("f39fd6e51aad88f6f4ce6ab8827279cfffb92266");
-        assert_eq!(
-            recover_signer(&hash, &mut low.clone()).unwrap().to_vec(),
-            want
-        );
+        assert_eq!(recover_signer(&hash, &low).unwrap().to_vec(), want);
         // The high-S twin.
         let n = k256::Scalar::ZERO - sig.s().as_ref();
         let high = Signature::from_scalars(sig.r().as_ref().to_bytes(), n.to_bytes()).unwrap();
         let mut h = [0u8; 65];
         h[..64].copy_from_slice(&high.to_bytes());
         h[64] = recid.to_byte() ^ 1;
-        assert_eq!(recover_signer(&hash, &mut h).unwrap().to_vec(), want);
+        assert_eq!(recover_signer(&hash, &h).unwrap().to_vec(), want);
         // v outside 0/1/27/28 is refused.
         let mut bad = low;
         bad[64] = 37;
-        assert!(recover_signer(&hash, &mut bad).is_err());
+        assert!(recover_signer(&hash, &bad).is_err());
     }
 
     #[test]
