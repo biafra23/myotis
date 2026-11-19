@@ -8,7 +8,8 @@ on:
     branches: [ "main" ]
     tags: [ "v*" ]
   # On a PR the jobs below do not build (owner's request, 2026-11-19): the APKs
-  # and the emulator smoke run in the merge queue instead (merge_group below),
+  # build in the merge queue instead (merge_group below; the non-blocking
+  # emulator smoke then runs on the push to main that follows),
   # once per PR on the commit `main` will become, rather than on every push of
   # a PR under review. Before that, a PR into main built them on every push
   # and a part PR into a feature branch skipped them (owner ruling,
@@ -37,25 +38,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Holds the build, and the emulator smoke behind it, until this PR's Claude
-  # review has finished, so neither runs on a commit the review might still
-  # ask to change. It passes straight through on every other event — see
-  # wait-for-claude-review.yml.
-  review-gate:
-    name: Review gate
-    # Everything below needs this job, so skipping it here skips the build and
-    # the emulator smoke too (a dependent job is skipped when a needed job was,
-    # unless its `if` uses always()) — and on a tag the release uploads. So an
-    # `if:` on this job MUST be true on every non-pull_request event (push to
-    # main, v* tags, dispatch, the merge queue). It tests the event alone: on a
-    # PR nothing below builds (the header says why), and on every other event
-    # it runs (#582). The release jobs only run on tags. In the merge queue the
-    # review has finished, and the gate passes straight through.
-    if: github.event_name != 'pull_request'
-    uses: ./.github/workflows/wait-for-claude-review.yml
-    permissions:
-      actions: read
-
   # Builds BOTH apps every run: the debug one (com.jaeckel.ethp2p.android.debug,
   # public debug key) and the UNSIGNED release one (com.jaeckel.ethp2p.android).
   # The release APK is signed only on a v* tag, by sign-release below, so the
@@ -66,7 +48,12 @@ jobs:
   # that actually ships, and a signing rehearsal. Neither replaces the other.
   build:
     name: Build APKs (debug + unsigned release)
-    needs: review-gate
+    # No PR builds the APKs: the merge queue does (the header says why). Every
+    # job below needs this one, so this `if` must stay true on every event but
+    # pull_request, or a tag would publish nothing (#582). Before the queue a
+    # review gate (wait-for-claude-review.yml) held this job until the PR's
+    # review had finished; it only ever waits on a PR, so it went with them.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -347,8 +334,11 @@ jobs:
       contents: read
     # Skip on release tags: nothing consumes this job's result there (release
     # needs only build + sign-release + version-guard), and the tagged commit
-    # already ran it on its way through main/PR.
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    # already ran it on its way through main. Skip in the merge queue too
+    # (2026-11-19): it is non-blocking, so it could only delay the queue, by
+    # up to its 60-minute timeout on a hang, and the push to main that follows
+    # a queue merge runs it on the same commit.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' }}
     # The in-test deadline only bounds the test body — NOT the system-image
     # download, AVD creation, or an emulator/adb hang (the failure modes named
     # below), which would otherwise run to GitHub's 6-hour default on a job
@@ -750,30 +740,25 @@ jobs:
 
   # The one check the merge queue requires of this workflow (owner's request,
   # 2026-11-19): a fixed name for the build. In the queue it passes only if the
-  # build succeeded. The emulator smoke stays non-blocking, as its job says
-  # (continue-on-error): its result is printed here, and a smoke that did not
-  # succeed is a warning, never a failure. On a PR the build does not run, and
-  # it passes, so the PR can be queued; elsewhere it fails only for a build
-  # that failed. `always()`, not `!cancelled()`: in a cancelled run this job
-  # must still run and fail, since a skipped required check counts as passed.
+  # build succeeded. It does not wait for the emulator smoke, which is
+  # non-blocking (continue-on-error) and does not run in the queue. On a PR
+  # the build does not run, and it passes, so the PR can be queued; elsewhere
+  # it fails only for a build that failed. `always()`, not `!cancelled()`: in a
+  # cancelled run this job must still run and fail, since a skipped required
+  # check counts as passed.
   result:
     name: Android APK result
-    needs: [build, boot-smoke-api29]
+    needs: [build]
     if: ${{ always() }}
     runs-on: ubuntu-26.04
     permissions: {}
     steps:
-      - name: Check the build and the emulator smoke
+      - name: Check the APK build
         env:
           EVENT: ${{ github.event_name }}
           BUILD: ${{ needs.build.result }}
-          SMOKE: ${{ needs.boot-smoke-api29.result }}
         run: |
-          echo "On $EVENT: build $BUILD, emulator smoke $SMOKE."
-          case "$SMOKE" in
-            success|skipped) ;;
-            *) echo "::warning::The API-29 emulator smoke did not succeed ($SMOKE); it does not block." ;;
-          esac
+          echo "On $EVENT: APK build $BUILD."
           if [ "$EVENT" = merge_group ]; then
             [ "$BUILD" = success ] && exit 0
             echo "::error::The merge queue needs the APK build to succeed (it was $BUILD)."

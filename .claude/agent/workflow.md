@@ -49,9 +49,15 @@ step skipped and none treated as optional or "only if asked"**:
    A PR into `main` lands through the merge queue (owner's request,
    2026-11-19): adding it to the queue ("Merge when ready", or `gh pr merge`
    while the queue is on) is the owner's merge, never yours. The queue then
-   builds the Android APK, the emulator smoke and the macOS dmg, which a PR
-   does not. If it takes the PR out of the queue, the failure is the PR's:
-   read the failed run, fix it on the PR's branch, and report it ready again.
+   builds the Android APK and the macOS dmg, which a PR does not. If it takes
+   the PR out of the queue, find the run: the removal event on the PR's
+   timeline links it, or `gh run list --event merge_group` (the queue's runs
+   are on `gh-readonly-queue/main/pr-<n>-…`, not on the PR's head, whose
+   checks stay green). A check that never reported (a starved runner, a
+   timeout) is no failure of the PR's code: say so and ask the owner to queue
+   it again. Otherwise merge `main` into the branch first (the queue built
+   the PR on top of the entries ahead of it), fix it there, and report it
+   ready again.
 
 Short form: **code → review → PR → wait for review comments → address them.**
 Do not stop at "pushed" and do not ask whether to open the PR or run the review —

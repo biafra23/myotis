@@ -33,6 +33,8 @@ on:
   pull_request:
     paths:
       - ".github/workflows/desktop-windows-msi.yml"
+      # The review gate it calls: a PR that breaks that file goes red here.
+      - ".github/workflows/wait-for-claude-review.yml"
       - ".java-version"
       - ".github/actions/rust-toolchain/**"
       - "rust/rust-toolchain.toml"
