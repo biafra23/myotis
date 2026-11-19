@@ -1,7 +1,7 @@
 # Trust and data sources
 
 > Moved verbatim from `CLAUDE.md` (the always-loaded core keeps a summary and points here).
-> Read before adding any data source or touching roost, log-index seeds, `:tx-history`, or anything Portal would have solved.
+> Read before adding any data source or touching roost, log-index seeds, `:tx-history`, the Swarm reader (`ant`, the addr1 index, the importer-key setting), or anything Portal would have solved.
 
 ## Trust
 
@@ -19,6 +19,11 @@
   the user told the app to remember), a fresh checkpoint that every answering
   checkpoint-sync server names (at least two independent operators). Scope and
   limits: the carve-out under *Data sources*.
+- **And one more (owner's decision, 2026-11-19):** the entries of an address's
+  history read from the addr1 index on Swarm are candidates; each is shown as
+  verified only after it is checked against verified chain data, and the
+  list's completeness (and `TRACE` entries) rests on the importer whose key
+  the user configured. Scope and limits: the carve-out under *Data sources*.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** A well-formed result computed against
   something other than what the caller asked for is indistinguishable from a
@@ -117,6 +122,68 @@
   and call data still come only from devp2p peers. But every one of them is
   verified against the store this source initializes, so for the root of
   trust it does count.
+- **Carve-out for Swarm reads of the address index (owner's decision,
+  2026-11-19, the tracer bullet of docs/ideas/address-history-plan.md).** The
+  Rust engine MAY read the published addr1 address index from Swarm, and
+  nothing else from it. The format is eth2swarm's `docs/address-index.md` at
+  commit `a1b3923` (https://github.com/biafra23/eth2swarm, branch
+  `feature/address-index`); a later revision of the format needs this rule
+  read again, it is not covered by it automatically.
+  - **The reader is an embedded Swarm light node**: `ant`
+    (https://github.com/freedom-hq/ant), linked into the engine, which reaches
+    Swarm over libp2p. In production never a separate Swarm process or a local
+    Bee/ant HTTP API (that stays the debug-only "local client over HTTP" of the
+    rule above, usable for debugging as before), and never a Swarm HTTP gateway
+    (one operator's server, which sees every request with the user's IP).
+  - **Only where the reader runs.** Any engine or build without it (the Java
+    and Go engines; a Rust engine built without `ant`, Android and iOS in the
+    first version), the Rust engine without a configured importer key, and
+    the Rust engine while Tor routing is on (the embedded node does not route
+    through Tor, so its requests would carry the user's IP past the Tor
+    setting) refuse the address history with the permanent `-32602`: never an
+    empty list, never a reader of their own.
+  - **What may be read**, in the spec's terms: `HeadRecord`s (the head feed's
+    updates and the origin), `SliceRecord`s (slice descriptors) and
+    `BucketRecord`s (buckets, inline or paged), all SOCs of the importer; and
+    the content-addressed spill files and bucket pages files they reference.
+    That is everything a lookup reads (the cover and the pending merges come
+    from the head). Every chunk is checked before use: a content-addressed
+    chunk against its address, a SOC against its address
+    (`keccak256(identifier ‖ importer)`, so a peer cannot answer one request
+    with another validly signed record) and its signature by the importer
+    key, and every record by the decoder's canonical checks. Swarm is
+    transport only.
+  - **What it is trusted for**: an entry is a candidate, and has one of three
+    states. *Verified* once Myotis has checked it against verified chain data
+    (a header verified through the existing trust anchors, and the body or
+    receipts, per role). *Contradicted* when that check fails (the address is
+    not where its role says): shown as such, never as unverified and never
+    dropped, and the answer says the importer key was contradicted. Else
+    *unverified*. A header that only the planned checkpoint table could verify
+    (D1 of the plan, undecided) leaves its entry unverified; this carve-out
+    does not decide D1. Completeness (an entry left out) and `TRACE` entries
+    rest on the importer's word, as the seed carve-out's displayed balance
+    rests on its publisher's; the answer says which block range rests on
+    which importer key and names every range nobody covered as a gap, never a
+    shorter list.
+  - **Whose index**: for this first version the importer key is configured at
+    runtime by the user (an experimental setting, labelled as trusting that
+    importer), not pinned in a release; a pinned key, a key rotation and what
+    follows a contradicted entry beyond showing it (stop trusting the key,
+    warn, report) are open (D3/D4 of the plan).
+
+  Three boundaries this carve-out does **not** cross:
+  - **The address index only.** Block bodies, receipts, state or any other
+    data on Swarm needs its own decision, even when the same embedded node
+    could fetch it.
+  - **The history list only.** The address history may list entries that are
+    still unverified, labelled as such. No other read the engine serves (an
+    account, a log, a block, a receipt) is answered from Swarm, or steered by
+    the index in which blocks it fetches or skips: a log-index backfill or a
+    transaction lookup that used it would make its completeness rest on the
+    importer, in a method with no field to say so.
+  - **Not a decision on the TrueBlocks plan below** (D5 of the plan stays
+    open), and no sanction for an IPFS reader.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the

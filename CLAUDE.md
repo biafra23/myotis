@@ -22,7 +22,7 @@ against. Do not move them out of `.claude/`, and not into `.claude/rules/`
 | do any release work: tag, version, changelog, checkpoints, bootnodes, seeds, assets, bundles | `.claude/agent/releases.md` |
 | add or bump a dependency, move a toolchain pin, touch build scripts or packaging | `.claude/agent/reproducibility.md` |
 | use a JDK API newer than Java 8 in Android-consumed code, or add HTTP         | `.claude/agent/platform.md`          |
-| add a data source, or touch roost, log-index seeds, `:tx-history`, Portal     | `.claude/agent/data-sources.md`      |
+| add a data source, or touch roost, log-index seeds, `:tx-history`, Portal, the Swarm reader (`ant`, addr1) | `.claude/agent/data-sources.md` |
 | work on, or come across, a security issue that is not public yet             | `.claude/agent/security-fixes.md`    |
 
 ## Build & Run
@@ -261,6 +261,12 @@ Full text, including the complete minSdk 29 JDK-API budget: `.claude/agent/platf
   only on the user's request (explicit or remembered), a fresh checkpoint that
   every answering checkpoint-sync server names. Scope and limits:
   `.claude/agent/data-sources.md`.
+- And one more (owner's decision, 2026-11-19): an address's history read from
+  the addr1 index on Swarm is a list of candidates, each shown verified only
+  after a check against verified chain data (contradicted if the check fails);
+  its completeness and its `TRACE` entries
+  rest on the importer key the user configured. Scope and limits:
+  `.claude/agent/data-sources.md`.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** When refusing, use a PERMANENT error code
   (`-32602`); `-32000` is documented as retryable and a client will spin on it.
@@ -268,15 +274,18 @@ Full text, including the complete minSdk 29 JDK-API budget: `.claude/agent/platf
 
 ## Data sources
 
-Full text of the rule, both carve-outs and their boundaries: `.claude/agent/data-sources.md`.
+Full text of the rule, the carve-outs and their boundaries: `.claude/agent/data-sources.md`.
 
 - the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production
-- Three bounded carve-outs exist, each an owner's decision: `roost` may relay
+- Four bounded carve-outs exist, each an owner's decision: `roost` may relay
   *self-verifying* consensus objects from a local beacon node, the log index
-  may serve a seeded history of a root-committing protocol, and at a
+  may serve a seeded history of a root-committing protocol, at a
   `STALE_ANCHOR` park the user may re-anchor on a fresh checkpoint that every
-  answering checkpoint-sync server names. None widens by analogy — anything
-  outside their stated boundaries needs its own decision.
+  answering checkpoint-sync server names, and the Rust engine may read the
+  addr1 address index from Swarm through an embedded light node (`ant`, over
+  libp2p; in production never a Swarm HTTP API, and never a gateway), every
+  chunk checked and every entry a candidate until verified. None widens by analogy — anything outside
+  their stated boundaries needs its own decision.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled**; the
   `:tx-history` scan is debug-only and misses recent history. If you find
   evidence publishing has resumed, flag it to the user.
