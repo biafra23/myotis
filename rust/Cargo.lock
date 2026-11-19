@@ -4505,6 +4505,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "myotis-addr1"
+version = "0.1.21"
+dependencies = [
+ "myotis-core",
+]
+
+[[package]]
 name = "myotis-bls"
 version = "0.1.21"
 dependencies = [
