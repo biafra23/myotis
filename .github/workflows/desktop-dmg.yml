@@ -529,6 +529,9 @@ jobs:
           BUILD: ${{ needs.build.result }}
         run: |
           echo "On $EVENT: dmg build $BUILD."
+          if [ "$EVENT" = pull_request ]; then
+            echo "::notice title=dmg not built::No PR builds the dmg: the merge queue does, or dispatch this workflow on the branch."
+          fi
           if [ "$EVENT" = merge_group ]; then
             [ "$BUILD" = success ] && exit 0
             echo "::error::The merge queue needs the dmg build to succeed."

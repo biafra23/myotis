@@ -70,7 +70,8 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    through a PR into the feature
    branch like a part, because the resolution is new code — and, like
    a part, it gets no artifact build (the exception below): a resolution in
-   `rust/` or a host module is cross-compiled only at the final PR unless the
+   `rust/` or a host module is cross-compiled only at the final PR (for the
+   APK and the dmg: in the merge queue, when the owner queues it) unless the
    merge PR dispatches the APK / dmg / iOS workflow on its branch. Build and
    Test (`ci.yml`) and nearly every other push trigger fire only on `main`
    (path-filtered `roost.yml` is the exception), so a clean merge is first
@@ -109,9 +110,9 @@ on the PR workflows' `pull_request` triggers (`pull_request_target` for
 `ci.yml`, `android-apk.yml` and siblings), which is what
 gives part PRs the tests, clippy, the lockfile check and the Claude review; do
 not narrow them to `main`. **The artifact builds are the exception** (owner
-ruling, 2026-10-09): the iOS framework skips a PR whose base is not `main` (a
-job-level `if` — the check shows as skipped, not absent), because a packaging
-leg per part costs more than it tells. **The Android APK and the macOS dmg build
+ruling, 2026-10-09): the iOS framework and the Windows msi skip a PR whose
+base is not `main` (a job-level `if` — the check shows as skipped, not
+absent), because a packaging leg per part costs more than it tells. **The Android APK and the macOS dmg build
 on no PR at all, but in the merge queue** (owner's request, 2026-11-19): once
 per PR into `main`, on the commit `main` will become, when the owner queues
 it. The non-blocking emulator smoke runs after the merge, on `main`. Their workflows still start on every PR and

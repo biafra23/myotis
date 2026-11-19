@@ -759,6 +759,9 @@ jobs:
           BUILD: ${{ needs.build.result }}
         run: |
           echo "On $EVENT: APK build $BUILD."
+          if [ "$EVENT" = pull_request ]; then
+            echo "::notice title=APK not built::No PR builds the APK: the merge queue does, or dispatch this workflow on the branch."
+          fi
           if [ "$EVENT" = merge_group ]; then
             [ "$BUILD" = success ] && exit 0
             echo "::error::The merge queue needs the APK build to succeed (it was $BUILD)."
