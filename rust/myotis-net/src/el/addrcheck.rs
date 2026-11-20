@@ -95,8 +95,8 @@ fn padded(address: &[u8; 20]) -> [u8; 32] {
 }
 
 /// The 32-byte windows of `data` from `offset`, those that fit completely.
-fn words(data: &[u8], offset: usize) -> impl Iterator<Item = &[u8]> {
-    data.get(offset..).unwrap_or(&[]).chunks_exact(32)
+fn words(data: &[u8], offset: usize) -> impl Iterator<Item = &[u8; 32]> {
+    data.get(offset..).unwrap_or(&[]).as_chunks::<32>().0.iter()
 }
 
 fn left_pad32(b: &[u8]) -> Option<[u8; 32]> {
@@ -185,7 +185,7 @@ pub fn check(
         transfer: None,
     };
     let me = padded(address);
-    let mut mark = |c: &mut Check, bit: u8, outcome: Option<bool>| {
+    let mark = |c: &mut Check, bit: u8, outcome: Option<bool>| {
         if roles & bit == 0 {
             return;
         }
@@ -255,11 +255,11 @@ pub fn check(
     mark(&mut c, role::EMITTER, logs.map(|l| l.iter().any(|log| log.address.as_slice() == address.as_slice())));
     mark(&mut c, role::TOPIC, logs.map(|l| l.iter().any(|log| log.topics.iter().any(|t| t.as_slice() == me))));
     // WORD: the input's words after the selector, a 7702 code address, or a log's data word.
-    let in_tx = summary.as_ref().is_some_and(|s| words(&s.input, 4).any(|w| w == me)) || code.contains(address);
+    let in_tx = summary.as_ref().is_some_and(|s| words(&s.input, 4).any(|w| *w == me)) || code.contains(address);
     let word = if in_tx {
         Some(true)
     } else {
-        logs.map(|l| l.iter().any(|log| words(&log.data, 0).any(|w| w == me)))
+        logs.map(|l| l.iter().any(|log| words(&log.data, 0).any(|w| *w == me)))
     };
     mark(&mut c, role::WORD, word);
     // The token transfer the row shows, if any.
