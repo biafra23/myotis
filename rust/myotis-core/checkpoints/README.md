@@ -22,6 +22,11 @@ hash, and the top. A table that does not match is refused.
   cross-checked against Geth 1.17.7: 203 entries and the top block were equal. The owner ruled
   on 2026-11-20 that this suffices for the first table. The running node's gap walk, from its
   beacon-attested finalized block down to the top, checks the top again.
+- **Why every entry counts as checked:** the walk linked each header to its parent, from
+  the top all the way down to the genesis hash. So every entry sits on one hash chain whose
+  two ends are checked: the genesis hash, and the cross-checked top. An entry off that chain
+  would have broken the walk. The 203 sampled entries are a check of the tool, not the whole
+  check.
 - **Size:** 25,838 entries, 826,816 bytes. keccak256 `0xccf5ad88…03d0`.
 
 ## Changing a table

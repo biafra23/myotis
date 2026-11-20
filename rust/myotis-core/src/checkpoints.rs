@@ -12,7 +12,15 @@
 //! not match, and [`mainnet`] parses the embedded copy against the pin. A running node never
 //! writes into it.
 //!
+//! Why the pin covers every entry and the top: the build linked every header by `parentHash`
+//! from the top down to the genesis hash, so all entries lie on one hash chain between those
+//! two ends. An entry off that chain would break the walk. The top was cross-checked against
+//! a second client, and the running node's gap walk checks it once more (the rule). The pin
+//! then proves these are the bytes of that build.
+//!
 //! Sans-I/O like the rest of this crate: [`mainnet`] reads `include_bytes!` data only.
+//! [`CheckpointTable::parse`] hashes the whole table (0.83 MB on mainnet), so a caller
+//! parses once and keeps the table; it is `Copy` and borrows the static bytes.
 
 use crate::keccak::keccak256;
 use crate::{err, CoreError};
