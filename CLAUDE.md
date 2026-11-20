@@ -255,7 +255,12 @@ Full text, including the complete minSdk 29 JDK-API budget: `.claude/agent/platf
 ## Trust
 
 - Peer trusted is never an option everything has to be cryptographically verified
-- The only trust anchors are sync committee signatures and  the embedded pre-Merge historical hashes accumulator and the Bellatrix-era historical roots accumulator
+- The only trust anchors are sync committee signatures, the embedded pre-Merge historical hashes accumulator, the Bellatrix-era historical roots accumulator and the bundled checkpoint table
+- The bundled checkpoint table (owner's decision D1, 2026-11-20), Rust engine:
+  per network the hash of every 1024th block, pinned by keccak256, built by a
+  `parentHash` walk down to the genesis hash; a deep block is canonical when
+  its headers hash-link up to the next entry. Scope and limits:
+  `.claude/agent/data-sources.md`.
 - One bounded exception (owner's decision, 2026-09-25): a seeded log history of
   a root-committing protocol is served on its publisher's word. Scope and
   limits: `.claude/agent/data-sources.md`.

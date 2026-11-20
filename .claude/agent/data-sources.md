@@ -6,7 +6,30 @@
 ## Trust
 
 - Peer trusted is never an option everything has to be cryptographically verified
-- The only trust anchors are sync committee signatures and  the embedded pre-Merge historical hashes accumulator and the Bellatrix-era historical roots accumulator
+- The only trust anchors are sync committee signatures, the embedded
+  pre-Merge historical hashes accumulator, the Bellatrix-era historical
+  roots accumulator and the bundled checkpoint table (below)
+- **The bundled checkpoint table (owner's decision D1, 2026-11-20;
+  docs/ideas/deep-block-verification.md), Rust engine.** Per network,
+  the hash of every 1024th block (entry i = block i*1024) from genesis
+  up to a finalized block, committed as an asset whose keccak256 is
+  pinned in the source; the loader refuses a table that does not match.
+  It is built off-line by hashing every header and linking each by
+  parentHash from that finalized block down to the network's genesis
+  hash, its top cross-checked against a second, independent client.
+  It is the release's word, as the embedded checkpoint is.
+  - A block at or below the top is canonical when the headers from it
+    up to the next entry (one GetBlockHeaders, at most 1024) hash-link
+    to that entry. Above the top, today's window from the attested
+    finalized block applies.
+  - A walk that closes the gap between the attested finalized block
+    and the top must end exactly at the top entry. A mismatch is an
+    alarm that refuses every read resting on the table (-32602), never
+    outvoted.
+  - The table changes only in a PR that names its build (tool, source
+    node, top, cross-check), extended at a release (releases.md). A
+    running node never writes into it; hashes it linked to an attested
+    finalized block may be kept in a local table beside it.
 - **One bounded exception to the two rules above (owner's decision,
   2026-09-25):** a seeded log history of a root-committing protocol is served
   on its publisher's word. The client's on-chain root check keeps forged
@@ -159,9 +182,9 @@
     receipts, per role). *Contradicted* when that check fails (the address is
     not where its role says): shown as such, never as unverified and never
     dropped, and the answer says the importer key was contradicted. Else
-    *unverified*. A header that only the planned checkpoint table could verify
-    (D1 of the plan, undecided) leaves its entry unverified; this carve-out
-    does not decide D1. Completeness (an entry left out) and `TRACE` entries
+    *unverified*. A header verified through the bundled checkpoint table
+    (D1 of the plan, decided 2026-11-20: the anchor under *Trust*) counts as
+    verified through the existing trust anchors. Completeness (an entry left out) and `TRACE` entries
     rest on the importer's word, as the seed carve-out's displayed balance
     rests on its publisher's; the answer says which block range rests on
     which importer key and names every range nobody covered as a gap, never a
