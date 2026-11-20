@@ -666,7 +666,8 @@ class DesktopNodeController(
                 // Only the Rust engine's "not available" refusal falls back; a Java engine
                 // that is not running or did not wake reports that, not an RPC-path miss.
                 if (!isOperatorQueryRefusal(e.message)) throw e
-                val reads = handle.reads() ?: throw e
+                val reads = handle.reads()
+                    ?: throw IllegalStateException("Verified reads are not available on $network (JSON-RPC backend not started)")
                 blockLookupFromRpcJson(number, reads.getBlockByNumber("0x" + number.toString(16), false))
             }
         }

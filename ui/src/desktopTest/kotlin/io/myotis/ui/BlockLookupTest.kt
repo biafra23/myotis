@@ -55,10 +55,10 @@ class BlockLookupTest {
 
     @Test
     fun aBlockUnderAnotherNumberIsAFailedFetch() {
-        val other = blockLookupFromRpcJson(8, """{"number":"0x9","transactions":[]}""").forHeight(8)
+        val other = blockLookupFromRpcJson(8, """{"number":"0x9","hash":"0xaa","transactions":[]}""").forHeight(8)
         assertEquals(8L, other.number)
         assertEquals("asked for block 8, got block 9 back", other.error)
-        val same = blockLookupFromRpcJson(9, """{"number":"0x9","transactions":[]}""")
+        val same = blockLookupFromRpcJson(9, """{"number":"0x9","hash":"0xaa","transactions":[]}""")
         assertEquals(same, same.forHeight(9))
     }
 
@@ -92,8 +92,12 @@ class BlockLookupTest {
         assertTrue(blockLookupFromRpcJson(7, "{oops").error!!.contains("malformed"))
         // A failed lookup keeps the height asked for.
         assertEquals(7L, blockLookupFromRpcJson(7, null).number)
+        // Shape drift fails closed: no parseable number, or no hash.
+        assertTrue(blockLookupFromRpcJson(7, """{"hash":"0xaa","transactions":[]}""").error!!.contains("malformed"))
+        assertTrue(blockLookupFromRpcJson(7, """{"number":"7","hash":"0xaa"}""").error!!.contains("malformed"))
+        assertTrue(blockLookupFromRpcJson(7, """{"number":"0x7","transactions":[]}""").error!!.contains("malformed"))
         // No baseFeePerGas (pre-London) / no withdrawals (pre-Shanghai).
-        val old = blockLookupFromRpcJson(7, """{"number":"0x7","transactions":[]}""")
+        val old = blockLookupFromRpcJson(7, """{"number":"0x7","hash":"0xaa","transactions":[]}""")
         assertNull(old.baseFeePerGasWei)
         assertEquals(-1, old.withdrawalCount)
     }

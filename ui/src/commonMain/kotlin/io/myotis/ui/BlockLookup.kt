@@ -102,8 +102,15 @@ fun blockLookupFromRpcJson(number: Long, json: String?): BlockLookupResult {
     fun str(key: String): String? = (o[key] as? JsonPrimitive)?.contentOrNull
     fun qty(key: String): Long = str(key)?.let(::hexQuantityToLong) ?: -1L
     fun count(key: String): Int = (o[key] as? JsonArray)?.size ?: -1
+    // Fail closed on shape drift: a block object without a parseable number or a hash is
+    // no block this card may show under a green pill — and without the number, the
+    // requested-height check (forHeight) would have nothing to compare.
+    val replyNumber = qty("number")
+    if (replyNumber < 0 || str("hash").isNullOrEmpty()) {
+        return BlockLookupResult.failed(number, path, "malformed block reply from the engine")
+    }
     return BlockLookupResult(
-        number = qty("number").takeIf { it >= 0 } ?: number,
+        number = replyNumber,
         hashHex = str("hash"),
         parentHashHex = str("parentHash"),
         stateRootHex = str("stateRoot"),
