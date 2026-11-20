@@ -8332,6 +8332,34 @@ impl ElReader {
         }
     }
 
+    /// The snap pool's peers a read of block `target` anchored at `top` asks:
+    /// all of them, except at a deep anchor (`el::deep`), where a peer that
+    /// announces it cannot serve the block (eth/69 `earliestBlock` above it)
+    /// is left out and the rest are ordered by [`deep_read_peers`]. None left
+    /// is a retryable failure: a peer holding the block may join the pool.
+    async fn read_peers_for(
+        &self,
+        target: u64,
+        top: WindowTop,
+    ) -> Result<Vec<std::sync::Arc<ManagedPeer>>, PoolReadError> {
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err(PoolReadError::Fatal("no snap peer available".to_string()));
+        }
+        if !matches!(top, WindowTop::Deep { .. }) {
+            return Ok(peers);
+        }
+        let total = peers.len();
+        let peers = deep_read_peers(peers, target, |p| p.earliest_block());
+        if peers.is_empty() {
+            return Err(PoolReadError::Fatal(format!(
+                "none of the {total} snap peer(s) announces block {target} \
+                 (eth/69 earliestBlock above it): no archive peer in the pool yet"
+            )));
+        }
+        Ok(peers)
+    }
+
     /// The verified header window `[from ..= top]` — header only, raced across
     /// the snap pool as the block reads are and settled the same way
     /// ([`Self::settle_pool_race`]).
@@ -8341,10 +8369,7 @@ impl ElReader {
         top: WindowTop,
     ) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, PoolReadError> {
         let span = top.number().saturating_sub(from);
-        let peers = self.pool.snap_peers().await;
-        if peers.is_empty() {
-            return Err(PoolReadError::Fatal("no snap peer available".to_string()));
-        }
+        let peers = self.read_peers_for(from, top).await?;
         let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
         let out = hedged_race(
             &peers,
@@ -8435,10 +8460,7 @@ impl ElReader {
         // serve is eth-only (headers + bodies), so this is a superset of what's
         // needed. If eth peers exist but none negotiated snap, this fails closed
         // (Err → -32000), never a false "null". Reputation reuses the snap sinks.
-        let peers = self.pool.snap_peers().await;
-        if peers.is_empty() {
-            return Err(PoolReadError::Fatal("no snap peer available".to_string()));
-        }
+        let peers = self.read_peers_for(target_num, top).await?;
         // Each peer's coverage of the anchored head, sampled before the race
         // (see pool_race_verdict; consulted only for a head-anchored window).
         let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
@@ -10279,10 +10301,7 @@ impl ElReader {
             return Ok(None); // above the head, not final: future/unknown → eth null
         };
         let (top, span) = self.deep_window_top(target_num, top).await?;
-        let peers = self.pool.snap_peers().await;
-        if peers.is_empty() {
-            return Err(PoolReadError::Fatal("no snap peer available".to_string()));
-        }
+        let peers = self.read_peers_for(target_num, top).await?;
         let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
         // Hedged like get_block_by_number_inner, on the same span-scaled delay
         // and the same deferred-strike settle. It matters at least as much here:
@@ -10893,6 +10912,26 @@ fn choose_window_top(
     }
 }
 
+/// Pure: the peers a deep read of `target` asks, in order. A peer whose
+/// announced `earliestBlock` is above `target` is left out (it said it does not
+/// hold the block); peers that announce the block come first, the oldest
+/// history first, then eth/68 peers, which announce no range. Archive peers
+/// are a minority of the pool (7 of 18 in the survey of
+/// docs/ideas/deep-block-verification.md), so this is what makes a deep body
+/// a matter of asking the right peer.
+fn deep_read_peers<T>(peers: Vec<T>, target: u64, earliest: impl Fn(&T) -> Option<u64>) -> Vec<T> {
+    let mut kept: Vec<(u64, T)> = peers
+        .into_iter()
+        .filter_map(|p| match earliest(&p) {
+            Some(e) if e > target => None,
+            Some(e) => Some((e, p)),
+            None => Some((u64::MAX, p)),
+        })
+        .collect();
+    kept.sort_by_key(|(e, _)| *e);
+    kept.into_iter().map(|(_, p)| p).collect()
+}
+
 /// How many more requests a deep window may take from one peer after its
 /// first answer stopped short (a 512-header cap needs one; three covers a
 /// 256-header cap on a 1024-header window).
@@ -11072,6 +11111,32 @@ fn verify_body_transactions(
             "block {} body does not match the header transactionsRoot",
             header.number
         ));
+    }
+    // The rest of the body is committed to as well (part 4 of #899): the
+    // ommers list by `ommersHash` (empty after the Merge, but checked on every
+    // block), the withdrawals by `withdrawalsRoot` from Shanghai on. A body
+    // whose withdrawals field does not match the header's shape is a mismatch.
+    if body.ommers_hash != header.ommers_hash {
+        return Err(format!(
+            "block {} body does not match the header ommersHash",
+            header.number
+        ));
+    }
+    match (&header.withdrawals_root, &body.withdrawals) {
+        (Some(root), Some(withdrawals)) if triehash::verify(withdrawals.iter(), root) => {}
+        (None, None) => {}
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "block {} body does not match the header withdrawalsRoot",
+                header.number
+            ))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(format!(
+                "block {} body's withdrawals do not match the header's (one has them, the other not)",
+                header.number
+            ))
+        }
     }
     Ok(())
 }
@@ -13176,7 +13241,7 @@ mod tests {
         }
 
         fn empty_block(with_body: bool) -> Fetched {
-            let body = BlockBody { transactions: RawList::new(), uncle_count: 0, withdrawal_count: 0 };
+            let body = BlockBody { transactions: RawList::new(), uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None };
             (with_body.then(|| Ok(vec![body])), Ok(Vec::new()))
         }
 
@@ -13228,7 +13293,7 @@ mod tests {
                 ..Default::default()
             };
             let vh = VerifiedHeader { hash: keccak256(&number.to_be_bytes()), raw_rlp: Vec::new(), header };
-            (vh, BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 }, BlockReceipts::Canonical(receipts))
+            (vh, BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None }, BlockReceipts::Canonical(receipts))
         }
 
         fn serve(number: u64, tip: u128, with_body: bool) -> Fetched {
@@ -13550,7 +13615,7 @@ mod tests {
             // not rebuild it is the peer's.
             let mut transactions = RawList::new();
             transactions.push(&[0x7f, 0xc0]);
-            let body = BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 };
+            let body = BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None };
             let mut header = BlockHeader { number: 10, gas_used: 21_000, ..Default::default() };
             header.transactions_root = triehash::ordered_trie_root(body.transactions.iter());
             let err = strict_body_tips(&header, vec![body.clone()]).unwrap_err();
@@ -13627,7 +13692,7 @@ mod tests {
                         Serve::After(delay) => {
                             tokio::time::sleep(delay).await;
                             // `Default` builds the empty list whatever type holds it.
-                            let empty = BlockBody { transactions: Default::default(), uncle_count: 0, withdrawal_count: 0 };
+                            let empty = BlockBody { transactions: Default::default(), uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None };
                             Ok(vec![empty])
                         }
                         Serve::NoBody => Ok(Vec::new()),
@@ -14135,6 +14200,50 @@ mod tests {
     }
 
     #[test]
+    fn deep_reads_ask_the_peers_that_hold_the_block() {
+        let peers = vec![("pruned", Some(25_000_000)), ("eth68", None), ("merge", Some(15_537_394)), ("archive", Some(0))];
+        let order = |target| -> Vec<&str> {
+            deep_read_peers(peers.clone(), target, |p| p.1).into_iter().map(|p| p.0).collect()
+        };
+        assert_eq!(order(1_000_000), vec!["archive", "eth68"]);
+        assert_eq!(order(20_000_000), vec!["archive", "merge", "eth68"]);
+        assert_eq!(order(26_000_000), vec!["archive", "merge", "pruned", "eth68"]);
+        assert!(deep_read_peers(vec![("pruned", Some(5))], 4, |p: &(&str, Option<u64>)| p.1).is_empty());
+    }
+
+    #[test]
+    fn a_body_is_checked_against_ommers_hash_and_withdrawals_root() {
+        use crate::el::eth::messages::{BlockBody, RawList, EMPTY_OMMERS_HASH};
+        let mut withdrawals = RawList::new();
+        withdrawals.push(&[0xc4, 0x01, 0x02, 0x03, 0x04]);
+        let root = triehash::ordered_trie_root(withdrawals.iter());
+        let header = BlockHeader {
+            number: 9,
+            transactions_root: EMPTY_TRIE_ROOT,
+            ommers_hash: EMPTY_OMMERS_HASH,
+            withdrawals_root: Some(root),
+            ..Default::default()
+        };
+        let body = |ommers_hash, withdrawals| BlockBody {
+            transactions: RawList::new(),
+            uncle_count: 0,
+            withdrawal_count: 0,
+            ommers_hash,
+            withdrawals,
+        };
+        assert!(verify_body_transactions(&header, &body(EMPTY_OMMERS_HASH, Some(withdrawals.clone()))).is_ok());
+        let err = verify_body_transactions(&header, &body([7; 32], Some(withdrawals.clone()))).unwrap_err();
+        assert!(err.contains("ommersHash"), "{err}");
+        let err = verify_body_transactions(&header, &body(EMPTY_OMMERS_HASH, Some(RawList::new()))).unwrap_err();
+        assert!(err.contains("withdrawalsRoot"), "{err}");
+        let err = verify_body_transactions(&header, &body(EMPTY_OMMERS_HASH, None)).unwrap_err();
+        assert!(err.contains("withdrawals"), "{err}");
+        let pre_shanghai = BlockHeader { withdrawals_root: None, ..header.clone() };
+        assert!(verify_body_transactions(&pre_shanghai, &body(EMPTY_OMMERS_HASH, None)).is_ok());
+        assert!(verify_body_transactions(&pre_shanghai, &body(EMPTY_OMMERS_HASH, Some(withdrawals))).is_err());
+    }
+
+    #[test]
     fn a_body_with_more_transactions_than_its_gas_pays_for_fails_before_the_trie() {
         use crate::el::eth::messages::{BlockBody, RawList};
         let body = |n: usize| {
@@ -14142,7 +14251,7 @@ mod tests {
             for _ in 0..n {
                 transactions.push(&[0x01]);
             }
-            BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 }
+            BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None }
         };
         let mut header = BlockHeader { number: 7, gas_used: 3 * MIN_GAS_PER_TX, ..Default::default() };
         header.transactions_root = triehash::ordered_trie_root(body(3).transactions.iter());
@@ -16551,7 +16660,7 @@ mod candidate_chunk_tests {
         Block {
             vh: VerifiedHeader { hash: [number as u8; 32], raw_rlp: Vec::new(), header },
             receipts: BlockReceipts::Canonical(receipts),
-            body: BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 },
+            body: BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None },
         }
     }
 

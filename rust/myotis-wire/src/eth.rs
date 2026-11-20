@@ -373,13 +373,25 @@ pub fn encode_get_block_bodies(request_id: u64, hashes: &[[u8; 32]]) -> Vec<u8> 
 }
 
 /// A decoded block body: raw consensus tx bytes (legacy re-encoded, typed kept
-/// as the envelope) plus uncle/withdrawal counts.
+/// as the envelope) plus uncle/withdrawal counts, the keccak256 of the ommers
+/// list as it arrived (what the header's `ommersHash` commits to), and the
+/// withdrawals as they arrived (what `withdrawalsRoot` commits to; `None` when
+/// the body has no withdrawals field, before Shanghai).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockBody {
     pub transactions: RawList,
     pub uncle_count: usize,
     pub withdrawal_count: usize,
+    pub ommers_hash: [u8; 32],
+    pub withdrawals: Option<RawList>,
 }
+
+/// keccak256 of the empty RLP list (`0xc0`): the `ommersHash` of every block
+/// without ommers, every post-Merge block among them.
+pub const EMPTY_OMMERS_HASH: [u8; 32] = [
+    0x1d, 0xcc, 0x4d, 0xe8, 0xde, 0xc7, 0x5d, 0x7a, 0xab, 0x85, 0xb5, 0x67, 0xb6, 0xcc, 0xd4, 0x1a,
+    0xd3, 0x12, 0x45, 0x1b, 0x94, 0x8a, 0x74, 0x13, 0xf0, 0xa1, 0x42, 0xfd, 0x40, 0xd4, 0x93, 0x47,
+];
 
 /// Decode a BlockBodies response `[reqId, [body, …]]` to a request for
 /// `requested` bodies, keeping at most one more (see [`kept`]). The
@@ -401,10 +413,21 @@ pub fn decode_block_bodies(rlp_bytes: &[u8], requested: usize) -> Result<(u64, V
         };
         let tx_items = txs.as_list()?;
         let uncle_count = uncles.as_list()?.count();
-        let withdrawal_count = fields.next().map_or(Ok(0), |w| w.as_list().map(Iterator::count))?;
+        let withdrawals_field = fields.next();
+        let withdrawal_count = withdrawals_field.map_or(Ok(0), |w| w.as_list().map(Iterator::count))?;
         if i >= kept(requested) {
             continue;
         }
+        let withdrawals = match withdrawals_field {
+            Some(w) => {
+                let mut list = RawList::with_capacity(w.raw().len());
+                for item in w.as_list()? {
+                    list.push_item(item);
+                }
+                Some(list)
+            }
+            None => None,
+        };
         // Legacy tx = RLP list (kept as-is, it's canonical); typed tx =
         // byte-string whose payload IS the consensus tx bytes. Both are kept
         // as they arrived, and read back as those bytes.
@@ -416,6 +439,8 @@ pub fn decode_block_bodies(rlp_bytes: &[u8], requested: usize) -> Result<(u64, V
             transactions,
             uncle_count,
             withdrawal_count,
+            ommers_hash: keccak256(uncles.raw()),
+            withdrawals,
         });
     }
     Ok((request_id, bodies))
@@ -1070,6 +1095,11 @@ mod tests {
         assert_eq!((id, incomplete, blocks.len()), (9, false, 0));
     }
     use myotis_core::keccak::keccak256;
+
+    #[test]
+    fn empty_ommers_hash_is_the_keccak_of_the_empty_list() {
+        assert_eq!(keccak256(&[0xc0]), super::EMPTY_OMMERS_HASH);
+    }
 
     #[test]
     fn transactions_gossip_hashes_match_tx_keccak() {
