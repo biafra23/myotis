@@ -2236,6 +2236,46 @@ public final class NodeService extends Service {
                 () -> reads.callDetailed(null, to, data, null, "latest", null), QUERY_POOL);
     }
 
+    /**
+     * The Query tab's block lookup by height (a debugging aid): the engine API's
+     * {@link ChainHandle#getBlockVerified}, which fetches the block at any height from the
+     * EL peers and verifies it, on the query pool. The future fails when the network isn't
+     * running, and with the engine's {@link io.myotis.api.EngineException} when the engine
+     * does not serve that operator query (the Rust engine) — the caller then falls back to
+     * {@link #getBlockByNumberJson}.
+     */
+    public CompletableFuture<io.myotis.api.BlockResult> getBlockVerified(String network, long blockNumber) {
+        noteUiActivity();
+        ChainHandle handle = handles.get(canonicalNetwork(network));
+        if (handle == null) {
+            CompletableFuture<io.myotis.api.BlockResult> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IllegalStateException("Node is not running"));
+            return failed;
+        }
+        return CompletableFuture.supplyAsync(() -> handle.getBlockVerified(blockNumber), QUERY_POOL);
+    }
+
+    /**
+     * The verified {@code eth_getBlockByNumber} read of block {@code blockNumber} (tx hashes,
+     * not bodies), in the {@link io.myotis.api.VerifiedReads} tri-state, on the query pool —
+     * the block lookup's path on an engine without {@link #getBlockVerified}. The future fails
+     * only when the network isn't running or its read surface is down.
+     */
+    public CompletableFuture<String> getBlockByNumberJson(String network, long blockNumber) {
+        noteUiActivity();
+        ChainHandle handle = handles.get(canonicalNetwork(network));
+        io.myotis.api.VerifiedReads reads = handle != null ? handle.reads() : null;
+        if (reads == null) {
+            CompletableFuture<String> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IllegalStateException(handle == null
+                    ? "Node is not running"
+                    : "Verified reads are not available (JSON-RPC backend not started)"));
+            return failed;
+        }
+        return CompletableFuture.supplyAsync(
+                () -> reads.getBlockByNumber("0x" + Long.toHexString(blockNumber), false), QUERY_POOL);
+    }
+
     // ---------------------------------------------------------------------
     // TrueBlocks transaction history (Query tab add-on) — the documented exemption
     // from the "hosts consume only io.myotis.api" rule, same shape as the daemon's

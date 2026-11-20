@@ -21,6 +21,12 @@ its trust anchors and release checks.
 
 ### Added
 
+- Query tab: a block number fetches that block from the EL peers and shows how
+  long it took, which engine path answered, and whether it could be verified. A
+  block the peers served but the node could not tie to the beacon chain reads as
+  "fetched, unverified", not as a failed fetch. The Java engine fetches any
+  height; the Rust engine (and so iOS) answers only for blocks near the head
+  (#898).
 - Docs: verifying deep blocks, an analysis of reads beyond the 512-block
   window with a measured survey of which peers still serve old blocks
   (#882).
