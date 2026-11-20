@@ -21,6 +21,12 @@ crate-type = ["cdylib", "rlib"]
 # `set_tor_enabled`/`tor_status`/`set_tor_storage_dirs` FFI functions exist either
 # way (they no-op / report "not compiled" / refuse without this feature).
 tor = ["myotis-net/tor"]
+# The address history from the addr1 index on Swarm (.claude/agent/data-sources.md, the
+# carve-out for Swarm reads of the address index): links the embedded ant node
+# (rust/swarm, rust/vendor/ant). OFF by default and in every shipped build, for dev builds
+# only, until ant's open items (rust/swarm/src/lib.rs, rust/vendor/ant/VENDORED.md) and the
+# advisory watch are settled (owner, 2026-11-20). Without it the history is refused (-32602).
+swarm = ["dep:myotis-swarm"]
 
 [dependencies]
 myotis-consensus = { path = "../myotis-consensus" }
@@ -32,6 +38,10 @@ myotis-net = { path = "../myotis-net" }
 # Direct dep for U256 (value parsing) + the eth_call bridge types; also pulled
 # transitively via myotis-net. revm is gated inside myotis-evm.
 myotis-evm = { path = "../myotis-evm" }
+# The addr1 reader (sans-I/O): the lookup and its checks. The Swarm node behind it is the
+# optional myotis-swarm (feature `swarm`).
+myotis-addr1 = { path = "../myotis-addr1" }
+myotis-swarm = { path = "../swarm", optional = true }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread"] }
 # The JVM boundary: UniFFI proc-macro scaffolding (replaces the old hand-JNI —
 # the generated Kotlin bindings live in :myotis-engine-rust and are pinned to this

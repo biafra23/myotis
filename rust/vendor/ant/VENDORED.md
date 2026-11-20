@@ -71,8 +71,9 @@ how often is the owner's to settle, before the engine links it.
 
 ## The SBOM
 
-`scripts/sbom.py` lists a Cargo package only when its lock entry has a `source`; a path
-crate has none and counts as Myotis's own. Today no product lock holds these crates. When
-the engine links `myotis-swarm` (part 4 of `feature/swarm-addr1`), they enter
-`rust/Cargo.lock` without a source, and the SBOM must list them as ant at the commit above,
-or fail on them, so that they are not left out silently.
+A path crate has no `source` in a lock, which `scripts/sbom.py` otherwise reads as one of
+Myotis's own crates. Since the engine links `myotis-swarm` (its `swarm` feature, part 5 of
+`feature/swarm-addr1`'s address-history plan), these crates are in `rust/Cargo.lock`, and
+`sbom.py` lists every crate of a tree under `rust/vendor` as its upstream at the commit this
+file names (`pkg:cargo` with a `vcs_url`, property `myotis:vendored`). A vendored tree
+without its `VENDORED.md` is an error, so none is left out silently.
