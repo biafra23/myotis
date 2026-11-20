@@ -258,9 +258,11 @@ Full text, including the complete minSdk 29 JDK-API budget: `.claude/agent/platf
 - The only trust anchors are sync committee signatures, the embedded pre-Merge historical hashes accumulator, the Bellatrix-era historical roots accumulator and the bundled checkpoint table
 - The bundled checkpoint table (owner's decision D1, 2026-11-20), Rust engine:
   per network the hash of every 1024th block, pinned by keccak256, built by a
-  `parentHash` walk down to the genesis hash; a deep block is canonical when
-  its headers hash-link up to the next entry. Scope and limits:
-  `.claude/agent/data-sources.md`.
+  `parentHash` walk down to the genesis hash; a block at or below its top is
+  canonical when its headers hash-link up to the first entry at or above it.
+  Above the top today's attested window applies; a gap walk that misses the top
+  entry refuses every table read (`-32602`); a running node never writes into
+  it. Scope and limits: `.claude/agent/data-sources.md`.
 - One bounded exception (owner's decision, 2026-09-25): a seeded log history of
   a root-committing protocol is served on its publisher's word. Scope and
   limits: `.claude/agent/data-sources.md`.

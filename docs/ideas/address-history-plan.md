@@ -2,8 +2,8 @@
 
 Status: **planning basis; the tracer bullet is being built** (`feature/swarm-addr1`: the
 Swarm carve-out, an embedded `ant` node, the addr1 reader and `myotis_getAddressHistory`).
-D1 stays open: an entry whose header only the checkpoint table could verify stays
-unverified in the tracer bullet. It lists everything needed for
+D1 is decided (owner, 2026-11-20): the bundled checkpoint table is a trust anchor, so a
+table-verified header verifies an entry. It lists everything needed for
 [Punicus](https://github.com/biafra23/punicus) to show the past transactions of any
 address with Myotis as its data access layer. The work is split into workstreams, and
 each is meant to become an implementation plan of its own. It builds on two designs:
@@ -84,10 +84,16 @@ collects its items.
 These gate the workstreams that depend on them; they are listed first because nothing
 built on an undecided rule can ship.
 
-- **D1. The checkpoint table as a trust anchor** (item 9). A third embedded anchor next to
-  the sync-committee checkpoint and the historical accumulators, only as good as the walk
-  that produced it. Covered in
-  [deep-block-verification.md §Open decisions](deep-block-verification.md#open-decisions).
+- **D1. The checkpoint table as a trust anchor** (item 9). **Decided (owner, 2026-11-20):
+  bundle every 1024th block hash, instead of a walk back at run time; the rule is in
+  `.claude/agent/data-sources.md` (Trust).** For the first mainnet table the owner ruled
+  that the build's own checks suffice: every header hashed and linked by `parentHash` down
+  to the genesis hash, its top (Erigon's finalized block) cross-checked against a second
+  client; the running node's gap walk still checks the top entry. A generator that starts
+  from a Myotis beacon-attested block (item 3 below) stays the target for later tables.
+  The considerations: a third embedded anchor next to the sync-committee checkpoint and the
+  historical accumulators, only as good as the walk that produced it
+  ([deep-block-verification.md §Open decisions](deep-block-verification.md#open-decisions)).
 - **D2. Swarm as a data source** (item 14). **Decided (owner, 2026-11-19): an embedded
   client, `ant` linked into the Rust engine; the carve-out is in
   `.claude/agent/data-sources.md`, which supersedes the sketch below in both halves: what is

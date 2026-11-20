@@ -9,27 +9,6 @@
 - The only trust anchors are sync committee signatures, the embedded
   pre-Merge historical hashes accumulator, the Bellatrix-era historical
   roots accumulator and the bundled checkpoint table (below)
-- **The bundled checkpoint table (owner's decision D1, 2026-11-20;
-  docs/ideas/deep-block-verification.md), Rust engine.** Per network,
-  the hash of every 1024th block (entry i = block i*1024) from genesis
-  up to a finalized block, committed as an asset whose keccak256 is
-  pinned in the source; the loader refuses a table that does not match.
-  It is built off-line by hashing every header and linking each by
-  parentHash from that finalized block down to the network's genesis
-  hash, its top cross-checked against a second, independent client.
-  It is the release's word, as the embedded checkpoint is.
-  - A block at or below the top is canonical when the headers from it
-    up to the next entry (one GetBlockHeaders, at most 1024) hash-link
-    to that entry. Above the top, today's window from the attested
-    finalized block applies.
-  - A walk that closes the gap between the attested finalized block
-    and the top must end exactly at the top entry. A mismatch is an
-    alarm that refuses every read resting on the table (-32602), never
-    outvoted.
-  - The table changes only in a PR that names its build (tool, source
-    node, top, cross-check), extended at a release (releases.md). A
-    running node never writes into it; hashes it linked to an attested
-    finalized block may be kept in a local table beside it.
 - **One bounded exception to the two rules above (owner's decision,
   2026-09-25):** a seeded log history of a root-committing protocol is served
   on its publisher's word. The client's on-chain root check keeps forged
@@ -47,6 +26,27 @@
   verified only after it is checked against verified chain data, and the
   list's completeness (and `TRACE` entries) rests on the importer whose key
   the user configured. Scope and limits: the carve-out under *Data sources*.
+- **The bundled checkpoint table (owner's decision D1, 2026-11-20;
+  docs/ideas/deep-block-verification.md), Rust engine.** Per network,
+  the hash of every 1024th block (entry i = block i*1024) from genesis
+  up to a finalized block, committed as an asset whose keccak256 is
+  pinned in the source; the loader refuses a table that does not match.
+  It is built off-line by hashing every header and linking each by
+  parentHash from that finalized block down to the network's genesis
+  hash, its top cross-checked against a second, independent client.
+  It is the release's word, as the embedded checkpoint is.
+  - A block at or below the top is canonical when the headers from it
+    up to the first entry at or above it (one GetBlockHeaders, at most
+    1024) hash-link to that entry. Above the top, today's window from the attested
+    finalized block applies.
+  - A walk that closes the gap between the attested finalized block
+    and the top must end exactly at the top entry. A mismatch is an
+    alarm that refuses every read resting on the table (-32602), never
+    outvoted.
+  - The table changes only in a PR that names its build (tool, source
+    node, top, cross-check), extended at a release (releases.md). A
+    running node never writes into it; hashes it linked to an attested
+    finalized block may be kept in a local table beside it.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** A well-formed result computed against
   something other than what the caller asked for is indistinguishable from a

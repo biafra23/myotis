@@ -4,8 +4,8 @@ Status: **analysis and measurements — nothing here is built.** The measurement
 were taken on 2026-11-16 against mainnet with `myotis-rpcd`; the deep-block
 probe behind §[Are deep blocks available?](#are-deep-blocks-available) was a
 local, unverified throwaway build that was never committed. Whether a bundled
-checkpoint table becomes a trust anchor is the owner's decision
-([§Open decisions](#open-decisions)).
+checkpoint table becomes a trust anchor was the owner's decision
+([§Open decisions](#open-decisions)): decided on 2026-11-20, bundled.
 
 ## TL;DR
 
@@ -270,7 +270,9 @@ For the owner:
 
 1. **The checkpoint table as a trust anchor.** It adds a third embedded anchor
    next to the sync-committee checkpoint and the historical accumulators, and
-   it is only as good as the walk that produced it.
+   it is only as good as the walk that produced it. **Decided (owner,
+   2026-11-20): bundled, k = 1024; the rule is in `.claude/agent/data-sources.md`
+   (Trust).**
 2. **k**, and whether the table ships in the mobile apps (about 2.7 MB for
    mainnet, Gnosis and Sepolia at k = 1024, plus the gap walks above) or only
    in the daemon, the desktop app and `myotis-rpcd`.
