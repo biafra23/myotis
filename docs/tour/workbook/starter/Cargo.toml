@@ -2,6 +2,8 @@
 name = "myotis-workbook"
 version = "1.0.0"
 edition = "2021"
+# The Myotis workspace's minimum rustc (rust/Cargo.toml).
+rust-version = "1.99"
 publish = false
 
 # Same versions as the Myotis workspace, so `cargo test --offline` finds them
