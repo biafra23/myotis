@@ -16,6 +16,7 @@
 //! - [`trie`]     ⇄ `core.trie.MerklePatriciaProofVerifier` + `HexPrefix`
 //! - [`triehash`] ⇄ `consensus.proof.OrderedTrieRoot`
 //! - [`bloom`]    ⇄ the M3:2048 accrual in `networking...ReceiptsMessage`
+//! - [`checkpoints`] ⇄ none yet: the bundled checkpoint table (Rust engine only)
 //!
 //! Error convention (workspace-wide): `Result<_, CoreError>` with Java-shaped
 //! messages; decoding untrusted bytes never panics (the workspace builds with
@@ -28,6 +29,7 @@ extern crate alloc;
 use alloc::string::String;
 
 pub mod bloom;
+pub mod checkpoints;
 pub mod enr;
 pub mod fees;
 pub mod forkid;
