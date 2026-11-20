@@ -701,6 +701,19 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow("not json"));
     }
 
+    @Test
+    void aPermanentBlockRefusalPassesThroughForTheRouter() {
+        // The checkpoint table's alarm (#899): -32602, never the retryable -32000.
+        String alarm = "{\"error\":\"checkpoint table alarm: block 26457537 is not the top\",\"code\":-32602}";
+        assertEquals(alarm, RustChainHandle.blockJsonOrThrow(alarm));
+        assertEquals(alarm, RustChainHandle.blockReceiptsJsonOrThrow(alarm));
+        // Any other code, or none, still throws.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.blockJsonOrThrow("{\"error\":\"x\",\"code\":-32000}"));
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.blockReceiptsJsonOrThrow("{\"error\":\"x\"}"));
+    }
+
     // ---- eth_getBlockReceipts (blockReceiptsJsonOrThrow) ----
 
     @Test
