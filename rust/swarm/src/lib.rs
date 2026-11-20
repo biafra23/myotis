@@ -27,7 +27,9 @@
 //!
 //! Each needs a change in ant (an option for no listener and no UPnP, DNS behind a feature or
 //! through the host's resolver, a panic contract) or an owner's decision. ant itself is
-//! vendored (`rust/vendor/ant`, its `VENDORED.md`): no build fetches it from GitHub.
+//! vendored (`rust/vendor/ant`, its `VENDORED.md`): no build fetches it from GitHub. Being on
+//! no registry, it has no advisory coverage: nothing reports a security fix in ant, which
+//! reaches Myotis only when the copy is moved (`VENDORED.md`, "Watching upstream").
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

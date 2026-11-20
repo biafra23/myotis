@@ -86,22 +86,6 @@ jobs:
       # two-copies state the holds exist to avoid, and the node key's secret
       # reaches enr's copy (enrfilter.rs, local_enr_rlp). This step fails in the
       # PR that adds the second version, which is the moment to lift both holds.
-      # No lock may name a git source: every cold build would fetch that repository,
-      # with no registry checksum and no advisory coverage (claude-review of #892). A
-      # crate that is not on crates.io is vendored under rust/vendor instead, as ant is
-      # (rust/vendor/ant/VENDORED.md, scripts/vendor_ant.sh).
-      - name: No git sources in any lock
-        run: |
-          set -eu
-          fail=0
-          for lock in rust/Cargo.lock rust/roost/Cargo.lock rust/tor-poc/Cargo.lock \
-                      rust/swarm/Cargo.lock docs/tour/workbook/solution/Cargo.lock; do
-            if grep -n '^source = "git+' "$lock"; then
-              echo "::error file=$lock::$lock names a git source. Vendor the crate under rust/vendor instead (rust/vendor/ant/VENDORED.md)."
-              fail=1
-            fi
-          done
-          exit $fail
       - name: One k256 per lock (lift the dependabot.yml hold when this fails)
         run: |
           set -eu
@@ -112,6 +96,23 @@ jobs:
             echo "$lock: k256 $(echo ${versions:-none})"
             if [ "$count" -gt 1 ]; then
               echo "::error file=$lock::$lock holds $count k256 versions ($(echo $versions)). An upstream crate moved to a new k256 line: lift the k256 AND libp2p holds in .github/dependabot.yml together, and move myotis-core's pin, discv5 and libp2p to that line, so there is one copy again."
+              fail=1
+            fi
+          done
+          exit $fail
+      # No lock may name a git source: every cold build would fetch that repository,
+      # and its bytes have no registry checksum (claude-review of #892). A crate that is
+      # not on crates.io is vendored under rust/vendor instead, as ant is
+      # (rust/vendor/ant/VENDORED.md, scripts/vendor_ant.sh). That answers the fetch and
+      # the checksum, not advisories: such a crate has no advisory coverage either way.
+      - name: No git sources in any lock
+        run: |
+          set -eu
+          fail=0
+          for lock in rust/Cargo.lock rust/roost/Cargo.lock rust/tor-poc/Cargo.lock \
+                      rust/swarm/Cargo.lock docs/tour/workbook/solution/Cargo.lock; do
+            if grep -n '^source = "git+' "$lock"; then
+              echo "::error file=$lock::$lock names a git source. Vendor the crate under rust/vendor instead (rust/vendor/ant/VENDORED.md)."
               fail=1
             fi
           done

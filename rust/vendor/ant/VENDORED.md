@@ -40,8 +40,39 @@ and scripts.
   plus what the new crates need), in one PR whose description links upstream's compare view
   of the two commits. The diff under `rust/vendor/ant` is ant's change: review it as code
   that runs inside the engine.
+- **The commit's age:** like every hand-moved pin (`.github/dependabot.yml`, the inventory
+  at its top and the 7-day cooldown), a commit vendored here is at least 7 days old; a
+  security fix is the exception, as it is for Dependabot.
+- **The commit's origin:** `scripts/vendor_ant.sh` takes only a commit on upstream's
+  default branch. GitHub serves a fork's commits through the parent's URL too, so a SHA
+  alone does not say the code is upstream's.
 - **Checking the copy:** `scripts/vendor_ant.sh --check` fetches upstream at the commit
-  above and compares. Builds never fetch it; the check is for reviewers and for the PR that
-  moves the commit.
+  above and compares what git tracks, file modes included, and fails on unstaged edits.
+  Builds never fetch it; CI runs it when the copy or the script changes
+  (`.github/workflows/vendored-ant.yml`).
+- **Agent instruction files** (`CLAUDE.md`, `AGENTS.md`, `.claude/`, `.mcp.json`, ...) in a
+  vendored crate are refused by the script: Claude Code would load a nested `CLAUDE.md`.
+  An update that brings one is decided about in its PR.
 - These crates are not Myotis code: `cargo fmt` and clippy of the Myotis workspaces do not
-  cover them, and their warnings are upstream's.
+  cover them, and their warnings are upstream's. As path dependencies they are built
+  without the `--cap-lints allow` Cargo gives registry and git dependencies, so a toolchain
+  bump can surface warnings in them, and a lint that is deny by default would fail the build
+  in files that must not be edited: the fix then goes upstream, or the toolchain waits.
+
+## Watching upstream
+
+ant is on no registry, so no advisory database (RustSec, GitHub advisories, Dependabot
+alerts) can name it, as a git pin or as a copy. Its registry dependencies stay covered
+through `rust/swarm/Cargo.lock`; ant's own code, which parses what Swarm peers send, is
+not. Nothing reports a security fix in ant: it reaches Myotis only when someone moves this
+copy, and so do fixes for freedom-hq/ant#269, #270 and #271, the three reasons the `swarm`
+feature is not in a release build (`rust/swarm/src/lib.rs`). Who watches ant's commits and
+how often is the owner's to settle, before the engine links it.
+
+## The SBOM
+
+`scripts/sbom.py` lists a Cargo package only when its lock entry has a `source`; a path
+crate has none and counts as Myotis's own. Today no product lock holds these crates. When
+the engine links `myotis-swarm` (part 4 of `feature/swarm-addr1`), they enter
+`rust/Cargo.lock` without a source, and the SBOM must list them as ant at the commit above,
+or fail on them, so that they are not left out silently.
