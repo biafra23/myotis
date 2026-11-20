@@ -287,7 +287,7 @@ mod tests {
             top_number: 2100,
             top_hash: [0x21; 32],
         };
-        CheckpointTable::parse(bytes, &pin).unwrap()
+        CheckpointTable::parse_for_test(bytes, &pin).unwrap()
     }
 
     fn h(n: u64) -> [u8; 32] {

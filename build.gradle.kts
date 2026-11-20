@@ -974,6 +974,9 @@ val rustSources = fileTree("rust") {
     include(
         "**/*.rs", "**/Cargo.toml", "Cargo.lock",
         "rust-toolchain.toml", ".cargo/**", "build-android.sh",
+        // The bundled checkpoint tables are include_bytes!'d into the engine:
+        // a table-only change must not leave an UP-TO-DATE native lib.
+        "myotis-core/checkpoints/*.hashes",
     )
     exclude("target/**")
 }
