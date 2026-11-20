@@ -1,0 +1,13 @@
+{
+  "chain_id": 1,
+  "k": 1024,
+  "entries": 25838,
+  "last_entry_block": 26457088,
+  "top_block": 26457537,
+  "top_hash": "0x229a7a2185b4a334b8c9e4f94f028974365698f2bc40b7ea418e276da9a485fc",
+  "top_pinned_by": "the finalized block of the source node (erigon/3.8.1-cf6f1413/linux-amd64/go1.27.3), cross-checked against Geth/v1.17.7-stable-3d858f85/linux-amd64/go1.27.1: 203 entries and the top block equal",
+  "genesis_hash": "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3",
+  "table_keccak256": "0xccf5ad8849bb513d7aef7b7bc732b264e2874c6b6e24cc4880753ceb68cc03d0",
+  "source_client": "erigon/3.8.1-cf6f1413/linux-amd64/go1.27.3",
+  "generated_unix": 1795196405
+}
