@@ -259,7 +259,7 @@ pub fn history_json(
     }
     let importer = cfg.importer.expect("refusal() checked it");
     match reader::page(rt, &cfg, chain_id, importer, &address, cursor, limit as usize) {
-        Ok(read) => page_json(&read, importer, chain_head),
+        Ok(read) => page_json(&read, importer, chain_head, (chain_id, address)),
         Err(reader::Failure::Refused(msg)) => eljson::invalid_params_json(&msg),
         Err(reader::Failure::Retry(msg)) => eljson::error_json(&msg),
     }
@@ -272,25 +272,25 @@ pub struct Read {
     pub page: myotis_addr1::client::Page,
 }
 
-fn page_json(read: &Read, importer: [u8; 20], chain_head: Option<u64>) -> String {
-    use myotis_addr1::records::role;
+/// The role bits and their API names, in bit order.
+const ROLE_NAMES: [(u8, &str); 8] = [
+    (0x01, "from"),
+    (0x02, "to"),
+    (0x04, "emitter"),
+    (0x08, "topic"),
+    (0x10, "word"),
+    (0x20, "trace"),
+    (0x40, "block"),
+    (0x80, "auth"),
+];
+
+fn role_names(bits: u8) -> Vec<&'static str> {
+    ROLE_NAMES.iter().filter(|(b, _)| bits & b != 0).map(|(_, n)| *n).collect()
+}
+
+fn page_json(read: &Read, importer: [u8; 20], chain_head: Option<u64>, who: (u64, [u8; 20])) -> String {
     let p = &read.page;
-    let roles = |bits: u8| -> Vec<&'static str> {
-        [
-            (role::FROM, "from"),
-            (role::TO, "to"),
-            (role::EMITTER, "emitter"),
-            (role::TOPIC, "topic"),
-            (role::WORD, "word"),
-            (role::TRACE, "trace"),
-            (role::BLOCK, "block"),
-            (role::AUTH, "auth"),
-        ]
-        .into_iter()
-        .filter(|(b, _)| bits & b != 0)
-        .map(|(_, n)| n)
-        .collect()
-    };
+    let roles = role_names;
     let head_gap = match chain_head {
         Some(h) if h > p.to_block => Some(serde_json::json!({"fromBlock": p.to_block + 1, "toBlock": h})),
         Some(_) => None,
@@ -306,15 +306,219 @@ fn page_json(read: &Read, importer: [u8; 20], chain_head: Option<u64>) -> String
         "headGap": head_gap,
         "tailGap": tail_gap,
         "gaps": p.gaps.iter().map(|g| serde_json::json!({"fromBlock": g.from_block, "toBlock": g.to_block})).collect::<Vec<_>>(),
-        "entries": p.entries.iter().map(|e| serde_json::json!({
-            "block": e.block,
-            "slot": e.slot,
-            "roles": roles(e.roles),
-            "state": "unverified",
-        })).collect::<Vec<_>>(),
+        // Each entry with its state so far: what an earlier verify call found for it, else
+        // "unverified".
+        "entries": p.entries.iter().map(|e| {
+            verified::cached(who.0, &who.1, e.block, e.slot, e.roles).unwrap_or_else(|| serde_json::json!({
+                "block": e.block,
+                "slot": e.slot,
+                "roles": roles(e.roles),
+                "state": "unverified",
+            }))
+        }).collect::<Vec<_>>(),
         "next": p.next.map(|(b, s)| format!("{}:{b}:{s}", read.head_update)),
     })
     .to_string()
+}
+
+/// The most entries one verify call checks.
+pub const MAX_VERIFY: usize = 50;
+
+/// `verify_address_history_json`: check `entries` (a JSON array of `{"block", "slot",
+/// "roles"}`, as a page returns them) of `address` against verified chain data
+/// (`myotis_net::el::addrcheck`, part 6 of #899), one verified block (and, for the log
+/// roles, its verified receipts) per block. Each entry comes back with its state:
+///
+/// ```json
+/// [{"block":…,"slot":…,"roles":[…],"state":"verified"|"contradicted"|"unverified"|"unavailable",
+///   "final":true,"confirmed":[…],"contradicted":[…],"unchecked":[…],
+///   "txHash":"0x…","from":"0x…","to":"0x…"|null,"value":"0x…",
+///   "transfer":{"token":"0x…","from":"0x…","to":"0x…","data":"0x…"}|null,"reason":"…"}]
+/// ```
+///
+/// `unavailable` (with its `reason`) is a block no peer served now: ask again. A final
+/// verdict (`verified` or `contradicted` in a finalized block) is kept, and later pages carry
+/// it. A refusal is the permanent `-32602`.
+pub fn verify_json(
+    rt: &tokio::runtime::Runtime,
+    reader: &std::sync::Arc<myotis_net::el::reader::ElReader>,
+    chain_id: u64,
+    address: &str,
+    entries_json: &str,
+) -> String {
+    let Some(address) = parse_address(address) else {
+        return eljson::invalid_params_json("invalid address (expected 20-byte hex)");
+    };
+    let entries = match parse_entries(entries_json) {
+        Ok(e) => e,
+        Err(msg) => return eljson::invalid_params_json(&msg),
+    };
+    let finalized = reader.finalized_block_number();
+    let mut out = vec![serde_json::Value::Null; entries.len()];
+    // One read per block, the entries of a block together.
+    let mut blocks: std::collections::BTreeMap<u64, Vec<usize>> = Default::default();
+    for (i, e) in entries.iter().enumerate() {
+        match verified::cached(chain_id, &address, e.0, e.1, e.2) {
+            Some(v) => out[i] = v,
+            None => blocks.entry(e.0).or_default().push(i),
+        }
+    }
+    for (block, idx) in blocks {
+        let needs_receipts = idx.iter().any(|i| {
+            let (_, slot, roles) = entries[*i];
+            slot > 0 && roles & myotis_net::el::addrcheck::role::NEEDS_RECEIPTS != 0
+        });
+        let fetched = rt.block_on(reader.request(async {
+            let b = reader.get_block_by_number(Some(block), true).await?;
+            let r = match (&b, needs_receipts) {
+                (Some(_), true) => reader.get_block_receipts(Some(block)).await?,
+                _ => None,
+            };
+            Ok((b, r))
+        }));
+        for i in idx {
+            let (_, slot, roles) = entries[i];
+            out[i] = match &fetched {
+                Ok((Some(b), receipts)) => {
+                    let c = myotis_net::el::addrcheck::check(&address, slot, roles, b, receipts.as_deref());
+                    let v = verified::render(block, slot, roles, &c, block <= finalized);
+                    if block <= finalized && c.state != myotis_net::el::addrcheck::State::Unverified {
+                        verified::keep(chain_id, &address, block, slot, roles, &v);
+                    }
+                    v
+                }
+                Ok((None, _)) => verified::unavailable(block, slot, roles, "the block is above the node's verified head"),
+                Err(e) => verified::unavailable(block, slot, roles, e),
+            };
+        }
+    }
+    serde_json::Value::Array(out).to_string()
+}
+
+/// `[{"block": N, "slot": S, "roles": ["from", …]}, …]`, every field applied or the whole
+/// request refused.
+fn parse_entries(json: &str) -> Result<Vec<(u64, u32, u8)>, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("invalid entries JSON: {e}"))?;
+    let list = v.as_array().ok_or("entries must be a JSON array")?;
+    if list.is_empty() || list.len() > MAX_VERIFY {
+        return Err(format!("expected 1 to {MAX_VERIFY} entries"));
+    }
+    list.iter()
+        .map(|e| {
+            let o = e.as_object().ok_or("an entry must be an object")?;
+            for k in o.keys() {
+                // A page's own fields are accepted back (a host may pass entries as it got
+                // them); anything else is refused.
+                if !matches!(k.as_str(), "block" | "slot" | "roles" | "state") {
+                    return Err(format!("unknown entry field '{k}'"));
+                }
+            }
+            let block = o.get("block").and_then(|b| b.as_u64()).ok_or("an entry needs a numeric block")?;
+            let slot = o
+                .get("slot")
+                .and_then(|s| s.as_u64())
+                .and_then(|s| u32::try_from(s).ok())
+                .ok_or("an entry needs a numeric slot")?;
+            let names = o.get("roles").and_then(|r| r.as_array()).ok_or("an entry needs a roles array")?;
+            let mut roles = 0u8;
+            for n in names {
+                let n = n.as_str().ok_or("a role must be a string")?;
+                let bit = ROLE_NAMES.iter().find(|(_, name)| *name == n).ok_or(format!("unknown role '{n}'"))?.0;
+                roles |= bit;
+            }
+            if roles == 0 {
+                return Err("an entry needs at least one role".to_string());
+            }
+            Ok((block, slot, roles))
+        })
+        .collect()
+}
+
+mod verified {
+    //! The verdicts kept, and how an entry with one is rendered.
+    use myotis_net::el::addrcheck::{Check, State};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type Key = (u64, [u8; 20], u64, u32, u8);
+
+    /// Final verdicts only (a finalized block's verified or contradicted entry): they never
+    /// change. Bounded: cleared whole when full, a cache, not a store.
+    static KEPT: Mutex<Option<HashMap<Key, serde_json::Value>>> = Mutex::new(None);
+    const MAX_KEPT: usize = 50_000;
+
+    pub(super) fn cached(chain: u64, address: &[u8; 20], block: u64, slot: u32, roles: u8) -> Option<serde_json::Value> {
+        KEPT.lock().ok()?.as_ref()?.get(&(chain, *address, block, slot, roles)).cloned()
+    }
+
+    pub(super) fn keep(chain: u64, address: &[u8; 20], block: u64, slot: u32, roles: u8, v: &serde_json::Value) {
+        if let Ok(mut kept) = KEPT.lock() {
+            let map = kept.get_or_insert_with(HashMap::new);
+            if map.len() >= MAX_KEPT {
+                map.clear();
+            }
+            map.insert((chain, *address, block, slot, roles), v.clone());
+        }
+    }
+
+    fn hex(b: &[u8]) -> String {
+        super::hex(b)
+    }
+
+    fn scalar(b: &[u8]) -> String {
+        let b = &b[b.iter().take_while(|x| **x == 0).count()..];
+        if b.is_empty() {
+            "0x0".to_string()
+        } else {
+            let s = hex(b);
+            format!("0x{}", s[2..].trim_start_matches('0'))
+        }
+    }
+
+    pub(super) fn render(block: u64, slot: u32, roles: u8, c: &Check, finalized: bool) -> serde_json::Value {
+        let state = match c.state {
+            State::Verified => "verified",
+            State::Contradicted => "contradicted",
+            State::Unverified => "unverified",
+        };
+        let mut v = serde_json::json!({
+            "block": block,
+            "slot": slot,
+            "roles": super::role_names(roles),
+            "state": state,
+            "final": finalized,
+            "confirmed": super::role_names(c.confirmed),
+            "contradicted": super::role_names(c.contradicted),
+            "unchecked": super::role_names(c.unchecked),
+        });
+        if slot > 0 {
+            let o = v.as_object_mut().expect("an object");
+            o.insert("txHash".into(), c.tx_hash.map(|h| hex(&h)).into());
+            o.insert("from".into(), c.from.map(|a| hex(&a)).into());
+            o.insert("to".into(), c.to.map(|a| hex(&a)).into());
+            o.insert("value".into(), scalar(&c.value).into());
+            o.insert(
+                "transfer".into(),
+                c.transfer
+                    .as_ref()
+                    .map(|t| {
+                        serde_json::json!({"token": hex(&t.token), "from": hex(&t.from), "to": hex(&t.to), "data": hex(&t.data)})
+                    })
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+        v
+    }
+
+    pub(super) fn unavailable(block: u64, slot: u32, roles: u8, reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "block": block,
+            "slot": slot,
+            "roles": super::role_names(roles),
+            "state": "unavailable",
+            "reason": reason,
+        })
+    }
 }
 
 #[cfg(feature = "swarm")]
@@ -527,6 +731,51 @@ mod tests {
     }
 
     #[test]
+    fn verify_entries_are_applied_or_refused_whole() {
+        let ok = parse_entries(r#"[{"block":100,"slot":3,"roles":["from","emitter"],"state":"unverified"},{"block":101,"slot":0,"roles":["block"]}]"#).unwrap();
+        assert_eq!(ok, vec![(100, 3, 0x05), (101, 0, 0x40)]);
+        for bad in [
+            "[]",
+            "{}",
+            r#"[{"block":1,"slot":1}]"#,
+            r#"[{"block":1,"slot":1,"roles":[]}]"#,
+            r#"[{"block":1,"slot":1,"roles":["sender"]}]"#,
+            r#"[{"block":1,"slot":1,"roles":["from"],"extra":1}]"#,
+            r#"[{"block":"1","slot":1,"roles":["from"]}]"#,
+            r#"[{"block":1,"slot":4294967296,"roles":["from"]}]"#,
+        ] {
+            assert!(parse_entries(bad).is_err(), "{bad}");
+        }
+        let many = format!("[{}]", vec![r#"{"block":1,"slot":1,"roles":["from"]}"#; MAX_VERIFY + 1].join(","));
+        assert!(parse_entries(&many).is_err());
+    }
+
+    #[test]
+    fn a_kept_verdict_is_what_a_later_page_shows() {
+        use myotis_addr1::client::Page;
+        use myotis_addr1::records::{role, Entry};
+        let who = (1u64, [0x42; 20]);
+        let kept = serde_json::json!({"block": 500, "slot": 2, "roles": ["from"], "state": "verified", "final": true});
+        verified::keep(who.0, &who.1, 500, 2, role::FROM, &kept);
+        let read = Read {
+            head_update: 1,
+            page: Page {
+                entries: vec![Entry { block: 500, slot: 2, roles: role::FROM }, Entry { block: 499, slot: 1, roles: role::TO }],
+                next: None,
+                from_block: 0,
+                to_block: 600,
+                gaps: vec![],
+            },
+        };
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), who)).unwrap();
+        assert_eq!(v["entries"][0]["state"], "verified");
+        assert_eq!(v["entries"][1]["state"], "unverified");
+        // Another address's page does not see it.
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), (1, [0x43; 20]))).unwrap();
+        assert_eq!(v["entries"][0]["state"], "unverified");
+    }
+
+    #[test]
     fn cursors_round_trip() {
         assert_eq!(
             parse_cursor("9:1000:5"),
@@ -587,7 +836,7 @@ mod tests {
                 gaps: vec![Gap { from_block: 10, to_block: 20 }],
             },
         };
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(128_100))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(128_100), (1, [0x42; 20]))).unwrap();
         assert_eq!(v["headUpdate"], 73);
         assert_eq!(v["coveredFrom"], 64_000);
         assert_eq!(v["headGap"]["fromBlock"], 128_000);
@@ -599,10 +848,10 @@ mod tests {
         // An index that starts late names the blocks below it.
         assert_eq!(v["tailGap"]["toBlock"], 63_999);
         // At the head: no head gap.
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(127_999))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(127_999), (1, [0x42; 20]))).unwrap();
         assert!(v["headGap"].is_null());
         // No verified head yet: an open head gap, never "none".
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], None)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], None, (1, [0x42; 20]))).unwrap();
         assert_eq!(v["headGap"]["fromBlock"], 128_000);
         assert!(v["headGap"]["toBlock"].is_null());
     }
