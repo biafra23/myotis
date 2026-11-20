@@ -34,8 +34,10 @@ hash, and the top. A table that does not match is refused.
 A table changes only in a release PR that names its build: the tool, the source node, the
 top, and the cross-check. Each release extends it (`.claude/agent/releases.md`, step 6):
 replace the file and the sidecar, and move the pin in `../src/checkpoints.rs` in the same
-commit. The new table's bytes up to the old last entry must equal the old table's, so a
-release only appends. A running node never writes here.
+commit: `MAINNET_PIN`, plus the new pin appended to `MAINNET_SHIPPED`. The new table's bytes
+up to the old last entry must equal the old table's, so a release only appends. The test
+`every_shipped_table_is_a_prefix` checks that in CI, since GitHub shows a changed table only
+as "Binary files differ". A running node never writes here.
 A table is committed, never generated at build time, so release outputs stay byte-identical.
 Even so, a PR into `main` that changes one needs a green `reproducible builds` run
 (`.claude/agent/reproducibility.md`), because the table is embedded in the engine.

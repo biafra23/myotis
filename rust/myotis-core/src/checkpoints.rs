@@ -27,7 +27,9 @@ use crate::{err, CoreError};
 use alloc::format;
 
 /// One table: its entries (32-byte hashes, entry `i` = block `i * K`) and its top.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Built only by [`mainnet`] / [`for_chain`] outside this crate, so every table is the
+/// release's, pinned in the source.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointTable<'a> {
     entries: &'a [u8],
     top_number: u64,
@@ -49,6 +51,16 @@ pub struct TablePin {
     pub top_hash: [u8; 32],
 }
 
+/// Not the derived one: that would print all 0.83 MB of entries.
+impl core::fmt::Debug for CheckpointTable<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CheckpointTable")
+            .field("entries", &self.len())
+            .field("top_number", &self.top_number)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> CheckpointTable<'a> {
     /// The table's stride: one hash every 1024 blocks, geth's `GetBlockHeaders` limit, so
     /// every lookup is one request.
@@ -58,7 +70,7 @@ impl<'a> CheckpointTable<'a> {
     /// hash, and the top at or above the last entry and below the next one (so the top is
     /// the only anchor above the last entry, and no anchor is more than `K` blocks above
     /// any block it serves).
-    pub fn parse(bytes: &'a [u8], pin: &TablePin) -> Result<Self, CoreError> {
+    pub(crate) fn parse(bytes: &'a [u8], pin: &TablePin) -> Result<Self, CoreError> {
         if keccak256(bytes) != pin.keccak256 {
             return err("checkpoint table does not match its pinned keccak256");
         }
@@ -84,6 +96,13 @@ impl<'a> CheckpointTable<'a> {
             return err("checkpoint table top is its last entry but the hashes differ");
         }
         Ok(Self { entries: bytes, top_number: pin.top_number, top_hash: pin.top_hash })
+    }
+
+    /// [`Self::parse`] for tests elsewhere in the workspace (`test-util` feature): a
+    /// synthetic table never reaches a production build.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn parse_for_test(bytes: &'a [u8], pin: &TablePin) -> Result<Self, CoreError> {
+        Self::parse(bytes, pin)
     }
 
     /// The top: the highest block the table anchors.
@@ -138,6 +157,12 @@ pub const MAINNET_PIN: TablePin = TablePin {
     top_hash: hex32("229a7a2185b4a334b8c9e4f94f028974365698f2bc40b7ea418e276da9a485fc"),
 };
 
+/// Every mainnet table shipped so far, as `(entries, keccak256 of those entries)`, oldest
+/// first. Moving [`MAINNET_PIN`] appends the new pin here (release step 6): the test
+/// `every_shipped_table_is_a_prefix` then checks that a release only appended.
+pub const MAINNET_SHIPPED: &[(u64, [u8; 32])] =
+    &[(25_838, hex32("ccf5ad8849bb513d7aef7b7bc732b264e2874c6b6e24cc4880753ceb68cc03d0"))];
+
 /// The embedded mainnet table's bytes, as committed.
 pub static MAINNET_BYTES: &[u8] = include_bytes!("../checkpoints/mainnet-1024.hashes");
 
@@ -182,42 +207,66 @@ mod tests {
     #[test]
     fn mainnet_parses_against_its_pin() {
         let t = mainnet().expect("the committed table matches its pin");
-        assert_eq!(t.len(), 25_838);
+        assert_eq!(t.len(), MAINNET_PIN.entries);
         assert_eq!(t.top(), (MAINNET_PIN.top_number, MAINNET_PIN.top_hash));
         assert_eq!(t.entry(0), Some(MAINNET_PIN.genesis_hash));
+        assert_eq!(t.entry(MAINNET_PIN.entries), None);
         assert!(for_chain(1).is_some());
         assert!(for_chain(100).is_none());
     }
 
-    /// The sidecar's `last_entry_block` (26,457,088) is entry 25,837, the last one. The
-    /// entries themselves are checked live, by the walks that verify against them.
+    /// Release step 6 only appends: every shipped table is a prefix of this one, and the
+    /// current pin is the last shipped one.
     #[test]
-    fn mainnet_last_entry() {
+    fn every_shipped_table_is_a_prefix() {
+        let mut last = 0;
+        for &(entries, hash) in MAINNET_SHIPPED {
+            assert!(entries > last, "shipped tables grow");
+            let n = usize::try_from(entries * 32).unwrap();
+            assert_eq!(keccak256(&MAINNET_BYTES[..n]), hash, "{entries} entries");
+            last = entries;
+        }
+        assert_eq!(MAINNET_SHIPPED.last(), Some(&(MAINNET_PIN.entries, MAINNET_PIN.keccak256)));
+    }
+
+    /// The first table's last entry (block 26,457,088), and the DAO-fork block 1,920,000
+    /// (entry 1875), whose hash is widely published.
+    #[test]
+    fn mainnet_known_entries() {
         let t = mainnet().unwrap();
         assert_eq!(
             t.entry(25_837),
             Some(hex32("f84279a9a1b4b7cb664c47bd0f21eb4ccc0f3bdc6ad4932063858de69eebf40b"))
         );
-        assert_eq!(t.entry(25_838), None);
+        assert_eq!(
+            t.entry(1875),
+            Some(hex32("4985f5ca3d2afbec36529aa96f74de3cc10a2a4a6c44f2157a57d2c6059a11bb"))
+        );
     }
 
     #[test]
     fn anchors() {
         let t = mainnet().unwrap();
+        const K: u64 = CheckpointTable::K;
+        let (top, _) = t.top();
+        let last = (MAINNET_PIN.entries - 1) * K;
         // An entry is its own anchor: a walk of one header.
         assert_eq!(t.anchor_at_or_above(0), Some((0, MAINNET_PIN.genesis_hash)));
         assert_eq!(t.anchor_at_or_above(2048).map(|a| a.0), Some(2048));
         // Otherwise the next multiple of 1024.
         assert_eq!(t.anchor_at_or_above(1).map(|a| a.0), Some(1024));
         assert_eq!(t.anchor_at_or_above(2049).map(|a| a.0), Some(3072));
+        assert_eq!(t.anchor_at_or_above(last).map(|a| a.0), Some(last));
         // Above the last entry, the top; above the top, none.
-        assert_eq!(t.anchor_at_or_above(26_457_089), Some(t.top()));
-        assert_eq!(t.anchor_at_or_above(26_457_537), Some(t.top()));
-        assert_eq!(t.anchor_at_or_above(26_457_538), None);
+        if top > last {
+            assert_eq!(t.anchor_at_or_above(last + 1), Some(t.top()));
+        }
+        assert_eq!(t.anchor_at_or_above(top), Some(t.top()));
+        assert_eq!(t.anchor_at_or_above(top + 1), None);
         // The walk is never longer than K.
-        for n in [1u64, 1023, 1025, 26_457_089, 26_457_537, 12_345_678] {
+        for n in [1u64, 1023, 1025, 12_345_678, last + 1, top] {
             let (a, _) = t.anchor_at_or_above(n).unwrap();
-            assert!(a >= n && a - n < CheckpointTable::K, "{n} → {a}");
+            assert!(a >= n && a - n < K, "{n} → {a}");
         }
     }
 
@@ -258,6 +307,14 @@ mod tests {
             &TablePin { top_number: 2048, top_hash: [2; 32], ..good }
         )
         .is_ok());
-        assert!(CheckpointTable::parse(&[], &pin_for(&[0; 32], 0, [0; 32])).is_err(), "empty");
+        // A zero-entry pin must be refused before `bytes[..32]` is read.
+        let empty = TablePin {
+            keccak256: keccak256(&[]),
+            entries: 0,
+            genesis_hash: [0; 32],
+            top_number: 0,
+            top_hash: [0; 32],
+        };
+        assert!(CheckpointTable::parse(&[], &empty).is_err(), "empty");
     }
 }
