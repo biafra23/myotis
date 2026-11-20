@@ -25,7 +25,8 @@ its trust anchors and release checks.
   long it took, which engine path answered, and whether it could be verified. A
   block the peers served but the node could not tie to the beacon chain reads as
   "fetched, unverified", not as a failed fetch. The Java engine fetches any
-  height; the Rust engine (and so iOS) answers only for blocks near the head.
+  height; the Rust engine (and so iOS) answers only for blocks near the head
+  (#898).
 
 ### Fixed
 
