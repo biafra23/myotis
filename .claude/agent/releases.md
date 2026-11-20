@@ -10,8 +10,9 @@ When the user asks for a release (a `v*` tag, a version bump, "cut a release"),
 rulings, 2026-09-02 and 2026-09-11), then **move the version pins — step 4
 below, mandatory, never asked about** (owner ruling, 2026-09-24) — and
 **refresh the PoC seeds, step 5, mandatory too** (2026-10-13) — and **add the
-release to `CHANGELOG.md`, step 6, mandatory as well** (owner's request,
-2026-11-15). Everything a release needs goes into ONE release PR. **The tag is the owner's action**: after
+release to `CHANGELOG.md`, step 7, mandatory as well** (owner's request,
+2026-11-15) — and **extend the checkpoint tables, step 6, mandatory too**
+(owner's decision D1, 2026-11-20). Everything a release needs goes into ONE release PR. **The tag is the owner's action**: after
 the merge the owner pushes it, or explicitly asks for it to be pushed — never
 push a `v*` tag on your own initiative, it is the publish trigger for every
 asset workflow and a stronger action than the merge this file already forbids.
@@ -20,7 +21,7 @@ asset workflow and a stronger action than the merge this file already forbids.
 
 Ask the owner too whether any merge since the last tag is an embargoed
 security fix: the release PR, the release notes and its `CHANGELOG.md` entry
-(step 6) then stay neutral until the advisory is published (`security-fixes.md`, steps 8 and 9; owner's
+(step 7) then stay neutral until the advisory is published (`security-fixes.md`, steps 8 and 9; owner's
 request, 2026-11-15, on #870). `git log <last tag>..origin/main
 --grep='^Merge pull request from GHSA-'` lists the advisory merges, so the
 question does not rest on memory.
@@ -213,7 +214,39 @@ question does not rest on memory.
    publish, which makes no commit. Details: docs/guides/railgun-poc.md (*Refreshing the seed*),
    docs/guides/bee-rpc-service.md (*seeding from a full node*).
 
-6. **Add the release to `CHANGELOG.md`. MANDATORY — not a question, and part
+6. **Extend the checkpoint tables. MANDATORY — not a question, and
+   part of the SAME release PR** (owner's decision D1, 2026-11-20;
+   `data-sources.md`, Trust). The bundled table
+   (`rust/myotis-core/checkpoints/`) anchors deep reads up to its top;
+   above it a running node walks the gap down from its finalized
+   block, about 7 requests (4-5 MB) per day since the table's build.
+   On the nuc, against its Erigon, cross-checked against zbox's geth,
+   extending the committed table:
+
+   ```bash
+   ethswarm checkpoint-table \
+     --extend rust/myotis-core/checkpoints/mainnet-1024.hashes \
+     --out mainnet-1024.next.hashes \
+     --rpc <nuc erigon> --cross-check <zbox geth>
+   ```
+
+   (eth2swarm, `--extend` since VesperBats/eth2swarm#33: it walks only
+   the blocks above the old table's last entry, checks that entry and
+   the old top against the chain again, and keeps the old entries byte
+   for byte; seconds for a few weeks of blocks. Without `--extend` it
+   rebuilds the whole table down to the genesis hash, ~40 min.)
+   Replace the table and its sidecar with the new pair, and move
+   `MAINNET_PIN` in `rust/myotis-core/src/checkpoints.rs`, appending
+   the new pin to `MAINNET_SHIPPED`, in the same commit. The release
+   PR names the build: tool and version, source node, top,
+   cross-check. The new table's bytes up to the old last entry must
+   equal the old table's (`cmp -n`; the test
+   `every_shipped_table_is_a_prefix` checks it too), so a release only
+   appends. The
+   release's `reproducible builds` run covers it like any embedded
+   asset.
+
+7. **Add the release to `CHANGELOG.md`. MANDATORY — not a question, and part
    of the SAME release PR** (owner's request, 2026-11-15, mirroring Punicus
    #281). `CHANGELOG.md` follows Keep a Changelog. The release PR turns
    `## [Unreleased]` into `## [X.Y.Z] - <date>` (the exact version of the tag
@@ -241,7 +274,7 @@ question does not rest on memory.
    is not a release may add its own line under `[Unreleased]`; the release PR
    still checks the whole entry.
 
-7. **After the tag: a release is done when its two evidence runs are green.
+8. **After the tag: a release is done when its two evidence runs are green.
    MANDATORY to check and report, not a question** (#734). A tag push starts
    them by itself, next to the ten publishing workflows:
    - **`verify release`** waits for the publishers, then checks the finished

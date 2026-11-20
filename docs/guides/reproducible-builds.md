@@ -326,7 +326,7 @@ What that makes each part, and what is missing:
 
 - The rule for merging is in `CLAUDE.md` (*No merge into `main` may break
   reproducibility*), and what a release has to show in its *Releases* section,
-  step 7.
+  step 8.
 - A red comparison names every differing file in the run's
   `repro-report-<platform>-<leg>-vs-<leg>` artifact. Fix the leak; do not add
   it to `scripts/repro/known-differences.txt`, which is empty and meant to
