@@ -40,6 +40,8 @@ on:
       - 'settings.gradle.kts'
       - 'gradle/libs.versions.toml'
       - '.github/workflows/ios-framework.yml'
+      # The review gate it calls: a PR that breaks that file goes red here.
+      - '.github/workflows/wait-for-claude-review.yml'
       - '.java-version'
       - '.xcode-version'
       - '.github/actions/select-xcode/**'
