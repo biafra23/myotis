@@ -6,7 +6,7 @@ Every release of Myotis, newest first. The format follows
 libraries and checksums are on its
 [GitHub release](https://github.com/biafra23/myotis/releases); every release so
 far is a pre-release. The release PR adds its entry here
-(`.claude/agent/releases.md`, step 6); numbers in parentheses are pull requests
+(`.claude/agent/releases.md`, step 7); numbers in parentheses are pull requests
 and issues of this repository.
 
 A release candidate's entry lists what it adds over the release before it; the

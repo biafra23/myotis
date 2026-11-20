@@ -195,12 +195,12 @@ Full text: `.claude/agent/reproducibility.md`.
 Read `.claude/agent/releases.md` in full before any release work. In outline:
 **ask three questions first** (1. refresh the trust checkpoints? 2. re-sync the
 mainnet bootnodes? 3. run the cold-start checks?), then the mandatory steps
-(4. move the version pins, 5. refresh the PoC log-index seeds, 6. turn
-`[Unreleased]` in `CHANGELOG.md` into the entry of the exact tag to come;
-every `v*` tag gets a PR for it), all in ONE release PR. Ask too whether a
+(4. move the version pins, 5. refresh the PoC log-index seeds, 6. extend the
+checkpoint tables, 7. turn `[Unreleased]` in `CHANGELOG.md` into the entry of
+the exact tag to come; every `v*` tag gets a PR for it), all in ONE release PR. Ask too whether a
 merge since the last tag is an embargoed security fix: its release PR, notes
 and changelog entry then stay neutral. The tag is the owner's action. After
-the tag (7.), a release is done only when `verify release` and `reproducible
+the tag (8.), a release is done only when `verify release` and `reproducible
 builds` are green — check and report them. Every release asset goes through
 `.github/release-assets.sh`, never a bare `gh release upload`.
 
