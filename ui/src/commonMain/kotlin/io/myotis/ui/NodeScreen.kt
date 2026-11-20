@@ -101,6 +101,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import kotlin.time.Clock
 import kotlin.time.Instant
+import kotlin.time.TimeSource
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 
@@ -1661,6 +1662,11 @@ private fun QueryTab(
     // job never writes into the card of a later name (the scanJob pattern below).
     var ensRecordsJob by remember(network) { mutableStateOf<Job?>(null) }
     var error by remember(network) { mutableStateOf<String?>(null) }
+    // A block-height lookup's result, and how long the host took to answer it — the
+    // point of the lookup is to see how readily the peers serve an arbitrary block.
+    var block by remember(network) { mutableStateOf<BlockLookupResult?>(null) }
+    var blockElapsedMillis by remember(network) { mutableStateOf(0L) }
+    val blockLookup = controller.supportsBlockLookup
     // History is global (all chains); re-read the local snapshot after each add/clear. Start empty
     // and load off the main thread (entries() reads a file) so composition never blocks on disk.
     // Keyed on `network` like the state it fills: a chain switch resets the list, so reload it.
@@ -1736,12 +1742,19 @@ private fun QueryTab(
         val q = raw.trim()
         if (q.isEmpty() || loading) return
         input = q
-        loading = true; error = null; account = null; ens = null
+        loading = true; error = null; account = null; ens = null; block = null
         ensRecordsJob?.cancel(); ensRecordsJob = null
         ensProfile = null; ensProfileError = null; ensProfileLoading = false; ensOwnership = null; ensRecordsRead = false
         scope.launch {
             try {
-                if (looksLikeEnsName(q)) {
+                val height = if (blockLookup) parseBlockHeight(q) else null
+                if (height != null) {
+                    loadingMsg = "Fetching block…"
+                    val started = TimeSource.Monotonic.markNow()
+                    val r = controller.requestBlock(network, height).forHeight(height)
+                    blockElapsedMillis = started.elapsedNow().inWholeMilliseconds
+                    block = r
+                } else if (looksLikeEnsName(q)) {
                     if (!ensCapable) {
                         error = "ENS isn't available on ${network.replaceFirstChar { it.uppercase() }} — enter a 0x address."
                         return@launch
@@ -1770,8 +1783,8 @@ private fun QueryTab(
             } finally {
                 loading = false
                 // Record for one-tap re-run (off the main thread — file write); label = the
-                // resolved address for ENS, else empty.
-                val label = ens?.addressHex ?: ""
+                // resolved address for ENS, "block" for a height, else empty.
+                val label = ens?.addressHex ?: if (blockLookup && parseBlockHeight(q) != null) "block" else ""
                 historyList = withContext(Dispatchers.Default) { history.add(q, label); history.entries() }
             }
         }
@@ -1809,6 +1822,13 @@ private fun QueryTab(
                         else -> "Address (0x…) or ENS name"
                     }
                 )
+            },
+            // The block lookup by height is a debugging aid: named in the placeholder, not the
+            // label, which the hosts' UI tests find the field by.
+            placeholder = if (blockLookup) {
+                { Text("…or a block number, e.g. 21000000") }
+            } else {
+                null
             },
             singleLine = true,
             enabled = !loading,
@@ -1900,6 +1920,7 @@ private fun QueryTab(
                 Text(loadingMsg)
             }
             error != null -> Text("Error: $error", color = MaterialTheme.colorScheme.error)
+            block != null -> BlockResultView(block!!, blockElapsedMillis, expert)
             account != null -> AccountResultView(account!!, nativeCurrencySymbol(network), expert, tokens, running)
         }
 
@@ -2336,6 +2357,168 @@ private fun AccountResultView(
                 // The verification verdict is the pill above; the raw rows don't repeat it.
             }
         }
+    }
+}
+
+/**
+ * A block lookup by height: how long the host took and over which engine path, then the
+ * fetch's outcome — the error when no peer served the block, else the verification pill,
+ * the block's headline numbers and its raw rows (open from the start under [expert]).
+ */
+@Composable
+private fun BlockResultView(b: BlockLookupResult, elapsedMillis: Long, expert: Boolean) {
+    val clipboard = LocalClipboardManager.current
+    var showRaw by remember(expert) { mutableStateOf(expert) }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Block #${groupDigits(b.number.toString())}", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(onClick = { clipboard.setText(AnnotatedString(formatBlockLookup(b, elapsedMillis))) }) {
+                    Text("Copy")
+                }
+            }
+            Text(
+                (if (b.error == null) "Fetched in " else "Failed after ") +
+                    formatElapsed(elapsedMillis) + " · via ${b.path}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (b.error != null) {
+                Text("Fetch failed: ${b.error}", color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+                return@Column
+            }
+            BlockVerificationBadge(b)
+            if (!b.verified) {
+                Text(
+                    unverifiedBlockExplanation(b.failReason),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                ResultStat("Transactions", countOrDash(b.transactionCount), muted = !b.verified)
+                ResultStat(
+                    "Gas used", if (b.gasUsed >= 0) groupDigits(b.gasUsed.toString()) else "—", muted = !b.verified,
+                    detail = if (b.gasLimit > 0 && b.gasUsed >= 0) "${b.gasUsed * 100 / b.gasLimit}% of limit" else null,
+                )
+                ResultStat(
+                    "Age", rememberBlockAge(b.timestamp) ?: "—", muted = !b.verified,
+                )
+            }
+            TextButton(onClick = { showRaw = !showRaw }) {
+                Text(if (showRaw) "Hide raw details" else "Show raw details")
+            }
+            if (showRaw) {
+                StatusRow("Hash", b.hashHex ?: "—")
+                StatusRow("Parent hash", b.parentHashHex ?: "—")
+                StatusRow("State root", b.stateRootHex ?: "—")
+                StatusRow("Transactions root", b.transactionsRootHex ?: "—")
+                StatusRow("Receipts root", b.receiptsRootHex ?: "—")
+                StatusRow("Timestamp", if (b.timestamp >= 0) b.timestamp.toString() else "—")
+                StatusRow("Gas limit", if (b.gasLimit >= 0) b.gasLimit.toString() else "—")
+                StatusRow("Base fee (wei)", b.baseFeePerGasWei ?: "—")
+                StatusRow("Uncles", countOrDash(b.uncleCount))
+                StatusRow("Withdrawals", countOrDash(b.withdrawalCount))
+                if (b.matchedBeaconSlot >= 0) StatusRow("Matched beacon slot", b.matchedBeaconSlot.toString())
+            }
+        }
+    }
+}
+
+/** A block lookup's verification as a pill, like [VerificationBadge]: fetched is not verified. */
+@Composable
+private fun BlockVerificationBadge(b: BlockLookupResult) {
+    val color = if (b.verified) StatusColors.Green else StatusColors.Red
+    val text = if (b.verified) {
+        "✓ Verified" + (b.verifyMethod?.let { " · $it" } ?: "") + (if (b.blsVerified) " · BLS" else "")
+    } else {
+        "✗ Fetched, unverified · ${b.failReason ?: "unknown"}"
+    }
+    Surface(shape = RoundedCornerShape(50), color = color.copy(alpha = 0.15f)) {
+        Text(
+            text,
+            Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelLarge,
+            color = color,
+        )
+    }
+}
+
+/**
+ * What a "fetched, unverified" block means, in words: the peers served it (its hash is
+ * recomputed and its body matches the header's transactionsRoot), but the node could
+ * not tie it to the beacon chain — and why, for the engine's failReason tokens.
+ */
+internal fun unverifiedBlockExplanation(failReason: String?): String {
+    val why = when (failReason) {
+        "preMergeBlock" ->
+            "it is from before the Merge, and pre-Merge blocks can't be tied to the beacon chain " +
+                "until the pre-Merge accumulator is built."
+        "headerChainGapTooLarge" ->
+            "it is 8192 or more blocks below the beacon-attested block it is checked against (the " +
+                "finalized block, or the head for a block above finality), further than the header-chain " +
+                "walk goes; deeper blocks need the historical_summaries proof, not built yet."
+        "beaconNotSynced" ->
+            "the beacon light client is not synced yet. Try again once it is."
+        "beaconBlockHashUnavailable" ->
+            "the beacon light client has no attested block hash to anchor to yet. Try again shortly."
+        "blockAheadOfAnchor" ->
+            "it is above the newest beacon-attested block. Try again in a few seconds."
+        "headerChainInvalid" ->
+            "the headers the peers served did not link it to the beacon-attested block, so it may " +
+                "not be the canonical block at this height."
+        "headerChainError" ->
+            "fetching the header chain up to the beacon-attested block failed (timeout, or no peer " +
+                "served it)."
+        else -> "the node could not tie it to the beacon chain."
+    }
+    return "Available, but not verified: the peers served this block and it is internally consistent " +
+        "(hash and transactions root check out), but $why Its contents are a peer's claim."
+}
+
+private fun countOrDash(n: Int): String = if (n >= 0) n.toString() else "—"
+
+/** 840 → "840 ms", 12_345 → "12.34 s" (pure Kotlin; commonMain has no String.format). */
+internal fun formatElapsed(millis: Long): String {
+    val ms = millis.coerceAtLeast(0)
+    if (ms < 1_000) return "$ms ms"
+    return "${ms / 1_000}.${(ms % 1_000 / 10).toString().padStart(2, '0')} s"
+}
+
+/** Full plaintext dump of a block lookup for the clipboard (untruncated hex). */
+internal fun formatBlockLookup(b: BlockLookupResult, elapsedMillis: Long): String = buildString {
+    appendLine("block: ${b.number}")
+    appendLine("path: ${b.path}")
+    appendLine("elapsed: ${formatElapsed(elapsedMillis)}")
+    if (b.error != null) {
+        appendLine("error: ${b.error}")
+        return@buildString
+    }
+    b.hashHex?.let { appendLine("hash: $it") }
+    b.parentHashHex?.let { appendLine("parentHash: $it") }
+    b.stateRootHex?.let { appendLine("stateRoot: $it") }
+    b.transactionsRootHex?.let { appendLine("transactionsRoot: $it") }
+    b.receiptsRootHex?.let { appendLine("receiptsRoot: $it") }
+    if (b.timestamp >= 0) appendLine("timestamp: ${b.timestamp}")
+    if (b.gasUsed >= 0) appendLine("gasUsed: ${b.gasUsed}")
+    if (b.gasLimit >= 0) appendLine("gasLimit: ${b.gasLimit}")
+    b.baseFeePerGasWei?.let { appendLine("baseFeePerGas (wei): $it") }
+    if (b.transactionCount >= 0) appendLine("transactions: ${b.transactionCount}")
+    if (b.uncleCount >= 0) appendLine("uncles: ${b.uncleCount}")
+    if (b.withdrawalCount >= 0) appendLine("withdrawals: ${b.withdrawalCount}")
+    appendLine("beaconVerified: ${b.verified}")
+    if (b.verified) {
+        b.verifyMethod?.let { appendLine("method: $it") }
+        if (b.matchedBeaconSlot >= 0) appendLine("matchedSlot: ${b.matchedBeaconSlot}")
+        appendLine("blsVerified: ${b.blsVerified}")
+    } else {
+        b.failReason?.let { appendLine("failReason: $it") }
+        appendLine(unverifiedBlockExplanation(b.failReason))
     }
 }
 

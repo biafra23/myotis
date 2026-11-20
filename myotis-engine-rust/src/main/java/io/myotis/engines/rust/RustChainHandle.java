@@ -73,6 +73,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     /** Message for the operator queries only the Java engine serves — {@code get-headers},
      *  {@code get-block} and {@code dial}. The Rust engine's block reads go through
      *  {@link io.myotis.api.VerifiedReads} instead, and it dials from its own pool. */
+    // Hosts recognise this refusal by its "not available on the Rust engine" prefix and
+    // fall back to the verified read (the Query tab's block lookup,
+    // io.myotis.ui.isOperatorQueryRefusal): keep the prefix.
     private static final String NOT_AVAILABLE =
             "not available on the Rust engine (a Java-engine operator query: get-headers, get-block, dial)";
 

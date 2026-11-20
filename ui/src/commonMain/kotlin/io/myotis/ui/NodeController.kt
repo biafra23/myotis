@@ -253,6 +253,23 @@ interface NodeController {
         throw UnsupportedOperationException("eth_call is not available on this host")
 
     /**
+     * Whether [requestBlock] works on this host — the Query tab reads a block-height
+     * input only then. Default false keeps hosts without the seam (and the test fakes)
+     * compiling.
+     */
+    val supportsBlockLookup: Boolean get() = false
+
+    /**
+     * Fetch block [number] on [network] from the EL peers and verify it against the
+     * beacon chain — a debugging aid for how readily the node gets an arbitrary block
+     * (see BlockLookup.kt for the two engine paths). A fetch failure is the result's
+     * `error`, an unverifiable block its `failReason`; throws only when the network
+     * isn't running. Hosts that return true from [supportsBlockLookup] must override this.
+     */
+    suspend fun requestBlock(network: String, number: Long): BlockLookupResult =
+        throw UnsupportedOperationException("Block lookup is not available on this host")
+
+    /**
      * Whether [transactionHistory] works for [network] on this host. Desktop-mainnet-only
      * today (the TrueBlocks scan needs the JVM Java engine's internals); the defaults keep
      * Android/iOS compiling and hide the Query-tab section there.

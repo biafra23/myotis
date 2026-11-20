@@ -6,8 +6,10 @@ import com.jaeckel.ethp2p.app.FileNodeKeyStore
 import com.jaeckel.ethp2p.app.PeerCache
 import com.jaeckel.ethp2p.app.PeerCacheAdapter
 import com.jaeckel.ethp2p.app.rpc.JavaHttpCcipGateway
+import io.myotis.api.BlockResult
 import io.myotis.api.ChainHandle
 import io.myotis.api.EngineConfig
+import io.myotis.api.EngineException
 import io.myotis.api.EnsRoot
 import io.myotis.api.MyotisEngine
 import io.myotis.api.NetworkInfo
@@ -22,7 +24,11 @@ import io.myotis.txhistory.TxSummary
 import io.myotis.txhistory.headline
 import io.myotis.txhistory.uiKind
 import io.myotis.ui.AccountResult
+import io.myotis.ui.BLOCK_PATH_VERIFIED_FETCH
 import io.myotis.ui.BalanceWatch
+import io.myotis.ui.BlockLookupResult
+import io.myotis.ui.blockLookupFromRpcJson
+import io.myotis.ui.isOperatorQueryRefusal
 import io.myotis.ui.BalanceWatcher
 import io.myotis.ui.CacheFileStats
 import io.myotis.ui.DataUsageRow
@@ -613,6 +619,28 @@ class DesktopNodeController(
         val (toBytes, dataBytes) = ethCallArgs(to, data)
         val r = withContext(Dispatchers.IO) { reads.callDetailed(null, toBytes, dataBytes, null, "latest", null) }
         return EthCallResult.of(r.status().name, r.data(), r.detail(), r.blockNumber())
+    }
+
+    override val supportsBlockLookup: Boolean get() = true
+
+    // The Query tab's block lookup by height. The Java engine fetches the block at any height
+    // and verifies it (getBlockVerified); the Rust engine refuses that operator query with an
+    // EngineException, so fall back to its verified eth_getBlockByNumber read, which answers
+    // near the head only (BlockLookup.kt). Blocking engine calls — worker thread.
+    override suspend fun requestBlock(network: String, number: Long): BlockLookupResult {
+        val handle = engine.get(engine.canonicalNetworkName(network))
+            ?: throw IllegalStateException("Node is not running on $network")
+        return withContext(Dispatchers.IO) {
+            try {
+                handle.getBlockVerified(number).toLookup(number)
+            } catch (e: EngineException) {
+                // Only the Rust engine's "not available" refusal falls back; a Java engine
+                // that is not running or did not wake reports that, not an RPC-path miss.
+                if (!isOperatorQueryRefusal(e.message)) throw e
+                val reads = handle.reads() ?: throw e
+                blockLookupFromRpcJson(number, reads.getBlockByNumber("0x" + number.toString(16), false))
+            }
+        }
     }
 
     // ------------------------------------------------------------------------------
@@ -1403,3 +1431,20 @@ class DesktopSettings(
 object DesktopNetworkStatus : NetworkStatus {
     override fun online(): Flow<Boolean> = flowOf(true)
 }
+
+/**
+ * The engine API's verified block fetch of block [requested] as the Query tab's block
+ * lookup. A failed fetch zeroes every record field, its number too — hence [requested].
+ */
+internal fun BlockResult.toLookup(requested: Long): BlockLookupResult =
+    if (error() != null) {
+        BlockLookupResult.failed(requested, BLOCK_PATH_VERIFIED_FETCH, error())
+    } else {
+        BlockLookupResult(
+            number(), hashHex(), parentHashHex(), stateRootHex(), transactionsRootHex(), receiptsRootHex(),
+            timestamp(), gasUsed(), gasLimit(), baseFeePerGasWei(),
+            transactionCount(), uncleCount(), withdrawalCount(),
+            verified = beaconChainVerified(), blsVerified = blsVerified(), matchedBeaconSlot = matchedBeaconSlot(),
+            verifyMethod = verifyMethod(), failReason = failReason(), error = null, path = BLOCK_PATH_VERIFIED_FETCH,
+        )
+    }
