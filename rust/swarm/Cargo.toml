@@ -24,6 +24,8 @@ ant-crypto = { path = "../vendor/ant/crates/ant-crypto" }
 libp2p = { version = "=0.56.0", features = ["secp256k1"] }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
+# The addr1 reader's ChunkSource, implemented by SwarmNode (sans-I/O, a workspace member).
+myotis-addr1 = { path = "../myotis-addr1" }
 
 # Own workspace root: keeps this out of the parent workspace entirely.
 [workspace]

@@ -163,3 +163,111 @@ fn a_soc_of_another_owner_or_address_is_refused() {
     bad[last] ^= 1;
     assert!(verify_soc(&bad, &address, &owner).is_err());
 }
+
+/// The fixture as Swarm serves it, chunk by chunk: SOCs under their address, every file as
+/// the chunks of its tree.
+struct Chunks(HashMap<[u8; 32], Vec<u8>>);
+
+impl Chunks {
+    fn new() -> Self {
+        let log = std::fs::read(dir().join("addr1.export")).unwrap();
+        let mut out = HashMap::new();
+        let mut rest = &log[..];
+        while !rest.is_empty() {
+            let kind = rest[0];
+            let key: [u8; 32] = rest[1..33].try_into().unwrap();
+            let n = u32::from_be_bytes(rest[33..37].try_into().unwrap()) as usize;
+            let data = rest[37..37 + n].to_vec();
+            if kind == 1 {
+                for (r, wire) in myotis_addr1::swarm::file_tree(&data) {
+                    out.insert(r, wire);
+                }
+            } else {
+                out.insert(key, data);
+            }
+            rest = &rest[37 + n..];
+        }
+        Chunks(out)
+    }
+}
+
+impl myotis_addr1::client::ChunkSource for Chunks {
+    fn chunk(
+        &self,
+        address: [u8; 32],
+        _expect_missing: bool,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send {
+        let got = self.0.get(&address).cloned();
+        async move { Ok(got) }
+    }
+}
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut f = std::pin::pin!(f);
+    loop {
+        if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+            return v;
+        }
+    }
+}
+
+#[test]
+fn the_client_pages_every_address_newest_first_as_eth2swarm_found_it() {
+    use myotis_addr1::client::Index;
+    let chunks = Chunks::new();
+    let owner: [u8; 20] = unhex(OWNER).try_into().unwrap();
+    let index = Index::new(&chunks, CHAIN, owner);
+    let origin = block_on(index.origin()).unwrap();
+    // The head probe finds update 1, the newest the fixture holds.
+    let (n, head) = block_on(index.head(&origin, 0)).unwrap();
+    assert_eq!((n, head.units), (1, 33));
+    for (address, want) in expected() {
+        let newest_first: Vec<Entry> = want.iter().rev().copied().collect();
+        // One page holds everything.
+        let all = block_on(index.page(&head, &address, None, 10_000)).unwrap();
+        assert_eq!(all.entries, newest_first, "address {address:02x?}");
+        assert_eq!((all.next, all.gaps.len()), (None, 0));
+        assert_eq!((all.from_block, all.to_block), (1920, 33 * 64 - 1));
+        // Small pages, followed by their cursors, give the same list.
+        for size in [1usize, 3, 7] {
+            let mut got = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = block_on(index.page(&head, &address, cursor, size)).unwrap();
+                assert!(page.entries.len() <= size);
+                got.extend(page.entries);
+                match page.next {
+                    Some(c) => cursor = Some(c),
+                    None => break,
+                }
+            }
+            assert_eq!(got, newest_first, "address {address:02x?}, pages of {size}");
+        }
+    }
+    // An address the index never saw: an empty, complete answer.
+    let none = block_on(index.page(&head, &[0x42; 20], None, 10)).unwrap();
+    assert!(none.entries.is_empty() && none.next.is_none() && none.gaps.is_empty());
+}
+
+#[test]
+fn a_slice_swarm_does_not_deliver_is_a_gap() {
+    use myotis_addr1::client::Index;
+    let mut chunks = Chunks::new();
+    let owner: [u8; 20] = unhex(OWNER).try_into().unwrap();
+    let head = {
+        let index = Index::new(&chunks, CHAIN, owner);
+        let origin = block_on(index.origin()).unwrap();
+        block_on(index.head(&origin, 0)).unwrap().1
+    };
+    // Withhold the newest slice's descriptor.
+    let newest = slices_to_read(&head, None).unwrap().slices[0];
+    chunks.0.remove(&soc_address(&slice_id(CHAIN, newest.0, newest.1), &owner));
+    let index = Index::new(&chunks, CHAIN, owner);
+    let (address, _) = expected().into_iter().next().unwrap();
+    let page = block_on(index.page(&head, &address, None, 10_000)).unwrap();
+    assert_eq!(page.gaps.len(), 1);
+    let range = myotis_addr1::cover::units(newest);
+    assert_eq!(page.gaps[0].to_block, range.end * 64 - 1);
+    assert!(page.entries.iter().all(|e| e.block < range.start * 64));
+}

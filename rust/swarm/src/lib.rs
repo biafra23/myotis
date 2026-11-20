@@ -212,6 +212,12 @@ impl SwarmNode {
             .unwrap_or(Err(SwarmError::Timeout))
     }
 
+    /// [`Self::chunk`] with the error as text: what the addr1 reader's
+    /// [`ChunkSource`](myotis_addr1::client::ChunkSource) takes.
+    async fn chunk_text(&self, address: [u8; 32], expect_missing: bool) -> Result<Option<Vec<u8>>, String> {
+        self.chunk(address, expect_missing).await.map_err(|e| e.to_string())
+    }
+
     /// Stops the node: shuts its runtime down, which ends every task ant spawned (its swarm
     /// loop, listener and connections), waiting up to `timeout` for them. Blocking: call it
     /// from a thread that may block (not from inside an async task).
@@ -219,6 +225,17 @@ impl SwarmNode {
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(timeout);
         }
+    }
+}
+
+/// The addr1 reader reads through the node: every chunk it gets is checked there before use.
+impl myotis_addr1::client::ChunkSource for SwarmNode {
+    fn chunk(
+        &self,
+        address: [u8; 32],
+        expect_missing: bool,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send {
+        self.chunk_text(address, expect_missing)
     }
 }
 
