@@ -12,6 +12,8 @@
 #
 # Bumping it is a reviewed PR like any dependency bump: change this line (the
 # x.y.z form is required — the CI action refuses a channel name) and let CI build
-# every target with it.
+# every target with it. The floor does not move with it: `rust-version` in
+# rust/Cargo.toml (and its copies in the standalone crates) is a decision of its
+# own, 1.99 since 2026-11-20.
 [toolchain]
 channel = "1.99.1"

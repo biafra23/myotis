@@ -72,6 +72,24 @@ jobs:
             echo "== $manifest"
             cargo update --workspace --locked --manifest-path "$manifest"
           done
+      # roost, tor-poc and the workbook are not members, so they state the
+      # workspace's minimum rustc by hand (rust/Cargo.toml [workspace.package]).
+      - name: Standalone crates state the workspace's rust-version
+        run: |
+          set -eu
+          floor=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' rust/Cargo.toml)
+          [ -n "$floor" ] || { echo "::error file=rust/Cargo.toml::no rust-version line"; exit 1; }
+          fail=0
+          for manifest in rust/roost/Cargo.toml rust/tor-poc/Cargo.toml \
+                          docs/tour/workbook/solution/Cargo.toml docs/tour/workbook/starter/Cargo.toml; do
+            got=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' "$manifest")
+            echo "$manifest: ${got:-none} (workspace: $floor)"
+            if [ "$got" != "$floor" ]; then
+              echo "::error file=$manifest::rust-version is '${got:-none}', the workspace's is $floor (rust/Cargo.toml)"
+              fail=1
+            fi
+          done
+          exit $fail
       - name: The workbook's starter/ matches solution/ (sources and lock)
         run: python3 docs/tour/workbook/make_starter.py --check
       # The k256 and libp2p holds (.github/dependabot.yml, cargo `ignore`):

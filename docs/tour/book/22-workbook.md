@@ -2,7 +2,7 @@
 
 *Stop 22 · hands-on* · 10 exercises · about 2½ hours
 
-Reading Rust and writing it are different skills, and the borrow checker teaches the second one fastest. Each exercise below re-builds, in 30 to 80 lines, one mechanism you met in Myotis: the snapshot cursor, the engine's handle map, the peer's drop guard, the reader's hedged race. Every exercise comes with tests. The crate needs only the standard library, tokio and futures, at the exact versions Myotis uses, and those are already in your local cargo cache, so `cargo test --offline` works with no network at all. This was verified with cargo 1.99.
+Reading Rust and writing it are different skills, and the borrow checker teaches the second one fastest. Each exercise below re-builds, in 30 to 80 lines, one mechanism you met in Myotis: the snapshot cursor, the engine's handle map, the peer's drop guard, the reader's hedged race. Every exercise comes with tests. The crate needs only the standard library, tokio and futures, at the exact versions Myotis uses, and those are already in your local cargo cache, so `cargo test --offline` works with no network at all. It needs rustc 1.99 or newer, the floor of every Rust tree in Myotis (its `rust-version`). Your copy lives outside `rust/`, so `rust/rust-toolchain.toml` does not apply there and your default toolchain builds it: if that is older, `rustup toolchain install 1.99.1` once and run `cargo +1.99.1 test --offline`.
 
 ## How to use this stop
 
