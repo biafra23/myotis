@@ -14,6 +14,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -1224,6 +1225,63 @@ class RpcRouterTest {
         assertTrue(hasError(resp))
         assertEquals(-32000, errorCode(resp))
         assertTrue(resp.contains("8x request timed out"))
+    }
+
+    // ---- myotis_getAddressHistory / myotis_verifyAddressHistoryEntries (#899) ----
+
+    @Test fun addressHistory_passesAddressAndOptionsThroughAndServesThePage() {
+        var seen: Pair<String, String>? = null
+        val backend = object : VerifiedReads by FakeBackend() {
+            override fun addressHistoryJson(address: String, optionsJson: String): String {
+                seen = address to optionsJson
+                return """{"importer":"0x${"ab".repeat(20)}","entries":[{"block":7,"slot":1,"roles":["from"],"state":"unverified"}],"next":null}"""
+            }
+        }
+        val addr = "0x${"11".repeat(20)}"
+        val resp = route(backend,
+            """{"jsonrpc":"2.0","id":1,"method":"myotis_getAddressHistory","params":["$addr",{"limit":5,"roles":["from"]}]}""")
+        assertFalse(hasError(resp), resp)
+        assertEquals(addr, seen?.first)
+        assertEquals("""{"limit":5,"roles":["from"]}""", seen?.second)
+        val entries = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject["entries"]!!.jsonArray
+        assertEquals(1, entries.size)
+        // No options object: the engine gets an empty one.
+        route(backend, """{"jsonrpc":"2.0","id":2,"method":"myotis_getAddressHistory","params":["$addr"]}""")
+        assertEquals("{}", seen?.second)
+    }
+
+    @Test fun addressHistory_refusalsAreTheirOwnCodes() {
+        val addr = "0x${"11".repeat(20)}"
+        // The contract's default (the Java engine): the permanent refusal.
+        val refused = route(FakeBackend(), """{"jsonrpc":"2.0","id":1,"method":"myotis_getAddressHistory","params":["$addr"]}""")
+        assertEquals(-32602, errorCode(refused))
+        // A retryable engine error stays -32000.
+        val backend = object : VerifiedReads by FakeBackend() {
+            override fun addressHistoryJson(address: String, optionsJson: String): String =
+                """{"error":"not delivered by Swarm: the index's origin"}"""
+        }
+        val retry = route(backend, """{"jsonrpc":"2.0","id":1,"method":"myotis_getAddressHistory","params":["$addr"]}""")
+        assertEquals(-32000, errorCode(retry))
+        // Malformed arguments, and a third argument, never reach the engine.
+        assertEquals(-32602, errorCode(route(backend, """{"jsonrpc":"2.0","id":1,"method":"myotis_getAddressHistory","params":[5]}""")))
+        assertEquals(-32602, errorCode(route(backend, """{"jsonrpc":"2.0","id":1,"method":"myotis_getAddressHistory","params":["$addr","x"]}""")))
+        assertEquals(-32602, errorCode(route(backend, """{"jsonrpc":"2.0","id":1,"method":"myotis_getAddressHistory","params":["$addr",{},1]}""")))
+        assertEquals(-32602, errorCode(route(backend, """{"jsonrpc":"2.0","id":1,"method":"myotis_verifyAddressHistoryEntries","params":["$addr",{}]}""")))
+    }
+
+    @Test fun verifyAddressHistory_passesTheEntriesArrayThrough() {
+        var seen: String? = null
+        val backend = object : VerifiedReads by FakeBackend() {
+            override fun verifyAddressHistoryJson(address: String, entriesJson: String): String {
+                seen = entriesJson
+                return """[{"block":7,"slot":1,"roles":["from"],"state":"verified","final":true}]"""
+            }
+        }
+        val resp = route(backend,
+            """{"jsonrpc":"2.0","id":1,"method":"myotis_verifyAddressHistoryEntries","params":["0x${"11".repeat(20)}",[{"block":7,"slot":1,"roles":["from"]}]]}""")
+        assertFalse(hasError(resp), resp)
+        assertEquals("""[{"block":7,"slot":1,"roles":["from"]}]""", seen)
+        assertTrue(resp.contains("\"state\":\"verified\""))
     }
 
     @Test fun getLogs_engineErrorEnvelope_surfacesMessageAt32000() {

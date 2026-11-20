@@ -72,7 +72,7 @@ class MethodLogger(
     )
 
     /** Buckets that mean "answered" — anything else counts as an error. */
-    private val ANSWERED = setOf("VERIFIED", "SIMULATED", "PROXY", "LOCAL")
+    private val ANSWERED = setOf("VERIFIED", "SIMULATED", "INDEXED", "PROXY", "LOCAL")
 
     private val mutex = Mutex()
 

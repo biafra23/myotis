@@ -382,4 +382,12 @@ public final class SelectorEngine implements MyotisEngine {
     public NetworkMetering networkMetering() {
         return java.networkMetering();
     }
+
+    /** The address history's settings (#899): only the Rust engine has the reader, so they go
+     *  to it; without it, the refusal every other engine answers. */
+    @Override
+    public String setAddressHistoryConfigJson(String configJson) {
+        if (RustMyotisEngine.isAvailable()) return rustEngine().setAddressHistoryConfigJson(configJson);
+        return java.setAddressHistoryConfigJson(configJson);
+    }
 }

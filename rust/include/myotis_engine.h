@@ -36,7 +36,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 59
+#define MYOTIS_ABI_VERSION 60
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -484,6 +484,20 @@ char *myotis_log_index_status_json(int64_t handle);
  * verified mark; finalized reads and eth_getProof are always proven. */
 bool myotis_set_activity_watch(int64_t handle, const char *config_json);
 char *myotis_address_activity_json(int64_t handle, int64_t after_block);
+
+/* v60: an address's history from the addr1 index on Swarm (#899; the Swarm reader is
+ * linked only with the engine's `swarm` feature, else every call is the permanent
+ * {"error","code":-32602}). myotis_address_history_json: one page, newest first,
+ * options {"cursor","limit","roles","fromBlock","toBlock"} each applied; the page carries
+ * the importer, the covered range, headGap/tailGap/gaps, the entries with their state
+ * so far and the next cursor. myotis_verify_address_history_json: up to 50 entries
+ * checked against verified chain data, each with its state (verified, contradicted,
+ * unverified, unavailable). myotis_set_address_history_config_json: the importer key and
+ * the Swarm network, engine-wide, applied whole ("{}") or refused. Each returned string
+ * is freed with myotis_string_free. */
+char *myotis_address_history_json(int64_t handle, const char *address, const char *options_json);
+char *myotis_verify_address_history_json(int64_t handle, const char *address, const char *entries_json);
+char *myotis_set_address_history_config_json(const char *config_json);
 
 /* v28: the read-fetch shadow-cache counters (docs/how-it-works/read-stats.md): how much of
  * the verified account / storage / bytecode fetch traffic a cache would have

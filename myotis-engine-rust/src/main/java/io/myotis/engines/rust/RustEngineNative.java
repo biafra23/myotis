@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 59; // 59: set_stale_anchor_policy; 58: refresh_anchor_from_checkpointz (checkpointz recovery); 57: myotis_set_listen_ports (C ABI only; P2P listen ports); 56: log-index allowMetered + meteredHold (metered-download hold); 55: simulate_v1_json (#716); 54: debug_trace_call_json (#716); 53: get_raw_transaction_by_hash_json + get_raw_transaction_by_block_json (#715); 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
+    static final int EXPECTED_ABI_VERSION = 60; // 60: address_history_json + verify_address_history_json + set_address_history_config_json (#899); 59: set_stale_anchor_policy; 58: refresh_anchor_from_checkpointz (checkpointz recovery); 57: myotis_set_listen_ports (C ABI only; P2P listen ports); 56: log-index allowMetered + meteredHold (metered-download hold); 55: simulate_v1_json (#716); 54: debug_trace_call_json (#716); 53: get_raw_transaction_by_hash_json + get_raw_transaction_by_block_json (#715); 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -217,6 +217,21 @@ final class RustEngineNative {
      * usage (docs/how-it-works/data-usage.md): 0 unknown, 1 unmetered, 2 metered. False, and
      * nothing recorded, for any other code. Process-global, not per-handle.
      */
+    /** A page of an address's history (ABI 60, #899). */
+    static String nativeAddressHistoryJson(long handle, String address, String optionsJson) {
+        return Myotis_engineKt.addressHistoryJson(handle, nz(address), nz(optionsJson));
+    }
+
+    /** The per-entry check of an address's history (ABI 60, #899). */
+    static String nativeVerifyAddressHistoryJson(long handle, String address, String entriesJson) {
+        return Myotis_engineKt.verifyAddressHistoryJson(handle, nz(address), nz(entriesJson));
+    }
+
+    /** The address history's settings, engine-wide (ABI 60, #899). */
+    static String nativeSetAddressHistoryConfigJson(String configJson) {
+        return Myotis_engineKt.setAddressHistoryConfigJson(nz(configJson));
+    }
+
     static boolean nativeSetNetworkMetering(int code) {
         return Myotis_engineKt.setNetworkMetering(code);
     }

@@ -1214,6 +1214,54 @@ pub unsafe extern "C" fn myotis_address_activity_json(handle: i64, after_block: 
     into_c(crate::host::address_activity_json(handle, after_block))
 }
 
+/// A page of an address's history (see ffi::address_history_json).
+/// Returned string must be freed with `myotis_string_free`.
+///
+/// # Safety
+/// `address` and `options_json` must be null or valid null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_address_history_json(
+    handle: i64,
+    address: *const std::os::raw::c_char,
+    options_json: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
+    into_c(crate::host::address_history_json(
+        handle,
+        &read_string(address).unwrap_or_default(),
+        &read_string(options_json).unwrap_or_default(),
+    ))
+}
+
+/// Check entries of an address's history (see ffi::verify_address_history_json).
+/// Returned string must be freed with `myotis_string_free`.
+///
+/// # Safety
+/// `address` and `entries_json` must be null or valid null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_verify_address_history_json(
+    handle: i64,
+    address: *const std::os::raw::c_char,
+    entries_json: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
+    into_c(crate::host::verify_address_history_json(
+        handle,
+        &read_string(address).unwrap_or_default(),
+        &read_string(entries_json).unwrap_or_default(),
+    ))
+}
+
+/// The address history's settings (see ffi::set_address_history_config_json).
+/// Returned string must be freed with `myotis_string_free`.
+///
+/// # Safety
+/// `config_json` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_set_address_history_config_json(
+    config_json: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
+    into_c(crate::host::set_address_history_config_json(&read_string(config_json).unwrap_or_default()))
+}
+
 /// Read-fetch shadow-cache counters JSON (see ffi::read_stats_json).
 /// Returned string must be freed with `myotis_string_free`.
 #[no_mangle]

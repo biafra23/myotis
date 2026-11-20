@@ -1588,6 +1588,17 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return RustEngineNative.nativeAddressActivityJson(handle, afterBlock);
     }
 
+    /** The address history (#899): the native answer as it came — a page, the retryable
+     *  {@code {"error"}}, or the permanent {@code {"error","code":-32602}} — after the wake
+     *  gate (a page reads the chain's verified head, a verify reads blocks). */
+    String addressHistoryJson(String address, String optionsJson) {
+        return gated(() -> RustEngineNative.nativeAddressHistoryJson(handle, address, optionsJson));
+    }
+
+    String verifyAddressHistoryJson(String address, String entriesJson) {
+        return gated(() -> RustEngineNative.nativeVerifyAddressHistoryJson(handle, address, entriesJson));
+    }
+
     /** Read-fetch shadow-cache counters ({"error":...} when the gate is down).
      *  NOT gated(), for the same status-probe reasons as logIndexStatusJson. */
     @Override

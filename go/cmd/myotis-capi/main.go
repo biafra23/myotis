@@ -1,5 +1,5 @@
 // Command myotis-capi is the Go engine as a c-shared library: the C ABI
-// of rust/include/myotis_engine.h (ABI 59), implemented over
+// of rust/include/myotis_engine.h (ABI 60), implemented over
 // internal/capi for JVM JNA consumers (desktop-embed step 1, part 1b).
 //
 // Every symbol the header declares is exported — functional for the
@@ -303,6 +303,24 @@ func myotis_set_activity_watch(h C.int64_t, cfg *C.cchar_t) C.bool { return C.bo
 //export myotis_address_activity_json
 func myotis_address_activity_json(h C.int64_t, after C.int64_t) *C.char {
 	return cstr(capi.Unsupported("myotis_address_activity_json"))
+}
+
+// The address history (ABI 60): the Go engine has no Swarm reader, so it refuses
+// for good (the carve-out: an engine without the reader answers -32602).
+
+//export myotis_address_history_json
+func myotis_address_history_json(h C.int64_t, address *C.cchar_t, opts *C.cchar_t) *C.char {
+	return cstr(capi.Unsupported("myotis_address_history_json"))
+}
+
+//export myotis_verify_address_history_json
+func myotis_verify_address_history_json(h C.int64_t, address *C.cchar_t, entries *C.cchar_t) *C.char {
+	return cstr(capi.Unsupported("myotis_verify_address_history_json"))
+}
+
+//export myotis_set_address_history_config_json
+func myotis_set_address_history_config_json(cfg *C.cchar_t) *C.char {
+	return cstr(capi.Unsupported("myotis_set_address_history_config_json"))
 }
 
 //export myotis_read_stats_json
