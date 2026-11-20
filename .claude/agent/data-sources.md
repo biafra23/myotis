@@ -6,7 +6,9 @@
 ## Trust
 
 - Peer trusted is never an option everything has to be cryptographically verified
-- The only trust anchors are sync committee signatures and  the embedded pre-Merge historical hashes accumulator and the Bellatrix-era historical roots accumulator
+- The only trust anchors are sync committee signatures, the embedded
+  pre-Merge historical hashes accumulator, the Bellatrix-era historical
+  roots accumulator and the bundled checkpoint table (below)
 - **One bounded exception to the two rules above (owner's decision,
   2026-09-25):** a seeded log history of a root-committing protocol is served
   on its publisher's word. The client's on-chain root check keeps forged
@@ -24,6 +26,34 @@
   verified only after it is checked against verified chain data, and the
   list's completeness (and `TRACE` entries) rests on the importer whose key
   the user configured. Scope and limits: the carve-out under *Data sources*.
+- **The bundled checkpoint table (owner's decision D1, 2026-11-20;
+  docs/ideas/deep-block-verification.md), Rust engine.** Per network,
+  the hash of every 1024th block (entry i = block i*1024) from genesis
+  up to a finalized block, committed as an asset whose keccak256 is
+  pinned in the source; the loader refuses a table that does not match.
+  It is built off-line by hashing every header and linking each by
+  parentHash from that finalized block down to the network's genesis
+  hash (an extension: down to the previous table's last entry), its top
+  cross-checked against a second client implementation.
+  It is the release's word, as the embedded checkpoint is.
+  - A block at or below the top is canonical when the headers from it
+    up to the first entry at or above it (one GetBlockHeaders, at most
+    1024) hash-link to that entry. Until a walk has checked the top
+    (next bullet), such a read rests on the build's cross-check alone
+    (owner's ruling, 2026-11-20).
+  - Above the top, a block verifies through today's window, or by the
+    same walk up to a hash this node linked down from an attested
+    finalized block: through the sync-committee anchor, not the table.
+  - A walk from an attested finalized block that reaches the top must
+    find the top's hash there. A mismatch is an alarm that refuses
+    every read resting on the table (-32602), never outvoted. The
+    check and the alarm are kept per table (keyed by its pin) across
+    restarts, and the host is told. After a STALE_ANCHOR re-anchor the
+    alarm names both anchors as in doubt.
+  - The table changes only in a release PR that names its build (tool,
+    source node, top, cross-check). Each release extends it
+    (releases.md). A running node never writes into it; the hashes it
+    linked are kept beside it.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** A well-formed result computed against
   something other than what the caller asked for is indistinguishable from a
@@ -159,9 +189,9 @@
     receipts, per role). *Contradicted* when that check fails (the address is
     not where its role says): shown as such, never as unverified and never
     dropped, and the answer says the importer key was contradicted. Else
-    *unverified*. A header that only the planned checkpoint table could verify
-    (D1 of the plan, undecided) leaves its entry unverified; this carve-out
-    does not decide D1. Completeness (an entry left out) and `TRACE` entries
+    *unverified*. A header verified through the bundled checkpoint table
+    (D1 of the plan, decided 2026-11-20: the anchor under *Trust*) counts as
+    verified through the existing trust anchors. Completeness (an entry left out) and `TRACE` entries
     rest on the importer's word, as the seed carve-out's displayed balance
     rests on its publisher's; the answer says which block range rests on
     which importer key and names every range nobody covered as a gap, never a
