@@ -16,6 +16,7 @@
 // Public: the plain C ABI doubles as the in-process seam for Rust hosts (the
 // napi-rs Node binding in `myotis-node` calls these by Rust path — linking the
 // rlib does not reliably resolve `extern "C"` imports of no_mangle symbols).
+mod addrhist;
 pub mod capi;
 pub mod catalog;
 mod eljson;

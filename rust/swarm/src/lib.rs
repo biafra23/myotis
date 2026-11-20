@@ -15,7 +15,9 @@
 //! channel ([`ant_control::ControlCommand`]), the in-process interface `antd`'s own control
 //! socket uses.
 //!
-//! **Not linked into the engine yet, and not ready for a release build**, for reasons inside
+//! **Linked into the engine only behind its off-by-default `swarm` feature, for dev builds:
+//! not ready for a release build** (owner, 2026-11-20: settled before any release that turns
+//! `swarm` on), for reasons inside
 //! ant that this crate cannot switch off:
 //! - ant listens on `0.0.0.0` and runs libp2p's UPnP behaviour, which asks the local router
 //!   for a port mapping and announces the public address to peers: more than a fetch-only

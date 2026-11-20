@@ -1,7 +1,8 @@
 [package]
 name = "myotis-swarm"
-# Not a member of ../Cargo.toml's workspace (like tor-poc), and no engine crate depends on it
-# yet (rust/Cargo.toml `exclude`, and the crate doc's "Not linked into the engine yet").
+# Not a member of ../Cargo.toml's workspace (like tor-poc, rust/Cargo.toml `exclude`).
+# myotis-engine links it behind its off-by-default `swarm` feature only (the crate doc's
+# "Not ready for a release build").
 # Not a release crate of its own (it is linked into myotis-engine), so, like tor-poc and
 # roost, no version of its own to keep in step and nothing to publish.
 version = "0.0.0"
