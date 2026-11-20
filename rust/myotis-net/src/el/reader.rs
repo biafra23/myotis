@@ -8291,6 +8291,7 @@ impl ElReader {
                 top.kind()
             ))
         };
+        const _: () = assert!(BLOCK_LOOKBACK_MAX == 512, "BEYOND_FINALIZED_WINDOW names the cap");
         // Only a finalized top: a deep read above finality (a long stretch
         // without it) has no anchor a walk could start from.
         let WindowTop::Finalized { number, hash } = top else {
@@ -10434,6 +10435,13 @@ impl ElReader {
     /// The checkpoint table's alarm (`el::deep`), once raised: a walk from an
     /// attested finalized block found another hash at the table's top, and
     /// every read resting on the table is refused. Kept across restarts.
+    /// How many times this reader's light client was re-anchored at a STALE_ANCHOR park
+    /// (`ExecAnchor::reanchors`): what was verified under an earlier count rested on an
+    /// anchor since replaced.
+    pub fn reanchors(&self) -> u64 {
+        self.anchor.reanchors()
+    }
+
     pub fn checkpoint_alarm(&self) -> Option<String> {
         self.deep.alarm()
     }
@@ -10856,6 +10864,12 @@ fn build_one_receipt(
         contract_address,
     }
 }
+
+/// The words of a block read's refusal when the block is below the window of the
+/// finalized block and no deep anchor serves it (no table for this network): lasting, no
+/// retry changes it. A read above finality more than 512 blocks below the head (a long
+/// stretch without finality) words its top "the optimistic head" instead and is transient.
+pub const BEYOND_FINALIZED_WINDOW: &str = "behind the finalized block — beyond the 512-block verify window";
 
 /// What a verified header window is anchored at — the block its top must BE —
 /// and so what serving it proves about the peer (`peer::KnownHead`).
