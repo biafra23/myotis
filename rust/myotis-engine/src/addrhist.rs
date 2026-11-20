@@ -438,8 +438,8 @@ pub fn verify_json(
             let c = check(&address, slot, roles, &b, r);
             let v = verified::render(block, slot, roles, &c, block <= finalized);
             // Kept only when final and complete: every role that verified data can check was
-            // checked (TRACE never is; an uncle's miner neither).
-            let complete = c.unchecked & !(role::TRACE | role::BLOCK) == 0;
+            // checked (TRACE never is).
+            let complete = c.unchecked & !role::TRACE == 0;
             if block <= finalized && c.state != State::Unverified && complete {
                 verified::keep(chain_id, &address, block, slot, roles, &v);
             }

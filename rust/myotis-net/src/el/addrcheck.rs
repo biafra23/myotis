@@ -206,11 +206,20 @@ pub fn check(
                     .unwrap_or(false)
             })
         });
-        let has_uncles = block.header.ommers_hash != EMPTY_OMMERS;
-        let outcome = if beneficiary || withdrawal {
+        // An uncle's miner: the beneficiary (field 2) of an ommer header the body carried,
+        // checked against ommersHash by the block read.
+        let uncle = block.ommers.iter().any(|h| {
+            rlp::decode(h)
+                .ok()
+                .and_then(|v| v.as_list().ok().and_then(|f| f.get(2).and_then(|a| a.as_fixed_bytes(20).ok().map(|a| a == address))))
+                .unwrap_or(false)
+        });
+        // Ommers the header commits to but the block does not carry (a header-only read).
+        let ommers_missing = block.header.ommers_hash != EMPTY_OMMERS && block.ommers.iter().len() == 0;
+        let outcome = if beneficiary || withdrawal || uncle {
             Some(true)
-        } else if has_uncles {
-            None // an uncle's miner: its header is not kept
+        } else if ommers_missing {
+            None
         } else {
             Some(false)
         };
@@ -330,6 +339,7 @@ mod tests {
             full_transactions: None,
             raw_transactions: raw,
             withdrawals: None,
+            ommers: RawList::new(),
         }
     }
 
@@ -400,9 +410,17 @@ mod tests {
         let block = block_with(&[], [0x44; 20]);
         assert_eq!(check(&[0x44; 20], 0, role::BLOCK, &block, None).state, State::Verified);
         assert_eq!(check(&[0x45; 20], 0, role::BLOCK, &block, None).state, State::Contradicted);
-        // A block with uncles: another address may be an uncle's miner.
+        // A block with an ommer: its miner is confirmed, another address contradicted.
         let mut uncles = block_with(&[], [0x44; 20]);
-        uncles.header.ommers_hash = [9; 32];
+        let ommer = rlp::encode_list_payload(
+            &[rlp::encode_bytes(&[0; 32]), rlp::encode_bytes(&[0; 32]), rlp::encode_bytes(&[0x47; 20])].concat(),
+        );
+        uncles.ommers.push(&ommer);
+        uncles.header.ommers_hash = keccak256(&rlp::encode_list_payload(&ommer));
+        assert_eq!(check(&[0x47; 20], 0, role::BLOCK, &uncles, None).state, State::Verified);
+        assert_eq!(check(&[0x45; 20], 0, role::BLOCK, &uncles, None).state, State::Contradicted);
+        // Ommers the header commits to but the read did not carry: unchecked.
+        uncles.ommers = RawList::new();
         assert_eq!(check(&[0x45; 20], 0, role::BLOCK, &uncles, None).state, State::Unverified);
         // A withdrawal recipient.
         let mut w = RawList::new();

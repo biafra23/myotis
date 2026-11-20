@@ -204,7 +204,7 @@ pub fn code_json(
 }
 
 /// Serialize a verified block to the `eth_getBlockByNumber` JSON — transactions as
-/// hashes, `uncles` always empty (a verified header serve). Mirrors the Java
+/// hashes, `uncles` the hashes of the verified ommer headers. Mirrors the Java
 /// `VerifiedRpcBackend.buildBlockJson` field set and QUANTITY encoding exactly.
 /// Hand-built (not serde) so the shape is the pinned cross-language contract.
 pub fn block_json(b: &VerifiedBlock) -> String {
@@ -293,7 +293,18 @@ pub fn block_json(b: &VerifiedBlock) -> String {
             }
         }
     }
-    s.push_str("],\"uncles\":[]}");
+    // The ommers' hashes, from the body verified against `sha3Uncles` (empty since the
+    // Merge, and for a header-only serve).
+    s.push_str("],\"uncles\":[");
+    for (i, hash) in b.ommer_hashes().iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('"');
+        s.push_str(&hex0x(hash));
+        s.push('"');
+    }
+    s.push_str("]}");
     s
 }
 
@@ -2149,6 +2160,7 @@ mod tests {
             full_transactions: None,
             raw_transactions: Default::default(),
             withdrawals: None,
+            ommers: Default::default(),
         }
     }
 
@@ -2300,6 +2312,12 @@ mod tests {
         assert_eq!(v["transactions"][0], hex0x(&[0xa1; 32]));
         assert_eq!(v["transactions"][1], hex0x(&[0xb2; 32]));
         assert!(v["uncles"].as_array().unwrap().is_empty());
+        // A pre-Merge block with an ommer lists its hash.
+        let mut b = sample_block();
+        let ommer = vec![0xc3, 0x01, 0x02, 0x03];
+        b.ommers.push(&ommer);
+        let v: serde_json::Value = serde_json::from_str(&block_json(&b)).unwrap();
+        assert_eq!(v["uncles"], serde_json::json!([hex0x(&myotis_core::keccak::keccak256(&ommer))]));
     }
 
     #[test]
