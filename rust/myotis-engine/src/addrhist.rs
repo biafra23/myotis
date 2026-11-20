@@ -273,6 +273,8 @@ pub struct Options {
 /// The page size without a `limit`.
 pub const DEFAULT_PAGE: usize = 50;
 
+// Read by the Swarm half (and the tests) only.
+#[cfg_attr(not(any(feature = "swarm", test)), allow(dead_code))]
 impl Options {
     /// Strictly older than this `(block, slot)`: the cursor's, or the block above `toBlock`.
     pub fn before(&self) -> Option<(u64, u32)> {

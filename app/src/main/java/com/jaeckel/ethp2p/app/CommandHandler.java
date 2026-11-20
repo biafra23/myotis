@@ -106,6 +106,12 @@ public class CommandHandler {
                 case "logindex-status"         -> handle.logIndexStatusJson();
                 case "logindex-backfill"       -> handleLogIndexBackfill(jsonLine);
                 case "read-stats"              -> handle.readStatsJson();
+                // The address history (#899): the engine's JSON as it came (a page, the
+                // retryable {"error"}, or the permanent {"error","code":-32602}).
+                case "get-address-history"     -> handle.reads().addressHistoryJson(
+                        extractString(jsonLine, "address"), extractRawJsonOr(jsonLine, "options", "{}"));
+                case "verify-address-history"  -> handle.reads().verifyAddressHistoryJson(
+                        extractString(jsonLine, "address"), extractRawJsonOr(jsonLine, "entries", "[]"));
                 default                        -> jsonError("Unknown command: " + cmd);
             };
         } catch (Exception e) {
@@ -1151,6 +1157,40 @@ public class CommandHandler {
                 .replace("\"", "\\\"")
                 .replace("\n", "\\n")
                 .replace("\r", "\\r");
+    }
+
+    /**
+     * The raw JSON value (an object or an array) of {@code field}, as it stands in the
+     * request, or {@code fallback} when the field is absent. Strings inside it may hold
+     * brackets and escaped quotes; they are skipped whole.
+     */
+    static String extractRawJsonOr(String json, String field, String fallback) {
+        String key = "\"" + field + "\"";
+        int keyIdx = json.indexOf(key);
+        if (keyIdx < 0) return fallback;
+        int colon = json.indexOf(':', keyIdx + key.length());
+        if (colon < 0) throw new IllegalArgumentException("Malformed JSON near field: " + field);
+        int start = colon + 1;
+        while (start < json.length() && Character.isWhitespace(json.charAt(start))) start++;
+        if (start >= json.length() || (json.charAt(start) != '{' && json.charAt(start) != '[')) {
+            throw new IllegalArgumentException("Field '" + field + "' is not a JSON object or array");
+        }
+        int depth = 0;
+        boolean inString = false;
+        for (int i = start; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (inString) {
+                if (c == '\\') i++;
+                else if (c == '"') inString = false;
+            } else if (c == '"') {
+                inString = true;
+            } else if (c == '{' || c == '[') {
+                depth++;
+            } else if (c == '}' || c == ']') {
+                if (--depth == 0) return json.substring(start, i + 1);
+            }
+        }
+        throw new IllegalArgumentException("Unterminated JSON value for field: " + field);
     }
 
     static String extractString(String json, String field) {
