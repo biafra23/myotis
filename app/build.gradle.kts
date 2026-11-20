@@ -51,27 +51,33 @@ tasks.register<JavaExec>("run") {
     // backend (~15x faster BLS verify). Falls back to Milagro when cargo is absent.
     // Override choice with -Dmyotis.bls.backend=milagro|native|compare.
     dependsOn(rootProject.tasks.named("cargoBuildHost"))
-    // Resolved in doFirst — the dir only exists AFTER cargoBuildHost has run once.
+    // Same self-skip shape for the Go engine (self-skips without the go toolchain;
+    // only -Pengine=go ever loads it — the dependency just makes the lib exist).
+    dependsOn(rootProject.tasks.named("goBuildCShared"))
+    // Resolved in doFirst — the dirs only exist AFTER the builds have run once.
+    // The Go loader mirrors java.library.path into jna.library.path (like the
+    // Rust loader), so listing go/build here is the whole lookup wiring.
     doFirst {
-        rootProject.file("rust/target/release").takeIf { it.exists() }?.let {
-            systemProperty(
-                "java.library.path",
-                it.absolutePath + System.getProperty("path.separator") + System.getProperty("java.library.path"),
-            )
+        var searchPath = System.getProperty("java.library.path")
+        for (dir in listOf(rootProject.file("rust/target/release"), rootProject.file("go/build"))) {
+            if (dir.exists()) {
+                searchPath = dir.absolutePath + System.getProperty("path.separator") + searchPath
+            }
         }
+        systemProperty("java.library.path", searchPath)
     }
     // -Pbls=milagro|native|compare|auto → -Dmyotis.bls.backend (e.g. compare logs a
     // per-verify Milagro-vs-native head-to-head during a live sync).
     (project.findProperty("bls") as String?)?.let { systemProperty("myotis.bls.backend", it) }
-    // -Pengine=java|rust|auto → -Dmyotis.engine (the :myotis-engines selector).
+    // -Pengine=java|rust|go|auto → -Dmyotis.engine (the :myotis-engines selector).
     // Fail fast on a typo: an unrecognized value would otherwise silently fall
     // back to the Java engine (Engines.normalize warns + yields java), so a
     // `-Pengine=rust.` runs Java without it being obvious. Blank → unset (default
     // java).
     (project.findProperty("engine") as? String)?.takeIf { it.isNotBlank() }?.let { raw ->
         val v = raw.trim().lowercase()
-        if (v !in listOf("java", "rust", "auto")) {
-            throw GradleException("-Pengine must be one of java|rust|auto (got '$raw')")
+        if (v !in listOf("java", "rust", "go", "auto")) {
+            throw GradleException("-Pengine must be one of java|rust|go|auto (got '$raw')")
         }
         systemProperty("myotis.engine", v)
     }

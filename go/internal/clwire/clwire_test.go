@@ -263,3 +263,34 @@ func TestVarintGuard(t *testing.T) {
 		t.Fatalf("2-byte varint: %d %d %v", v, n, err)
 	}
 }
+
+// TestErrorChunkRawFallbackCapped pins the source-side cap on the
+// [raw] fallback: a declared-0 error chunk with leftover bytes (which
+// skips the snappy branch) must reflect at most 256 bytes of raw, the
+// same ceiling the snappy branch applies via `bound`. Uncapped, a
+// misbehaving server's raw tail — up to the 16 MiB response limit —
+// becomes a multi-megabyte log line in an embedded host. Fails if the
+// fallback reflects the whole tail.
+func TestErrorChunkRawFallbackCapped(t *testing.T) {
+	// result=ServerError || varint(0) declared || 1000 leftover bytes.
+	// declared 0 => bound 0 => snappy branch skipped => [raw] fallback.
+	tail := strings.Repeat("x", 1000)
+	raw := append([]byte{ResultServerError, 0x00}, []byte(tail)...)
+	_, err := DecodeResponse(raw, false)
+	if err == nil {
+		t.Fatal("error chunk must return an error")
+	}
+	const marker = "[raw] "
+	i := strings.Index(err.Error(), marker)
+	if i < 0 {
+		t.Fatalf("error did not take the [raw] fallback: %q", err.Error())
+	}
+	reflected := err.Error()[i+len(marker):]
+	if len(reflected) != 256 {
+		t.Fatalf("[raw] fallback reflected %d bytes, want the 256-byte cap (got %q…)",
+			len(reflected), reflected[:min(40, len(reflected))])
+	}
+	if strings.TrimLeft(reflected, "x") != "" {
+		t.Fatalf("[raw] payload not the expected run of raw bytes: %q", reflected)
+	}
+}

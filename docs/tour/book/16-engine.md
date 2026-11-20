@@ -28,7 +28,7 @@ A `#[uniffi::export]` function stays an ordinary `pub fn`; the macro only adds a
 > [!TIP]
 > **No HTTP server in this crate**<br>
 >
-> The engine answers function calls, not HTTP. The JVM apps' loopback JSON-RPC listener is a port, `LoopbackRpc`, in `:myotis-engine-rust`; the `:myotis-engines` selector fills it with `KtorLoopbackRpc`. An in-process consumer of the engine library (`Myotis.newEngine()`) gets no listener at all and calls `reads()` directly. `myotis-rpcd` brings its own JSON-RPC server, in Rust. All three end in the functions on this page.
+> The engine answers function calls, not HTTP. The JVM apps' loopback JSON-RPC listener is a port, `LoopbackRpc`, in `:myotis-engine-common` (shared by the Rust and Go engine wrappers); the `:myotis-engines` selector fills it with `KtorLoopbackRpc`. An in-process consumer of the engine library (`Myotis.newEngine()`) gets no listener at all and calls `reads()` directly. `myotis-rpcd` brings its own JSON-RPC server, in Rust. All three end in the functions on this page.
 
 > [!NOTE]
 > **What changed since September**<br>

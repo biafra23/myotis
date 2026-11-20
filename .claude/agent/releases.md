@@ -295,7 +295,8 @@ demo machine pulls, so nothing waits for a release; a PR build would only add a
 macOS runner leg per push, because a change that breaks a bundle without
 failing a test is next to impossible — what a bundle adds over the standard app
 (a seed, its manifest, warm peer caches) are build inputs, not code paths, and
-the standard dmg leg already proves jpackage on every PR into `main`. A bundle-only
+the standard dmg leg already proves jpackage on every PR into `main`, in the merge
+queue since 2026-11-19. A bundle-only
 regression therefore surfaces on the next `main` run, where it is a hard gate.
 A bundle whose seed lives OUTSIDE the tree (RAILGUN's, on the `railgun-seed`
 release) also takes `workflow_dispatch`, so a refreshed seed can be rebuilt

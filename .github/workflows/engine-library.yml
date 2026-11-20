@@ -22,8 +22,9 @@ on:
   # its check) — like node-binding.yml. GitHub does not evaluate paths filters
   # for tag pushes, so `v*` release runs always fire. No pull_request trigger:
   # the Rust Android cross-compile this needs is a 10-minute leg, and the APK
-  # workflow already runs it on every PR into main; a PR that changes the
-  # publication dispatches this on its branch from the Actions tab.
+  # workflow already runs it for every PR into main (in the merge queue since
+  # 2026-11-19); a PR that changes the publication dispatches this on its
+  # branch from the Actions tab.
   push:
     branches: [ "main" ]
     tags: [ "v*" ]

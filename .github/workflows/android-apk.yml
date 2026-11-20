@@ -1,23 +1,29 @@
 name: Android APK
 
 on:
-  # Scope push to main + release tags so a branch push that also has an open PR
-  # doesn't build twice (the PR is covered by pull_request below). Tags still
+  # Scope push to main + release tags: a PR's branch builds in the merge queue
+  # (merge_group below), not on a push to the branch. Tags still
   # build the release .apk.
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
-  # pull_request stays unscoped (any base branch) so every PR shows this
-  # workflow's checks — but the JOBS below skip a PR whose base is not main
-  # (owner ruling, 2026-10-09): a part PR of a multi-PR plan targets its
-  # feature branch, and building an APK plus a 10-minute emulator boot for
-  # each part costs more than it tells; the final feature → main PR builds
-  # everything. Tests, clippy, the lockfile check and the Claude review stay
-  # on every PR (ci.yml and siblings). A part that touches the Rust engine's
-  # Android build or the minSdk budget can still run this on demand from the
-  # Actions tab (workflow_dispatch) — note that check_apk_min_api.py, the
-  # minSdk-29 enforcement, runs in this workflow and nowhere else.
+  # On a PR the jobs below do not build (owner's request, 2026-11-19): the APKs
+  # build in the merge queue instead (merge_group below; the non-blocking
+  # emulator smoke then runs on the push to main that follows),
+  # once per PR on the commit `main` will become, rather than on every push of
+  # a PR under review. Before that, a PR into main built them on every push
+  # and a part PR into a feature branch skipped them (owner ruling,
+  # 2026-10-09); the final feature → main PR goes through the queue like any
+  # other. A PR that wants the APKs before it is queued (one that touches the
+  # Rust engine's Android build or the minSdk budget) can run this on demand
+  # from the Actions tab (workflow_dispatch) — note that check_apk_min_api.py,
+  # the minSdk-29 enforcement, runs in this workflow and nowhere else.
+  # pull_request stays as a trigger so the PR shows the one check the queue
+  # requires, `Android APK result` (the `result` job at the end), as passed.
   pull_request:
+  # The merge queue's run of the queued commit; `Android APK result` is a
+  # required check of the queue (the ruleset on main).
+  merge_group:
   workflow_dispatch:
 
 # Cancel a superseded run when new commits land on the same branch/PR. The
@@ -32,23 +38,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Holds the build, and the emulator smoke behind it, until this PR's Claude
-  # review has finished, so neither runs on a commit the review might still
-  # ask to change. It passes straight through on every other event — see
-  # wait-for-claude-review.yml.
-  review-gate:
-    name: Review gate
-    # Everything below needs this job, so skipping it here skips the build and
-    # the emulator smoke too (a dependent job is skipped when a needed job was,
-    # unless its `if` uses always()) — and on a tag the release uploads. So an
-    # `if:` on this job MUST be true on every non-pull_request event (push to
-    # main, v* tags, dispatch); the only safe test is the PR's base branch,
-    # which is all this one does (#582). The release jobs only run on tags.
-    if: github.event_name != 'pull_request' || github.base_ref == 'main'
-    uses: ./.github/workflows/wait-for-claude-review.yml
-    permissions:
-      actions: read
-
   # Builds BOTH apps every run: the debug one (com.jaeckel.ethp2p.android.debug,
   # public debug key) and the UNSIGNED release one (com.jaeckel.ethp2p.android).
   # The release APK is signed only on a v* tag, by sign-release below, so the
@@ -59,7 +48,12 @@ jobs:
   # that actually ships, and a signing rehearsal. Neither replaces the other.
   build:
     name: Build APKs (debug + unsigned release)
-    needs: review-gate
+    # No PR builds the APKs: the merge queue does (the header says why). Every
+    # job below needs this one, so this `if` must stay true on every event but
+    # pull_request, or a tag would publish nothing (#582). Before the queue a
+    # review gate (wait-for-claude-review.yml) held this job until the PR's
+    # review had finished; it only ever waits on a PR, so it went with them.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -81,7 +75,9 @@ jobs:
           # artifact stamps a sha that resolves nowhere. Deliberately not pinned to
           # the PR head: that would change WHAT is built (head, not head-merged-into-
           # base) and lose the integration signal. The base version is still right,
-          # since the merge commit reaches the tag through its base parent.
+          # since the merge commit reaches the tag through its base parent. A PR
+          # builds no APK now (merge queue, 2026-11-19); the queue's commit is
+          # the one main becomes, so an APK built there stamps a sha that resolves.
           fetch-depth: 0
 
       - name: Set up JDK 21
@@ -338,8 +334,11 @@ jobs:
       contents: read
     # Skip on release tags: nothing consumes this job's result there (release
     # needs only build + sign-release + version-guard), and the tagged commit
-    # already ran it on its way through main/PR.
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    # already ran it on its way through main. Skip in the merge queue too
+    # (2026-11-19): it is non-blocking, so it could only delay the queue, by
+    # up to its 60-minute timeout on a hang, and the push to main that follows
+    # a queue merge runs it on the same commit.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' }}
     # The in-test deadline only bounds the test body — NOT the system-image
     # download, AVD creation, or an emulator/adb hang (the failure modes named
     # below), which would otherwise run to GitHub's 6-hour default on a job
@@ -738,3 +737,36 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"
+
+  # The one check the merge queue requires of this workflow (owner's request,
+  # 2026-11-19): a fixed name for the build. In the queue it passes only if the
+  # build succeeded. It does not wait for the emulator smoke, which is
+  # non-blocking (continue-on-error) and does not run in the queue. On a PR
+  # the build does not run, and it passes, so the PR can be queued; elsewhere
+  # it fails only for a build that failed. `always()`, not `!cancelled()`: in a
+  # cancelled run this job must still run and fail, since a skipped required
+  # check counts as passed.
+  result:
+    name: Android APK result
+    needs: [build]
+    if: ${{ always() }}
+    runs-on: ubuntu-26.04
+    permissions: {}
+    steps:
+      - name: Check the APK build
+        env:
+          EVENT: ${{ github.event_name }}
+          BUILD: ${{ needs.build.result }}
+        run: |
+          echo "On $EVENT: APK build $BUILD."
+          if [ "$EVENT" = pull_request ]; then
+            echo "::notice title=APK not built::No PR builds the APK: the merge queue does, or dispatch this workflow on the branch."
+          fi
+          if [ "$EVENT" = merge_group ]; then
+            [ "$BUILD" = success ] && exit 0
+            echo "::error::The merge queue needs the APK build to succeed (it was $BUILD)."
+            exit 1
+          fi
+          case "$BUILD" in
+            failure|cancelled) echo "::error::The APK build did not succeed ($BUILD)."; exit 1 ;;
+          esac

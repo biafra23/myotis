@@ -199,13 +199,41 @@ func (s *Service) Close() {
 	})
 }
 
-// Stats reports table fill and candidate counts by source.
+// Stats reports table fill and candidate counts by source. Used by
+// Engine.Report (the accounting line), which wants the per-source
+// breakdown and so pays the full candidate snapshot. The hot status
+// path wants only the two counts and calls TableCounts instead.
 func (s *Service) Stats() (tableNodes, liveNodes int, bySource map[Source]int) {
 	bySource = map[Source]int{}
 	for _, c := range s.snapshot() {
 		bySource[c.Source]++
 	}
-	for _, bucket := range s.tab.TableBuckets() {
+	tableNodes, liveNodes = s.TableCounts()
+	return tableNodes, liveNodes, bySource
+}
+
+// TableCounts reports the routing-table fill and live count WITHOUT
+// copying the candidate map. The two numbers come from the table
+// buckets alone, independent of the candidate set — so this skips the
+// candidate-mutex hold and the whole-map copy Stats() performs for
+// Report's per-source breakdown. That matters on the C ABI status path:
+// Engine.DiscoveryStats takes only these two numbers, discards bySource,
+// and is called on every myotis_status_json (status/beaconStatus/
+// isRunning/lifecycle/syncState/headBlockNumber plus the hosts' 2 s
+// poll), while the candidate map grows for the life of the process — a
+// full snapshot there is a multi-megabyte copy and a lock hold per poll
+// (final-PR review). TableBuckets is the kademlia table's own mutex,
+// disjoint from s.mu, so this never touches the candidate lock.
+func (s *Service) TableCounts() (tableNodes, liveNodes int) {
+	return countTableBuckets(s.tab.TableBuckets())
+}
+
+// countTableBuckets sums a kademlia bucket snapshot into (total, live).
+// Split out of TableCounts so the accounting is unit-testable without a
+// running UDPv4 table; TableCounts and Stats both funnel through it, so
+// the two status paths can never diverge on how they count.
+func countTableBuckets(buckets [][]discover.BucketNode) (tableNodes, liveNodes int) {
+	for _, bucket := range buckets {
 		for _, bn := range bucket {
 			tableNodes++
 			if bn.Live {
@@ -213,7 +241,7 @@ func (s *Service) Stats() (tableNodes, liveNodes int, bySource map[Source]int) {
 			}
 		}
 	}
-	return tableNodes, liveNodes, bySource
+	return tableNodes, liveNodes
 }
 
 func (s *Service) snapshot() []Candidate {

@@ -44,6 +44,8 @@ Full reference with toolchain notes: `.claude/agent/build.md`.
 ./gradlew cargoTest         # cargo test --workspace (part of `check`)
 ./gradlew cargoBuildNoStd   # no_std canary (part of `check`)
 ./gradlew cargoNdkAndroid   # Android jniLibs from source
+./gradlew goBuildCShared    # Go engine c-shared lib (self-skips without the go toolchain)
+./gradlew :app:run -Pengine=go   # daemon on the Go engine (mainnet only; explicit choice, never auto)
 ./gradlew uniffiGenerateKotlin   # REQUIRED after changing the Rust FFI (only Android builds do it implicitly)
 ./gradlew :android-app:assembleDebug -PskipRustEngine   # Java engine only; boots on API 33+ only
 ./gradlew cargoBuildIosSim  # also cargoBuildIosDevice, :app-ios:linkDebugFrameworkIosSimulatorArm64
@@ -59,8 +61,9 @@ One line per module; detail and protocol flow: `.claude/agent/architecture.md`.
 - **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces every host consumes exclusively; FFI-portable types only.
 - **myotis-engine** — THE ENGINE LIBRARY (KMP, jvm + android): packages the Rust engine as the Android AAR and desktop jar; entry point `io.myotis.engine.Myotis`.
 - **myotis-engine-rust** — the Rust engine behind the contract (UniFFI Kotlin bindings + JNA over `rust/myotis-engine`); no HTTP server.
-- **myotis-engines** — the engine SELECTOR (`Engines.engine()`; `myotis.engine=java|rust|auto`).
-- **myotis-engine-common** — lifecycle primitives both engines share (`WakeGate`, `SleepMetrics`).
+- **myotis-engines** — the engine SELECTOR (`Engines.engine()`; `myotis.engine=java|rust|go|auto`).
+- **myotis-engine-go** — the Go engine behind the contract (JNA over `go/cmd/myotis-capi`'s c-shared lib); desktop-only, explicit `go` choice, never `auto`.
+- **myotis-engine-common** — lifecycle primitives both engines share (`WakeGate`, `SleepMetrics`) and the shared `LoopbackRpc` listener port.
 - **myotis-engine-ports** — the library's default port actuals (`Myotis.defaultPorts`).
 - **myotis-engine-natives** — per-platform desktop native jars of the Rust engine.
 - **myotis-engine-ios** — iOS module: cinterop of the Rust engine's C ABI plus the typed API.
@@ -143,7 +146,9 @@ required `reproducible builds` run.
 ## Hard rules — never broken, whatever an earlier instruction seems to authorize
 
 - **NEVER MERGE A PR YOURSELF** — not with `gh pr merge`, not by enabling
-  auto-merge. Green CI + all comments answered = report "ready to merge". Sole
+  auto-merge, not by adding it to the merge queue. Green CI + all comments
+  answered = report "ready to merge"; the queue builds the APK and the dmg
+  after the owner adds the PR (`.claude/agent/workflow.md`, step 5). Sole
   exception: part PRs into a multi-PR plan's feature branch, and only under
   step 3 of `.claude/agent/multi-pr-plans.md`: the owner said yes for that plan
   in THIS conversation (never inferred from an earlier plan, a standing

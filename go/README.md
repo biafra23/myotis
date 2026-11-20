@@ -98,8 +98,15 @@ policy, anchoring — is this module's own code, guided by `docs/spec/` and
    pinned by test). `myotis-go
    -get-account <addr> [-slot <n>]` runs the light client in parallel
    with EL dialing and prints the account only once the proof verifies
-   against the LC-anchored finalized exec state root. Two CLI policy
-   points: anchors are published only after a VERIFYING finality poll
+   against the LC-anchored ATTESTED (optimistic head) exec state root —
+   the Rust twin's default anchor. (Since the
+   desktop-embed step-1 refactor this orchestration — dialer, LC loop,
+   anchor publishing, and the read with its per-anchor disclosure
+   memory — lives in `internal/engine`, the engine as a library; the
+   CLI is a thin driver over it, and `myotis-go -json` prints the same
+   verified read in the pinned engine-API result shape
+   (`internal/engine/eljson.go`: the eljson.rs key set and value
+   encodings, goldens included).) Two policy points: anchors are published only after a VERIFYING finality poll
    (never the bootstrap/catch-up root, which is routinely outside
    every peer's ~128-block state window — reading on it would
    disclose the key to peers that cannot answer), and the 2 s retry
@@ -113,13 +120,29 @@ policy, anchoring — is this module's own code, guided by `docs/spec/` and
    that answers with a pruned state stays in the set (it *can* serve
    snap, just not at this root) — the reader rotates past it per attempt
    rather than evicting it.
-   Deliberate cuts, documented in the code: FINALIZED-anchor reads only
-   (the Rust twin's optimistic-head read — `ProcessOptimisticUpdate` +
-   the optimistic-update poll — is the next increment; a peer on a
-   pruned state scheme answers a finalized-root read with an EMPTY
-   proof, and that is precisely the `pruned-root` case the reader
-   rotates past — observed live), and no hedged reads (sequential
-   only; HEDGE_DELAY 3 s racing is 3c).
+   Deliberate cuts, documented in the code: verified reads run at the
+   BLS-ATTESTED head root (the twin's default — the finality poll
+   already BLS-verifies the update's attested header every cycle, so
+   the head anchor came with it; the explicit `"finalized"` selector
+   still runs the finalized read). Two cuts remain on this path: there
+   is NO fresh-head/header-chain fallback (the twin's `fresh_head`
+   recovery — read at the peer's own head, then walk a header chain
+   back to the attested head — is not ported, so a peer that cannot
+   serve the attested root loses the attempt and the read retries at
+   the next publish with the peers not yet tried; a peer on a pruned
+   state scheme answers a head-root read with an EMPTY proof, and that
+   is precisely the `pruned-root` case the reader rotates past —
+   observed live). The attested header rides the FINALITY update the
+   steady loop polls once per slot, and CL servers answer each poll
+   freshly — the head tracks wall clock within ~1–2 slots, the same
+   mechanism and bound as the twin's (there is no per-slot
+   optimistic-update poll on either engine to wait for). Its honest
+   caveat: which header counts as the head is ordered by the
+   unauthenticated `signature_slot` (#774) — one polled CL pin can
+   roll the head side back within the current committee period
+   (staleness or denial, never forgery; the guards are a three-engine
+   change and the owner's call, go/internal/lc/store.go). And no
+   hedged reads (sequential only; HEDGE_DELAY 3 s racing is 3c).
    Live-smoke verified 2026-11-11 from this machine: the LC finality
    poll advanced the anchor in real time (slot 15633728 → 15633856
    during the run), the first READY Geth answered the read with an
@@ -138,7 +161,10 @@ policy, anchoring — is this module's own code, guided by `docs/spec/` and
    exclusively state-pruned nodes, and a longer window then served
    the read: `verifiedAt=0xe04f511b… lcFinalizedSlot=15634912`,
    nonce/balance from the MPT leaf and the storage read anchored at
-   the PROVEN empty storageRoot.
+   the PROVEN empty storageRoot. (CLI output since names the side the
+   read actually used — `verifiedAt … anchor=head matchedBeaconSlot=…
+   blockNumber=…`, the same `Anchor.ReadSide` the JSON shapes answer
+   from; PR #889 review.)
 5. final integration PR to `main` (PR #773 — once it merges and the
    feature branch is deleted, this section is history, and the
    `feature/go-engine` entry in `go-engine.yml`'s push trigger can go
@@ -154,8 +180,199 @@ go run ./cmd/myotis-go -dial=false               # discovery only
 go run ./cmd/myotis-go -loglevel debug           # per-dial failure detail
 go run ./cmd/myotis-go -get-account 0xd8dA…045   # light client + snap peer → VERIFIED account
 go run ./cmd/myotis-go -get-account 0xd8dA…045 -slot 0   # …and a two-hop storage read
+go run ./cmd/myotis-go -get-account 0xd8dA…045 -json     # …in the pinned engine-API JSON shape on stdout
 go run ./cmd/myotis-lc -once                     # LC alone: bootstrap → catch-up → one finality advance
 ```
+
+## C ABI (desktop embed)
+
+`cmd/myotis-capi` builds the engine as a c-shared library exporting the
+full `rust/include/myotis_engine.h` surface: the read-engine functions
+(lifecycle, verified account/storage reads, status, log drain) are
+functional, every other export answers an honest refusal (permanent
+`-32602` JSON / `false` / the contract's own "not in build" codes),
+and `myotis_go_capabilities_json` answers the split at runtime.
+
+```bash
+# CGO_CFLAGS as goBuildCShared sets them (portable blst; the CI workflow
+# and the reproducible-builds gate additionally pass -g — see the build
+# note at the bottom of this document)
+CGO_CFLAGS="-O2 -D__BLST_PORTABLE__" \
+  go build -buildmode=c-shared -o build/libmyotis_engine_go.so ./cmd/myotis-capi
+scripts/check_capi_symbols.sh   # every header symbol must be exported (CI runs both)
+```
+
+The handle contract matches the header: `myotis_create` allocates a
+NOT-YET-STARTED engine (the CLI starts its network right away; a C-ABI
+host starts it at `myotis_start`), an empty `data_dir` is refused with
+`-1` rather than defaulting to the process cwd, and the discv4 UDP
+port is OS-assigned (the header's own default) unless the
+undocumented-until-now override `MYOTIS_GO_LISTEN_PORT` says otherwise
+(`0` = the network's `30303`, `-1` = ephemeral — the default). The block
+selector is applied-or-refused with the twin's `parse_call_block`
+vocabulary: empty/`latest`/`pending` run at the attested head,
+`"finalized"` at the finalized root (applied, never mapped to the head),
+a number inside the shared ±window runs at head state (behind it:
+permanent `-32602`; ahead of it: retryable, it clears as the head
+advances), and `safe`/`earliest`/block hashes/garbage are refused with
+the way forward named. (Through the JVM adapter the same window gates
+first, and its refused numbers leave as the typed channels' retryable
+null until `:myotis-api` grows a refused-channel — the `-32602` here
+describes the C-ABI surface itself.) `myotis_get_storage_at_json` is
+FUNCTIONAL: raw 32-byte positions with the selector applied, the twin's
+`get_storage_at_json`; `myotis_get_code_json` and
+`myotis_get_proof_json` remain named refusals. `myotis_status_json` answers
+with the Rust engine's KEY SET (`host.rs` `status_object`: same names,
+same types — the string `networkMetering`, the 0x-less
+`finalizedRootHex`) plus three Go-only keys (`engine`, `myotisAbi`,
+`capabilities`); keys whose machinery this engine lacks carry honest
+zeros, marked in the struct. `myotis_set_ws_bound_periods` and
+`myotis_accept_stale_anchor` are APPLIED live — the LC loop reads
+them at every weak-subjectivity gate and a parked bootstrap
+restarts — while `myotis_set_served_block_window` records its value
+(a dial-only engine serves no blocks, so no answer depends on it;
+`capabilities` makes that explicit). The ABI-58/59 additions are both
+exported, applied where the engine can and refused where it cannot —
+never unlinked, never silently accepted:
+`myotis_refresh_anchor_from_checkpointz` answers the contract's own
+`{"applied":false,…}` refusal (no checkpoint fetch yet; capabilities
+`anchorRefresh:false`, the one-shot `myotis_accept_stale_anchor` is the
+way forward). `myotis_create_with_checkpoint` refuses with the
+contract's `-1` ("cannot create"): this engine bootstraps ONLY from its
+embedded checkpoint, so a caller-supplied root cannot be applied — and
+`-3` (anchor-generation mismatch) can never occur because there is no
+checkpoint generation to mismatch. `myotis_set_stale_anchor_policy` IS the remembered
+answer the sync loop honors at every park: CONTINUE arms the same
+sticky consent the one-shot export uses (re-read at every
+weak-subjectivity gate), leaving a remembered CONTINUE for anything
+else withdraws it (host.rs's rule), and the CHECKPOINT code is refused
+with the contract's `false` for the missing fetch. `GoChainHandle`
+routes both through the native exports, so the JVM and C-ABI hosts get
+the identical answer (`capabilities.staleAnchorPolicy:true` marks the
+policy applied for its two supported codes).
+
+## Desktop embed (`:myotis-engine-go`, feature/go-desktop-embed part 1c)
+
+The JVM side is the `:myotis-engine-go` Gradle module: `GoEngineNative`
+(plain JNA interface mapping over this same header, lazy symbol resolution — the Go twin of
+`RustEngineNative`, same `java.library.path`→`jna.library.path` mirroring,
+the ABI-version handshake (GoAbiVersionMirrorTest pins the mirror), `myotis_string_free` after every returned string),
+and `GoMyotisEngine`/`GoChainHandle`/`GoVerifiedReads` behind the
+`:myotis-api` contract. The selector routes it via `myotis.engine=go`
+(`-Pengine=go` on the daemon/desktop run tasks only — the Settings engine
+toggle is a java/rust switch and cannot select it) —
+`auto` never picks it: the Go engine is desktop-only and explicit until the
+engine-parity step (owner's brief, 2026-11). The library is built by the
+root `goBuildCShared` task (without the go toolchain it skips, and deletes a
+library IT built — stamped on success — so old bytes cannot keep serving new
+sources through the run tasks' existence-only gating; a library YOU built with
+the recipe above is left alone and stays your own responsibility;
+PR #832 rounds 4-5) into
+`go/build/libmyotis_engine_go.{so,dylib,dll}`; the desktop run task injects
+it via `-Dmyotis.engine.go.lib`, the daemon via `java.library.path`.
+
+Honest gaps the wrapper surfaces rather than fakes (all engine-parity
+items): no idle sleep (`pause()` refuses, lifecycle is RUNNING/STOPPED),
+no fresh-head fallback under the head anchor (a snap peer that cannot
+serve the attested head root loses the attempt; the twin would header-
+chain to its own head — see "Deliberate cuts" under §Parts),
+storage reads reach positions below 2^64 only ON THE OPERATOR MAPPING-PROOF
+path (`get_storage_proof_json`'s `int64_t` slot contract — positions
+≥ 2^63 cross as their two's-complement pattern, pinned by the slot-echo
+test); the RPC `eth_getStorageAt` takes the full 32-byte position
+through `myotis_get_storage_at_json` like the Rust twin, so hashed
+mapping slots of any width are servable there, no EVM/block/tx/code reads,
+no ENS (the `EnsApi` throws one named refusal), no broadcast path,
+no Tor (account reads leave from the host's real IP; the desktop logs
+the mismatch instead of pretending the switch applies),
+no checkpoint-anchor refresh (ABI 58 refuses by name,
+`capabilities.anchorRefresh:false`). One stale-anchor gap needs naming
+plainly (PR #877 round 3): the weak-subjectivity **re-check while
+running** differs from the Rust loop. After bootstrap, an in-run
+refusal (a long sleep, or Settings moving off "continue anyway")
+stalls the steady loop — every slot refuses at the in-run gate, so no
+finality poll runs and no anchor is published, the status stays
+`SYNCING`/`CATCHING_UP` (it reports `STALE_ANCHOR` only when the loop
+itself died) and **no dialog opens**; the stall is not silent: it logs
+once at WARN
+(`STALE ANCHOR: held committee aged ... while running`, re-warned per
+new stall, so the hosts' WARN-filtered view keeps it) besides the
+per-slot INFO `re-catch-up:` line, and the ways out are choosing
+CONTINUE again in Settings, **raising the weak-subjectivity bound in
+Settings** (applied live — the gate re-reads the bound every slot, so
+the stall ends without a restart, as the WARN line itself says), or a
+restart, which parks at the bootstrap gate and asks. The Rust loop instead re-publishes `STALE_ANCHOR` and re-asks.
+The parity fix likely needs no status-contract change (PR #877
+round 6): Rust re-publishes that park every 5 s from its
+still-running loop (`sync.rs:2691`), so `STALE_ANCHOR` from a live
+loop is the contract both engines already share — a flag set on an
+in-run refusal and cleared on any other outcome, with the status
+reporting `STALE_ANCHOR` while set, re-opens the dialog within a slot
+and keeps the walked-forward store, which returning the error would
+throw away to a re-bootstrap. Owner's call, like the gap itself. The
+JSON-string
+reads (block/tx/receipt/fee-history) answer the `{"error":…,
+"code":-32602}` envelope so the wallet gets a permanent refusal, not a
+retryable one. `myotis_drain_logs` lines are drained by
+`Engines.drainRustLogs` next to the Rust engine's ring, so the hosts'
+log pipeline is engine-agnostic (Go's slog lines are normalized to the
+level-first shape the pumps classify by, carrying a `go` marker). The
+catalog lists only the runnable network (mainnet, its entry
+golden-pinned), while the canonical-name table matches Rust's for all
+four. A `-Pengine=go` desktop launch runs on its own `~/.myotis-go`
+profile — the shrunken catalog would otherwise prune the shared
+settings' other networks (and it keeps this engine's `nodekey`/`nodedb`
+off the regular profile too).
+
+Peer liveness over long uptime is an embed gap (final-PR review): the
+dialer's bookkeeping came verbatim from the CLI, where a run lasts minutes.
+An endpoint is dialed at most once for the life of the process — the
+`attempted` set (keyed id‖endpoint) is written at dequeue and never
+expires, discovery's `OnDiscovered` fires once per (id, endpoint) and never
+re-fires, and candidates dropped at a full backlog are gone for good. So a
+peer that once answered "too many peers", or whose session died later, is
+never re-dialed; the READY set can only be refilled from endpoints
+discovery has never seen, and once the stable part of a network has been
+tried or dropped, reads lean on node churn, with a handle restart the only
+recovery. `backedOffPeers` reports a constant 0 (no backoff machinery). The
+maps that only grow with uptime (`attempted`, and `discovery.candidates`)
+are likewise unbounded today. This is derived from the code, not yet from a
+multi-day run; the fix (expire `attempted` after a backoff, re-offer live
+table nodes when the READY set has room, bound the growing maps) is a
+dialing-behavior change that wants its own tested change plus a long-run
+check, so it is tracked rather than folded into this PR.
+
+`goBuildCShared` builds with `CGO_CFLAGS="-O2 -D__BLST_PORTABLE__"`
+(portable blst, like the Rust workspace and — since this PR's review —
+`go-engine.yml`, which built bare before: the ADX build's load-time
+constructor answers SIGILL with `_exit(128+4)` and kills whatever process
+dlopens the library on a pre-Broadwell/pre-Zen CPU, past every
+`UnsatisfiedLinkError` handler; `go-engine.yml` and the gate's
+`scripts/repro/build_linux.sh` additionally pass `-g` — debug info, no
+instructions — and the gate pairs its flags with the workflow so the blst
+CONFIGURATION CI tests is the one it compares (same flags, not same
+bytes: the gate also builds with `-trimpath` and the image's pinned
+gcc, while this task compiles with the local compiler, so this task's
+objects carry no byte- or instruction-level promise against theirs)) and `GOTOOLCHAIN=local`
+(it skips with a note when the local toolchain is older than `go.mod`'s
+line rather than downloading one mid-build; CI installs it via
+`setup-go`). A skip — missing `go` (resolved like `cargo`, incl.
+`/usr/local/go/bin` for PATH-blind IDE daemons) or an old toolchain — also
+deletes a previously built library, since consumers gate on existence alone —
+but only one this task wrote (the stamp above), never a hand-built one
+(PR #832 rounds 4-5). And a FAILED build is not recorded up-to-date while
+its own library is stale: absent, there without a matching stamp, or there
+carrying the stamp's `:stale` mark (a delete the OS refused — e.g. a running
+host mapping the DLL; PR #861 round 2) — the task retries on every later
+build, so installing a C compiler or coming back online is all it takes.
+The one residue (PR #861 rounds 3 & 5, measured): a `go/build` this task can
+neither delete nor write — the classic Linux/macOS case is files owned by
+another user after a `sudo` or container build — has an unwritable stamp
+too, so that failed run does record up-to-date (the warning names it). Fixing
+the ownership alone does NOT retry it — the recorded stamp still matches the
+library, so the task sees nothing to do; only a Go source change re-runs it.
+To force a rebuild now, `chown` `go/build` back AND delete it (or run
+`./gradlew goBuildCShared --rerun-tasks`).
 
 ## Test
 

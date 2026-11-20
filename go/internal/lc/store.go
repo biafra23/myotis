@@ -37,8 +37,15 @@ type Store struct {
 	optimisticSigSlot uint64
 
 	// finalizedLC keeps the finalized LightClientHeader so the payload's
-	// own state_root field stays reachable (FinalizedStateRoot).
+	// own state_root field stays reachable (FinalizedStateRoot), and the
+	// engine-API result shapes can report the anchor block's PROVEN
+	// number/timestamp/hash (lcHeader.Exec*).
 	finalizedLC *lcHeader
+	// optimisticLC likewise for the attested header — the engine-API
+	// shapes' optimisticBlockNumber is the attested payload's own number,
+	// never a stand-in. Same verification as finalizedLC (the update's
+	// execution branch checked it into the attested state).
+	optimisticLC *lcHeader
 }
 
 // NewFromBootstrap runs docs/spec/01 §9.1 in full before adopting
@@ -84,6 +91,7 @@ func NewFromBootstrap(b *Bootstrap, fork *ForkSchedule, c *chain.Consensus, trus
 		finalizedLC:      b.Header,
 		Optimistic:       b.Header.Beacon,
 		OptimisticExec:   b.Header.Exec,
+		optimisticLC:     b.Header,
 		// store.rs bootstrap init: optimistic_slot = header.beacon.slot
 		// (store.rs:67) — there is no signature slot at bootstrap.
 		optimisticSigSlot: b.Header.Beacon.Slot,
@@ -102,6 +110,42 @@ func (s *Store) FinalizedStateRoot() hash32 {
 		return hash32{}
 	}
 	return s.finalizedLC.ExecStateRoot
+}
+
+// FinalizedExecInfo returns the finalized anchor block's PROVEN exec-block
+// coordinates (number, timestamp, hash) — the lcHeader.Exec* fields read
+// out of the attested execution payload header. ok=false before any
+// finalized header is held. These back the engine-API result shapes'
+// blockNumber/blockTimestamp/blockHash/finalizedBlockNumber keys (eljson.rs).
+func (s *Store) FinalizedExecInfo() (number, timestamp uint64, hash hash32, ok bool) {
+	if s.finalizedLC == nil {
+		return 0, 0, hash32{}, false
+	}
+	return s.finalizedLC.ExecNumber, s.finalizedLC.ExecTimestamp, s.finalizedLC.ExecBlockHash, true
+}
+
+// OptimisticStateRoot is the attested payload's OWN state_root field —
+// the root a verified HEAD read verifies against, the exact twin of
+// FinalizedStateRoot for the finalized header (reader.rs reads head state
+// under the anchor's optimistic root, myotis-net/src/el/anchor.rs). Same
+// verification as the finalized root: the execution branch was checked
+// against the attested header's body root inside ProcessUpdate /
+// ProcessFinalityUpdate, under the committee's BLS signature.
+func (s *Store) OptimisticStateRoot() hash32 {
+	if s.optimisticLC == nil {
+		return hash32{}
+	}
+	return s.optimisticLC.ExecStateRoot
+}
+
+// OptimisticExecInfo is FinalizedExecInfo for the attested (optimistic)
+// header, backing the shapes' optimisticBlockNumber. ok=false until an
+// attested header is held.
+func (s *Store) OptimisticExecInfo() (number, timestamp uint64, hash hash32, ok bool) {
+	if s.optimisticLC == nil {
+		return 0, 0, hash32{}, false
+	}
+	return s.optimisticLC.ExecNumber, s.optimisticLC.ExecTimestamp, s.optimisticLC.ExecBlockHash, true
 }
 
 // committeeFor is Rust's committee_for (store.rs:460-470): the store's
@@ -194,6 +238,7 @@ func (s *Store) ProcessUpdate(u *Update) error {
 	}
 	if u.SignatureSlot > s.optimisticSigSlot {
 		s.Optimistic, s.OptimisticExec, s.optimisticSigSlot = u.Attested.Beacon, u.Attested.Exec, u.SignatureSlot
+		s.optimisticLC = u.Attested
 	}
 	s.applyNextWhenPeriodChanges(s.Finalized.Slot)
 	return nil
@@ -286,7 +331,17 @@ func (s *Store) ProcessFinalityUpdate(u *FinalityUpdate) (FinalityOutcome, error
 	// (a peer cannot forge the finalized header either way — it is
 	// Merkle-checked into the attested state, which is what the
 	// committee signed): it is a stale-update-rejection sharp edge, not
-	// a forgery path. This is deliberately IDENTICAL to the Rust twin
+	// a forgery path. Since head reads became the Go engine's default
+	// (PR #889) the edge reaches the OPTIMISTIC side too: one polled CL
+	// pin can replay a genuine earlier update of the CURRENT period with
+	// signature_slot rewritten to the period's last slot, and that
+	// period's honest updates cannot displace it (their real signature
+	// slots are lower) until the period rolls — staleness or denial of
+	// the default read for up to a period, never forgery, and the
+	// finalized side keeps advancing beside it. Spec-style guards
+	// (refuse signature_slot beyond wall clock; tip the optimistic
+	// header only on a higher ATTESTED slot) would close it but change
+	// all three engines' comparator, so they are the owner's call. This is deliberately IDENTICAL to the Rust twin
 	// (store.rs notes the same) and the Java engine, so a fix is a
 	// three-way coordinated change, not a Go-side patch — tracked as
 	// issue #774, not silently diverged here (PR #773 review).
@@ -296,6 +351,7 @@ func (s *Store) ProcessFinalityUpdate(u *FinalityUpdate) (FinalityOutcome, error
 	}
 	if u.SignatureSlot > s.optimisticSigSlot {
 		s.Optimistic, s.OptimisticExec, s.optimisticSigSlot = u.Attested.Beacon, u.Attested.Exec, u.SignatureSlot
+		s.optimisticLC = u.Attested
 	}
 	s.applyNextWhenPeriodChanges(s.Finalized.Slot)
 	if s.Finalized.Slot > oldFinalized || s.optimisticSigSlot > oldOptSig {

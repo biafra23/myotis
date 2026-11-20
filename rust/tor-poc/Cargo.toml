@@ -9,6 +9,9 @@
 name = "tor-poc"
 version = "0.0.0"
 edition = "2021"
+# The floor of every Rust tree here (rust/Cargo.toml [workspace.package]); not a
+# member, so stated by hand.
+rust-version = "1.99"
 publish = false
 license = "MIT OR Apache-2.0"
 

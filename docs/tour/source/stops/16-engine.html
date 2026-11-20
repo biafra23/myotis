@@ -108,7 +108,7 @@
 
 <div class="callout rust">
   <span class="k">No HTTP server in this crate</span>
-  <p>The engine answers function calls, not HTTP. The JVM apps' loopback JSON-RPC listener is a port, <code>LoopbackRpc</code>, in <code>:myotis-engine-rust</code>; the <code>:myotis-engines</code> selector fills it with <code>KtorLoopbackRpc</code>. An in-process consumer of the engine library (<code>Myotis.newEngine()</code>) gets no listener at all and calls <code>reads()</code> directly. <code>myotis-rpcd</code> brings its own JSON-RPC server, in Rust. All three end in the functions on this page.</p>
+  <p>The engine answers function calls, not HTTP. The JVM apps' loopback JSON-RPC listener is a port, <code>LoopbackRpc</code>, in <code>:myotis-engine-common</code> (shared by the Rust and Go engine wrappers); the <code>:myotis-engines</code> selector fills it with <code>KtorLoopbackRpc</code>. An in-process consumer of the engine library (<code>Myotis.newEngine()</code>) gets no listener at all and calls <code>reads()</code> directly. <code>myotis-rpcd</code> brings its own JSON-RPC server, in Rust. All three end in the functions on this page.</p>
 </div>
 
 <div class="callout jvm">

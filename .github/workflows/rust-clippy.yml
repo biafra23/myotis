@@ -84,6 +84,9 @@ jobs:
       # Default-features code only: the `tor`-gated code in myotis-net and
       # myotis-engine is unlinted by design (see the header on features), so a
       # -PtorEngine build on an exactly-floor toolchain is the one path it misses.
+      # While the floor (1.99) is on the pinned toolchain's own line (1.99.1), no
+      # std API can be newer than it and the lint cannot fire; it guards again
+      # from the first pin bump past the floor.
       - name: Clippy (fails on deny-level lints and on code above the MSRV; other warnings are reported only)
         working-directory: rust
         run: cargo clippy --locked --workspace --all-targets --keep-going -- -D clippy::incompatible_msrv

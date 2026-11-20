@@ -264,6 +264,17 @@ type lcHeader struct {
 	// snap reads verify against (the conformance key final.finalizedExecStateRoot
 	// records this field, not the EPH root).
 	ExecStateRoot hash32
+	// ExecNumber, ExecTimestamp and ExecBlockHash are the payload's own
+	// number/timestamp/block_hash fields. Like ExecStateRoot they are read
+	// out of the attested EPH BUFFER whose root the execution branch just
+	// verified against the beacon body root — same commitment, same trust:
+	// a peer that forged any of these would fail that branch exactly as a
+	// forged state root does. The engine API's account/storage result
+	// shapes (eljson.rs blockNumber/blockTimestamp/blockHash) report them
+	// as PROVEN values (PR #773 follow-up, step 1 of the desktop embed).
+	ExecNumber    uint64
+	ExecTimestamp uint64
+	ExecBlockHash hash32
 	Branch        []hash32
 }
 
@@ -290,11 +301,20 @@ func parseLCHeader(region []byte) (*lcHeader, error) {
 	if err != nil {
 		return nil, err
 	}
-	var execState hash32
-	if len(region)-off >= 84 {
-		copy(execState[:], region[off+52:])
-	}
-	return &lcHeader{Beacon: beacon, Exec: exec, ExecStateRoot: execState, Branch: branch}, nil
+	// execHeaderRoot succeeded, so region[off:] is at least the fixed
+	// section: the reads below (up to offset 472+32 — block_hash per the
+	// layout table above; 440 is base_fee, NOT the hash) are in bounds
+	// by the same guarantee the merkleization itself relies on.
+	eph := region[off:]
+	var execState, execHash hash32
+	copy(execState[:], eph[52:])
+	copy(execHash[:], eph[472:])
+	return &lcHeader{
+		Beacon: beacon, Exec: exec, ExecStateRoot: execState, Branch: branch,
+		ExecNumber:    binary.LittleEndian.Uint64(eph[404:]),
+		ExecTimestamp: binary.LittleEndian.Uint64(eph[428:]),
+		ExecBlockHash: execHash,
+	}, nil
 }
 
 // ---- LightClientBootstrap ----

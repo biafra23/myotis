@@ -52,6 +52,13 @@
 ./gradlew cargoBuildNoStd  # no_std canary: cargo build -p myotis-core --no-default-features for x86_64-unknown-none (part of `check`; self-skips without that rustup target)
 ./gradlew cargoNdkAndroid  # Android jniLibs, built from source (needs cargo-ndk + NDK + Android rustup targets)
 
+# Go engine (go/ — the desktop-only third engine, :myotis-engine-go). OPTIONAL
+# like the Rust block: without the go toolchain goBuildCShared self-skips. The
+# daemon/desktop run tasks depend on it (and only load the result when
+# -Pengine=go routes it).
+./gradlew goBuildCShared   # go build -buildmode=c-shared -> go/build/libmyotis_engine_go.so
+./gradlew :app:run -Pengine=go   # daemon on the Go engine (mainnet only; go-engine.yml CI)
+
 # The Android engine library (:myotis-engine, the AAR the Android app consumes)
 # builds the Rust engine FROM SOURCE by default — cargo + the pinned cargo-ndk and
 # NDK (gradle/libs.versions.toml) +

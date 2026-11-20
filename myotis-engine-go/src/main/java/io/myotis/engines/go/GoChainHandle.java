@@ -1,0 +1,1115 @@
+package io.myotis.engines.go;
+
+import com.eclipsesource.json.Json;
+import com.eclipsesource.json.JsonObject;
+import com.eclipsesource.json.JsonValue;
+import io.myotis.api.AccountProofResult;
+import io.myotis.api.BeaconState;
+import io.myotis.api.BeaconStatus;
+import io.myotis.api.BlockResult;
+import io.myotis.api.ChainHandle;
+import io.myotis.api.ConnectedPeer;
+import io.myotis.api.DataUsage;
+import io.myotis.api.DialResult;
+import io.myotis.api.EnsApi;
+import io.myotis.api.EngineException;
+import io.myotis.api.HeadersResult;
+import io.myotis.api.LifecycleState;
+import io.myotis.api.NetworkMetering;
+import io.myotis.api.NodeStatusReads;
+import io.myotis.api.PeerInfo;
+import io.myotis.api.StorageProofResult;
+import io.myotis.api.UpgradeAdvisory;
+import io.myotis.api.UpgradePhase;
+import io.myotis.api.VerifiedReads;
+import io.myotis.api.WakeReason;
+import io.myotis.api.WebAccessPolicy;
+import io.myotis.api.WebOrigin;
+import io.myotis.engines.common.Hex;
+import io.myotis.engines.common.LoopbackRpc;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+
+/**
+ * One Go-engine-hosted network behind the {@link ChainHandle} contract — the twin
+ * of {@code RustChainHandle} over {@link GoEngineNative}, with the parts the Go
+ * build does not serve yet handled HONESTLY rather than faked:
+ *
+ * <ul>
+ *   <li><b>No idle sleep yet.</b> The Go ABI's pause/resume refuse (no teardown/
+ *       warm-start machinery), so this lifecycle is RUNNING/STOPPED only and
+ *       there is no {@code WakeGate}: {@link #pause()} returns false, a resume of
+ *       a running stack succeeds, of a stopped one does not. Hosts' idle timers
+ *       simply never reach a Go-hosted network (pause() false means "not paused").</li>
+ *   <li><b>Head-anchored reads, twin parity.</b> The Go reader verifies
+ *       against the light client's BLS-ATTESTED optimistic head root — the
+ *       same default the Rust twin serves: {@link #requestAccount} passes the
+ *       empty selector (the header's verified head), and
+ *       {@link GoVerifiedReads} serves head tags, a near-head number inside
+ *       the shared {@code RpcBlockWindow}, and {@code finalized} (which stays
+ *       APPLIED as the beacon-finalized read, never mapped to the head). The
+ *       remaining divergence from the twin, recorded not fixed: the engine has
+ *       no fresh-head/header-chain fallback — a snap peer that cannot serve
+ *       the attested head root (further behind than its ~128-block state
+ *       window) simply loses that attempt, and the read retries at the next
+ *       publish with the peers not yet tried (go/README.md §Deliberate
+ *       cuts). Verified-head age is the anchor's TRUE wall-clock age —
+ *       seconds since the attested slot's wall time, from the catalog's CL
+ *       genesis (PR #832 review). The attested header rides the
+ *       once-per-slot FINALITY-update poll, and CL servers answer each
+ *       poll freshly, so the head tracks wall clock within ~1–2 slots —
+ *       the same mechanism and the same bound as the Rust twin's
+ *       (anchor.rs); there is no per-slot optimistic-update poll on
+ *       either engine to wait for. What that age does NOT claim: which
+ *       attested header counts as the head is ordered by the
+ *       unauthenticated {@code signature_slot} (#774) — one polled CL
+ *       pin can roll the head side back within the current committee
+ *       period (staleness or denial, never forgery; the guards are a
+ *       three-engine change and the owner's call, go/internal/lc/store.go).</li>
+ *   <li><b>No EVM, no block/tx/receipt reads, no ENS, no log index.</b> The
+ *       operator queries throw {@link EngineException} (the Rust twin's
+ *       NOT_AVAILABLE rule), {@link #ens()} answers an API that throws the same
+ *       named refusal, and {@link GoVerifiedReads} overrides the unimplemented
+ *       methods explicitly: {@code null} ("cannot answer verified") on the
+ *       plain reads, {@code refused(...)} on the detailed call/estimate/send
+ *       channel (see its class doc for the retryable-status reasoning).</li>
+ *   <li><b>ABI 58/59, applied where the engine can and refused where it
+ *       can't.</b> {@link #setStaleAnchorPolicy} routes to the engine (not the
+ *       {@code :myotis-api} default) so the return is the engine's own answer,
+ *       identical to what a C-ABI host sees: ASK and CONTINUE are APPLIED —
+ *       CONTINUE through the same sticky consent {@link #acceptStaleAnchor}
+ *       uses, re-read at every weak-subjectivity gate and withdrawn when a
+ *       later policy replaces it (exactly host.rs's rule) — while the
+ *       CHECKPOINT code is REFUSED (false): the Go engine has no checkpoint
+ *       fetch, so it does not accept a policy it cannot act on
+ *       ({@code capabilities.anchorRefresh:false}). {@link
+ *       #refreshAnchorFromCheckpointz} parses the C export's contract-shaped
+ *       answer, which today is always the {@code applied:false} refusal — the
+ *       one-shot {@link #acceptStaleAnchor} is the way forward until the fetch
+ *       lands (engine-parity; the parse already handles the applied shape).
+ *       Related engine-parity gap, recorded not fixed: the "asks again at a
+ *       later park" promise holds at the bootstrap gate only — after
+ *       bootstrap an in-run {@code ErrStaleAnchor} STALLS the loop (refuses
+ *       every slot, publishes no anchor, status stays
+ *       {@code SYNCING}/{@code CATCHING_UP}, no dialog opens) instead of
+ *       re-parking {@code STALE_ANCHOR} the way the Rust loop does. The
+ *       stall warns once at WARN per refused streak beside the per-slot
+ *       INFO lines, so it is never silent to a WARN-filtered host view.
+ *       go/README.md §Desktop embed is the CANONICAL record — the stall's
+ *       full behaviour, the ways out, and the likely flag-shaped parity fix
+ *       awaiting the owner's call (PR #877 rounds 2-8).</li>
+ * </ul>
+ *
+ * <p>{@link #reads()} and the loopback listener follow the Rust twin exactly:
+ * a host-attached {@link LoopbackRpc} starts on {@code 127.0.0.1:rpcPort} at
+ * {@link #start()} and gates what {@link #reads()} means on the wire.
+ */
+final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api.NodeLifecycle {
+
+    private static final Logger log = LoggerFactory.getLogger(GoChainHandle.class);
+
+    /** Message for the operator queries the Go engine does not serve yet — the
+     *  Go twin of {@code RustChainHandle.NOT_AVAILABLE}. Block reads join the
+     *  engine-parity increment; the contract reserves records for verification
+     *  verdicts, and a surface this engine does not implement is a capability
+     *  error ("we don't"), not a failReason ("we tried and failed"). */
+    private static final String NOT_AVAILABLE =
+            "not available on the Go engine yet (operator query: get-headers, get-block, dial)";
+
+    /** The block selector every Go verified read runs at: the EMPTY selector,
+     *  which the header (v32) names the verified HEAD — the Rust twin's
+     *  default, applied since the engine reads the attested head root
+     *  (see class doc). */
+    static final String READ_SELECTOR = "";
+
+    private final long handle;
+    private final String networkName;
+    private final long chainId;
+    /** Loopback JSON-RPC port; {@code <= 0} disables the listener (test seams). */
+    private final int rpcPort;
+    private final GoVerifiedReads verifiedReads = new GoVerifiedReads(this);
+    /** The host's loopback listener (a port — see {@link LoopbackRpc}), or null. */
+    private final LoopbackRpc rpc;
+    private volatile boolean rpcStarted;
+
+    /** Uptime anchoring (Rust-twin parity): nanoTime from the start REQUEST,
+     *  paired with a set flag because nanoTime's origin is arbitrary. */
+    private volatile long startedAtNs;
+    private volatile boolean started;
+
+    /** The network's CL slot clock (from the catalog entry, via create):
+     *  {@code clGenesisTime} unix-seconds and the slot width. With them the
+     *  verified-head age is the TRUE wall-clock age of the anchor reads run
+     *  at — the ATTESTED (optimistic) slot while attestation flows (the Rust
+     *  twin's rule; seconds for a healthy run), falling back to the finalized
+     *  slot only while no optimistic slot is reported yet. Aging by "time
+     *  since this handle last saw an advance" restarts at 0 on every advance
+     *  (PR #832 review — under the old finalized anchor that let the hosts'
+     *  45 s readiness dot read green for 45 s of every epoch for state
+     *  13-19 minutes behind). Zero means "no catalog wired" (test seams): the
+     *  age then falls back to the advance-stamp clock. */
+    private final long clGenesisTime;
+    private final int secondsPerSlot;
+
+    /** Fallback age bookkeeping (no catalog values): the last read-anchor
+     *  block number seen (optimistic when held, finalized otherwise) and the
+     *  monotonic time it was first seen, guarded so concurrent status()
+     *  callers cannot tear the pair. */
+    private final Object headAgeLock = new Object();
+    private long lastAnchorBlock = -1L;
+    private long lastAnchorAdvanceNanos;
+
+    /** Idle-sleep accounting is Java-side even here: the Go engine never pauses,
+     *  so these stay at their zeros — but they are reported through the same
+     *  SleepMetrics type so the two engines' status screens cannot drift. */
+    private final io.myotis.engines.common.SleepMetrics sleepMetrics =
+            new io.myotis.engines.common.SleepMetrics();
+    /** Requests in flight: while non-zero lastActivityEpochMillis reports "now"
+     *  so a host idle timer never acts mid-query (the Go engine cannot be
+     *  paused anyway; kept so the field means the same thing on every engine). */
+    private final java.util.concurrent.atomic.AtomicLong lastActivityMs =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicInteger inFlight =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    GoChainHandle(long handle, String networkName, long chainId, int rpcPort, LoopbackRpc rpc) {
+        this(handle, networkName, chainId, rpcPort, rpc, 0L, 0);
+    }
+
+    GoChainHandle(long handle, String networkName, long chainId, int rpcPort, LoopbackRpc rpc,
+                  long clGenesisTime, int secondsPerSlot) {
+        this.handle = handle;
+        this.networkName = networkName;
+        this.chainId = chainId;
+        this.rpcPort = rpcPort;
+        this.rpc = rpc;
+        this.clGenesisTime = clGenesisTime;
+        this.secondsPerSlot = secondsPerSlot;
+    }
+
+    @Override public String networkName() { return networkName; }
+
+    @Override public long chainId() { return chainId; }
+
+    @Override
+    public synchronized boolean start() {
+        long startRequestNs = System.nanoTime();
+        boolean ok = linked(() -> GoEngineNative.nativeStart(handle));
+        if (ok) {
+            if (!started) { startedAtNs = startRequestNs; started = true; }
+            startRpc();
+        }
+        return ok;
+    }
+
+    @Override
+    public synchronized void stop() {
+        if (rpcStarted) {
+            try { rpc.stop(); } catch (Throwable ignored) {}
+            rpcStarted = false;
+        }
+        started = false;
+        linked(() -> { GoEngineNative.nativeStop(handle); return null; });
+    }
+
+    // ---- lifecycle (no idle sleep yet; see class doc) ----
+
+    @Override
+    public synchronized boolean pause() {
+        // The Go ABI has no pause (myotis_pause refuses, no PAUSED state exists).
+        // The contract's answer for "cannot be PAUSED on return" is false; the
+        // host's idle timer treats that as "the engine declined".
+        log.debug("[engines] pause is not implemented on the Go engine yet");
+        return false;
+    }
+
+    @Override public boolean resume() { return resume(WakeReason.MANUAL); }
+
+    @Override
+    public boolean resume(String reason) {
+        // No PAUSED state to leave: a running stack is a no-op success per the
+        // contract; a stopped one cannot warm-start (that is the engine-parity
+        // increment), so it fails like a resume whose rebuild failed.
+        return isRunning();
+    }
+
+    @Override
+    public LifecycleState lifecycle() {
+        ParsedStatus s = readStatus();
+        if (s.running()) return LifecycleState.RUNNING;
+        return s.paused() ? LifecycleState.PAUSED : LifecycleState.STOPPED;
+    }
+
+    @Override public boolean wakeUp() { return resume(WakeReason.IPC); }
+    @Override public String lifecycleName() { return lifecycle().name(); }
+
+    @Override
+    public long lastActivityEpochMillis() {
+        return inFlight.get() > 0 ? System.currentTimeMillis() : lastActivityMs.get();
+    }
+
+    /** Map a lazy-link failure into the EngineException this class promises.
+     *  JNA's INTERFACE mapping resolves symbols LAZILY, at the first call
+     *  (not at class-load, and not "direct" as an earlier doc claimed —
+     *  PR #832 review): a stale or misbuilt libmyotis_engine_go surfaces as
+     *  UnsatisfiedLinkError at ANY call site. EVERY native call in this
+     *  class crosses here — lifecycle and setters included (PR #861
+     *  internal review: start/stop/status/the setters used to call
+     *  GoEngineNative directly, so a missing symbol threw a raw
+     *  UnsatisfiedLinkError out of, say, {@code shutdownAll}'s fan-out
+     *  instead of the documented EngineException). */
+    private <T> T linked(java.util.function.Supplier<T> nativeCall) {
+        try {
+            return nativeCall.get();
+        } catch (LinkageError e) {
+            throw new EngineException("the Go engine failed to link on a call for "
+                    + networkName + " (stale libmyotis_engine_go? rebuild it via "
+                    + "goBuildCShared): " + e, e);
+        }
+    }
+
+    /** The Go twin of the Rust handle's {@code gated()}, minus the wake gate
+     *  (there is no pause to wake from): stamp activity, mark in flight, run
+     *  through {@link #linked}. Reserved for VERIFIED READS and operator
+     *  queries — the calls the contract's activity clock is defined over —
+     *  NOT for status probes and lifecycle (PR #861 round-3 review): the
+     *  Rust twin keeps its status probe out of its gate for the same reason,
+     *  with the recorded lesson that gating a probe "stamped activity +
+     *  woke paused stacks on every poll, fighting the idle-pause
+     *  controller". Latent here (pause() refuses and no host polls
+     *  lastActivity for a Go handle today), but it must not become a bug
+     *  the day the Go engine learns idle sleep: a handle anything polls
+     *  would never look idle. */
+    private <T> T gated(java.util.function.Supplier<T> nativeCall) {
+        lastActivityMs.set(System.currentTimeMillis());
+        inFlight.incrementAndGet();
+        try {
+            return linked(nativeCall);
+        } finally {
+            inFlight.decrementAndGet();
+        }
+    }
+
+    @Override
+    public long uptimeSeconds() {
+        return !started ? 0L : (System.nanoTime() - startedAtNs) / 1_000_000_000L;
+    }
+
+    private boolean rpcServing() {
+        return rpcStarted && rpc.isServing();
+    }
+
+    /** Start the host's {@link LoopbackRpc} listener (Rust-twin parity: a bind
+     *  failure is logged, the stack continues without JSON-RPC). */
+    private void startRpc() {
+        if (rpc == null) return;
+        if (rpcPort <= 0) return;
+        if (rpcStarted) return;
+        try {
+            rpc.start(rpcPort, verifiedReads, this, this);
+            rpcStarted = true;
+            log.info("[{}] JSON-RPC listening on http://127.0.0.1:{} (verified, strict, Go engine)",
+                    networkName, rpcPort);
+        } catch (java.io.IOException bindEx) {
+            log.warn("[{}][rpc] port {} unavailable ({}); continuing without JSON-RPC",
+                    networkName, rpcPort, bindEx.getMessage());
+        } catch (Throwable t) {
+            log.warn("[{}][rpc] failed to start JSON-RPC; continuing without it: {}",
+                    networkName, t.toString());
+        }
+    }
+
+    @Override public boolean isRunning() { return readStatus().running(); }
+
+    // ---- status ----
+
+    /** Parse the native status JSON; a null/empty payload → an unknown/dead handle. */
+    private ParsedStatus readStatus() {
+        String json = linked(() -> GoEngineNative.nativeStatusJson(handle));
+        return ParsedStatus.parse(json);
+    }
+
+    /**
+     * The parsed native status object. Same field set and same tolerant defaults
+     * as the Rust twin's ParsedStatus (the Go status JSON is emitted from
+     * {@code go/internal/capi}'s statusJSON struct, whose key set is pinned to
+     * the Rust one by TestStatusCarriesTheRustKeySet; the Go-only keys
+     * engine/myotisAbi/capabilities carry no snapshot field — the badge reads
+     * them from the raw JSON's {@code engine} value). Keys whose machinery the Go
+     * build lacks carry honest zeros THERE; the defaults here are the
+     * never-seen-that-vintage backstop, not load-bearing.
+     */
+    private record ParsedStatus(
+            boolean running,
+            boolean paused,
+            boolean elReaderAvailable,
+            BeaconState beaconState,
+            boolean bootstrapped,
+            long finalizedSlot,
+            long optimisticSlot,
+            long currentPeriod,
+            long targetPeriod,
+            long peerCount,
+            int servedPeersLastMinute,
+            int discv5TableSize,
+            long syncStartPeriod,
+            int snapPeers,
+            int snapServingPeers,
+            int snap2ServingPeers,
+            int discoveredPeers,
+            int attemptedDials,
+            int backedOffPeers,
+            int blacklistedPeers,
+            long optimisticBlockNumber,
+            long finalizedBlockNumber,
+            long peerHeaderRequests,
+            long peerHeaderRequestsServed,
+            long peerBodyRequests,
+            long peerBodyRequestsServed,
+            boolean lcHunting,
+            boolean elHunting,
+            long wsBoundPeriods,
+            UpgradeAdvisory upgradeAdvisory,
+            DataUsage dataUsage,
+            NetworkMetering networkMetering) {
+
+        /** Unrecognized beacon state → STARTING (fail closed), as the Rust twin. */
+        private static BeaconState beaconStateOf(String name) {
+            try {
+                return BeaconState.valueOf(name);
+            } catch (IllegalArgumentException e) {
+                return BeaconState.STARTING;
+            }
+        }
+
+        static ParsedStatus parse(String json) {
+            if (json == null || json.isBlank()) return notRunning();
+            try {
+                JsonObject o = Json.parse(json).asObject();
+                if (o.isEmpty()) return notRunning(); // "{}" == unknown handle
+                return new ParsedStatus(
+                        o.getBoolean("running", false),
+                        o.getBoolean("paused", false),
+                        o.getBoolean("elReaderAvailable", false),
+                        beaconStateOf(o.getString("beaconState", "STARTING")),
+                        o.getBoolean("bootstrapped", false),
+                        o.getLong("finalizedSlot", 0L),
+                        o.getLong("optimisticSlot", 0L),
+                        o.getLong("currentPeriod", 0L),
+                        o.getLong("targetPeriod", 0L),
+                        o.getLong("peerCount", 0L),
+                        o.getInt("servedPeersLastMinute", 0),
+                        o.getInt("discv5TableSize", 0),
+                        o.getLong("syncStartPeriod", -1L),
+                        o.getInt("snapPeers", 0),
+                        o.getInt("snapServingPeers", 0),
+                        o.getInt("snap2ServingPeers", 0),
+                        o.getInt("discoveredPeers", 0),
+                        o.getInt("attemptedDials", 0),
+                        o.getInt("backedOffPeers", 0),
+                        o.getInt("blacklistedPeers", 0),
+                        o.getLong("optimisticBlockNumber", 0L),
+                        o.getLong("finalizedBlockNumber", 0L),
+                        o.getLong("peerHeaderRequests", 0L),
+                        o.getLong("peerHeaderRequestsServed", 0L),
+                        o.getLong("peerBodyRequests", 0L),
+                        o.getLong("peerBodyRequestsServed", 0L),
+                        o.getBoolean("lcHunting", false),
+                        o.getBoolean("elHunting", false),
+                        o.getLong("wsBoundPeriods", 0L),
+                        parseAdvisory(o.get("upgradeAdvisory")),
+                        parseDataUsage(o.get("dataUsage")),
+                        meteringOf(o.get("networkMetering")));
+            } catch (RuntimeException e) {
+                throw new EngineException(
+                        "malformed status JSON from the Go engine: " + e.getMessage(), e);
+            }
+        }
+
+        static ParsedStatus notRunning() {
+            return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
+                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L,
+                    null, DataUsage.NONE, NetworkMetering.UNKNOWN);
+        }
+
+        static DataUsage parseDataUsage(JsonValue v) {
+            if (v == null || !v.isObject()) return DataUsage.NONE;
+            JsonObject u = v.asObject();
+            try {
+                return new DataUsage(
+                        u.getLong("bytesIn", 0L), u.getLong("bytesOut", 0L),
+                        u.getLong("elBytesIn", 0L), u.getLong("elBytesOut", 0L),
+                        u.getLong("clBytesIn", 0L), u.getLong("clBytesOut", 0L),
+                        u.getString("day", ""),
+                        u.getLong("todayBytesIn", 0L), u.getLong("todayBytesOut", 0L),
+                        u.getLong("todayMeteredBytesIn", 0L),
+                        u.getLong("todayMeteredBytesOut", 0L));
+            } catch (RuntimeException wrongType) {
+                return DataUsage.NONE;
+            }
+        }
+
+        static NetworkMetering meteringOf(JsonValue v) {
+            if (v == null || !v.isString()) return NetworkMetering.UNKNOWN;
+            try {
+                return NetworkMetering.valueOf(v.asString());
+            } catch (IllegalArgumentException e) {
+                return NetworkMetering.UNKNOWN;
+            }
+        }
+
+        static UpgradeAdvisory parseAdvisory(JsonValue v) {
+            if (v == null || !v.isObject()) return null;
+            JsonObject a = v.asObject();
+            try {
+                return new UpgradeAdvisory(UpgradePhase.valueOf(a.getString("phase", "")),
+                        a.getLong("activationTime", 0L), a.getString("forkId", ""),
+                        a.getInt("observedPeers", 0));
+            } catch (RuntimeException unknownPhaseOrWrongType) {
+                return null;
+            }
+        }
+    }
+
+    @Override
+    public io.myotis.api.StatusSnapshot status() {
+        return status(readStatus());
+    }
+
+    /** Package-private test seam: JSON→{@link io.myotis.api.StatusSnapshot} without JNA. */
+    static io.myotis.api.StatusSnapshot statusFromJson(String network, String json) {
+        return new GoChainHandle(0L, network, 1L, 0, null).status(ParsedStatus.parse(json));
+    }
+
+    /** Test seam with the catalog slot clock: exercises the TRUE-age path. */
+    static io.myotis.api.StatusSnapshot statusFromJson(String network, String json,
+                                                       long clGenesisTime, int secondsPerSlot) {
+        return new GoChainHandle(0L, network, 1L, 0, null, clGenesisTime, secondsPerSlot)
+                .status(ParsedStatus.parse(json));
+    }
+
+    /** Package-private test seam: JSON→{@link BeaconStatus} without JNA. */
+    static BeaconStatus beaconStatusFromJson(String network, String json) {
+        return new GoChainHandle(0L, network, 1L, 0, null).beaconStatus(ParsedStatus.parse(json));
+    }
+
+    private io.myotis.api.StatusSnapshot status(ParsedStatus s) {
+        int peers = (int) Math.min(s.peerCount(), Integer.MAX_VALUE);
+        long targetPeriod = Math.max(s.targetPeriod(), s.currentPeriod());
+        // verifiedHeadAgeMs is the TRUE wall-clock age of the anchor verified
+        // reads run at — the ATTESTED (optimistic) slot once one is held, the
+        // finalized slot only before the first attested head lands (a status
+        // from before the head-anchor parity change, or an old library,
+        // reports optimisticSlot 0). The slot's wall time comes from the
+        // catalog's CL genesis (PR #832 review): the attested header
+        // rides the once-per-slot finality-update poll and CL servers
+        // answer freshly, so a healthy run ages only seconds (the
+        // twin's own ~1–2-slot bound, anchor.rs) and the readiness dot
+        // stays green in the normal case (PR #889 review: the old
+        // epoch-saw-tooth story was wrong — the Rust engine never runs
+        // a per-slot optimistic-update poll either).
+        // Without catalog values (test seams) the age falls back to the
+        // Rust-twin advance-stamp clock: pinning to "now" while not
+        // serveable so a serving stretch starts fresh instead of leaking
+        // the outage gap in.
+        long anchorBlock = s.optimisticBlockNumber() > 0
+                ? s.optimisticBlockNumber() : s.finalizedBlockNumber();
+        long anchorSlot = s.optimisticSlot() > 0 ? s.optimisticSlot() : s.finalizedSlot();
+        boolean serveable = serveable(s);
+        long verifiedHeadAgeMs;
+        if (serveable && clGenesisTime > 0 && secondsPerSlot > 0 && anchorSlot > 0) {
+            long slotWallMs = (clGenesisTime + anchorSlot * (long) secondsPerSlot) * 1000L;
+            long wallAgeMs = System.currentTimeMillis() - slotWallMs;
+            // The anchor slot's wall time cannot be in the future under an
+            // honest clock: finality trails the head by ≥2 epochs, and an
+            // ATTESTED slot is one the beacon already signed — its slot began
+            // before the attestation could exist. slotWallMs ahead of now is
+            // therefore proof the HOST clock lags chain time — a sleeping
+            // laptop waking before NTP — and clamping that to 0 would read
+            // the clock-skew proof itself as "fresh": the one way this dot
+            // goes falsely green. MAX_VALUE (already the not-serveable
+            // answer, so hosts handle it) says "cannot claim freshness"
+            // instead. Residual the JVM cannot fix: a clock lagging by LESS
+            // than the anchor's true age still under-reports the age — the
+            // engine shares this host clock, so no side can see the true
+            // "now" to compare against. (Final-PR review, combined diff,
+            // finding 1; the head-anchor rewire keeps the invariant, tighter:
+            // a slot cannot attest before it starts.)
+            verifiedHeadAgeMs = wallAgeMs < 0 ? Long.MAX_VALUE : wallAgeMs;
+        } else {
+            long nowNanos = System.nanoTime();
+            synchronized (headAgeLock) {
+                if (!serveable) {
+                    lastAnchorBlock = anchorBlock;
+                    lastAnchorAdvanceNanos = nowNanos;
+                    verifiedHeadAgeMs = Long.MAX_VALUE;
+                } else {
+                    if (anchorBlock != lastAnchorBlock) {
+                        lastAnchorBlock = anchorBlock;
+                        lastAnchorAdvanceNanos = nowNanos;
+                    }
+                    verifiedHeadAgeMs = Math.max(0L, (nowNanos - lastAnchorAdvanceNanos) / 1_000_000L);
+                }
+            }
+        }
+        return new io.myotis.api.StatusSnapshot(
+                s.running(),
+                s.running() ? LifecycleState.RUNNING
+                        : s.paused() ? LifecycleState.PAUSED : LifecycleState.STOPPED,
+                networkName,
+                s.beaconState(),
+                peers,                 // connectedPeers (CL libp2p peers, as the Rust twin)
+                s.snapPeers(),         // readyPeers (EL pool holds only snap-ready)
+                s.snapPeers(),         // snapPeers
+                s.snapServingPeers(),  // snapServingPeers
+                s.snap2ServingPeers(), // snap2ServingPeers
+                s.discoveredPeers(),   // discoveredPeers (discv4)
+                s.backedOffPeers(),    // backedOffPeers (Go: honest 0)
+                s.blacklistedPeers(),  // blacklistedPeers (Go: honest 0)
+                s.attemptedDials(),    // attemptedDials
+                s.discv5TableSize(),
+                s.finalizedBlockNumber(),   // executionBlockNumber (== finalized payload's block)
+                s.optimisticBlockNumber(),  // optimisticBlockNumber (the attested head the reads run at)
+                s.finalizedSlot(),
+                s.finalizedBlockNumber(),   // finalizedBlockNumber
+                s.syncStartPeriod(),
+                s.currentPeriod(),
+                targetPeriod,
+                s.finalizedSlot() / 8192L, // finalizedPeriod (SLOTS_PER_SYNC_COMMITTEE_PERIOD)
+                targetPeriod,              // wallClockPeriod == the catch-up target
+                verifiedHeadAgeMs,
+                s.wsBoundPeriods(),
+                List.<PeerInfo>of(),
+                sleepMetrics.pauseCount(),
+                sleepMetrics.totalPausedMs(),
+                sleepMetrics.lastPauseEpochMs(),
+                sleepMetrics.lastResumeEpochMs(),
+                sleepMetrics.lastWakeReason(),
+                s.peerHeaderRequests(),
+                s.peerHeaderRequestsServed(),
+                s.peerBodyRequests(),
+                s.peerBodyRequestsServed(),
+                s.lcHunting(),
+                s.elHunting(),
+                // Host-side listener truth, Rust-twin rule: the configured port
+                // while the handle runs, 0 when stopped; serving = live listener.
+                (s.running() || s.paused()) && rpc != null && rpcPort > 0 ? rpcPort : 0,
+                rpcServing(),
+                s.upgradeAdvisory(),
+                s.dataUsage(),
+                s.networkMetering());
+    }
+
+    /** A verified read can be served NOW on this engine: SYNCED, a published
+     *  anchor, and a pooled snap peer that can answer AT THE READ'S ROOT. The
+     *  Go twin of the Rust predicate; a published Go anchor always carries
+     *  both sides (attested head and finalized) together, so a present
+     *  finalized side means the head side the reads run at is present too. */
+    private static boolean serveable(ParsedStatus s) {
+        return s.beaconState() == BeaconState.SYNCED
+                && s.finalizedBlockNumber() > 0 && s.snapServingPeers() > 0;
+    }
+
+    // ---- read surface ----
+
+    /** Rust-twin contract: null before a successful start when a listener is
+     *  attached (its bind may have failed), or before start with none. */
+    @Override public VerifiedReads reads() {
+        return (rpc == null ? started : rpcStarted) ? verifiedReads : null;
+    }
+
+    /** The Go build answers ENS with a named refusal, so the API exists but
+     *  every method throws the capability error (NOT_AVAILABLE rule — a record's
+     *  error field would misrepresent "we don't resolve names" as a verdict). */
+    private static final EnsApi ENS_REFUSED = new EnsApi() {
+        private EngineException refuse() {
+            return new EngineException("ENS resolution is not implemented on the Go engine yet");
+        }
+        @Override public io.myotis.api.EnsResolutionResult resolveAddress(String name,
+                io.myotis.api.EnsRoot root) { throw refuse(); }
+        @Override public io.myotis.api.EnsResolutionResult reverseResolve(String hexAddress) {
+            throw refuse(); }
+        @Override public io.myotis.api.EnsTextResult resolveText(String name, String key) {
+            throw refuse(); }
+        @Override public io.myotis.api.EnsContenthashResult resolveContenthash(String name) {
+            throw refuse(); }
+        @Override public io.myotis.api.EnsMultiCoinResult resolveMultiCoinAddr(String name,
+                long coinType) { throw refuse(); }
+        @Override public io.myotis.api.EnsPubkeyResult resolvePubkey(String name) {
+            throw refuse(); }
+        @Override public io.myotis.api.EnsAbiResult resolveAbi(String name, long contentTypes) {
+            throw refuse(); }
+        @Override public io.myotis.api.EnsDnsRecordResult resolveDnsRecord(String name,
+                String dnsName, int recordType) { throw refuse(); }
+        @Override public io.myotis.api.EnsInterfaceResult resolveInterfaceImplementer(String name,
+                byte[] interfaceId4) { throw refuse(); }
+    };
+
+    @Override public EnsApi ens() { return ENS_REFUSED; }
+
+    @Override public List<io.myotis.api.DiscoveredPeer> discoveredPeers() { return List.of(); }
+
+    @Override public List<ConnectedPeer> connectedPeers() { return List.of(); }
+
+    @Override
+    public void setTargetSnapPeers(int target) {
+        // The Go dialer sizes its own pool (internal/transport) and exports no
+        // target knob, as the Rust engine — a Settings value with nothing to reach.
+        log.debug("[engines] setTargetSnapPeers({}) is a no-op on the Go engine", target);
+    }
+
+    @Override
+    public void setServedBlockWindow(int blocks) {
+        // The Go ABI records the value and clamps it ([1,4096]); the dial-only
+        // engine serves no blocks, so no answer depends on it (capabilities say
+        // so). False only for an unknown handle — log it, same rule as the twin.
+        if (!linked(() -> GoEngineNative.nativeSetServedBlockWindow(handle, blocks))) {
+            log.warn("[engines] setServedBlockWindow({}) dropped: unknown handle {}", blocks, handle);
+        }
+    }
+
+    @Override
+    public void setWsBoundPeriods(long periods) {
+        // APPLIED live on the Go engine: the LC loop re-reads the bound at every
+        // weak-subjectivity gate and a parked bootstrap restarts within a second.
+        if (!linked(() -> GoEngineNative.nativeSetWsBoundPeriods(handle, periods))) {
+            log.warn("[engines] setWsBoundPeriods({}) dropped: unknown handle {}", periods, handle);
+        }
+    }
+
+    @Override
+    public WebAccessPolicy setWebAccessPolicy(WebAccessPolicy policy) {
+        // Listener-side, never crosses the FFI (both engines share this rule):
+        // with a listener the gate applies it live; without one the contract's
+        // answer is the same pure normalization so a host's dropped-entry
+        // compare works either way (applied-or-refused, CLAUDE.md).
+        if (rpc != null) return rpc.setWebAccessPolicy(policy);
+        return new WebAccessPolicy(policy.mode(),
+                io.myotis.jsonrpc.policy.WebOrigins.INSTANCE.normalizeEach(policy.origins()));
+    }
+
+    @Override
+    public List<WebOrigin> recentWebOrigins() {
+        return rpc == null ? List.of() : rpc.recentWebOrigins();
+    }
+
+    @Override
+    public void acceptStaleAnchor() {
+        // APPLIED live: releases a STALE_ANCHOR park; armed until a
+        // remembered CONTINUE is replaced (one shared flag, see the
+        // class doc).
+        if (!linked(() -> GoEngineNative.nativeAcceptStaleAnchor(handle))) {
+            log.warn("[engines] acceptStaleAnchor dropped: unknown handle {}", handle);
+        }
+    }
+
+    @Override
+    public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz(boolean allowUnconfirmed) {
+        // Parsed from the C export's own answer (as RustChainHandle does), so the
+        // reason the host shows is the engine's word, not the :myotis-api
+        // default's generic one. Today the Go export always refuses — no
+        // checkpoint fetch (capabilities anchorRefresh:false) — but the shape is
+        // the contract's, and a later fetch implementation flows through here
+        // with no JVM change.
+        return parseAnchorRefresh(
+                linked(() -> GoEngineNative.nativeRefreshAnchorFromCheckpointz(handle, allowUnconfirmed)));
+    }
+
+    /**
+     * The engine's {@code refresh_anchor_from_checkpointz} JSON as the API
+     * record — the mirror of {@code RustChainHandle.parseAnchorRefresh}
+     * (same shape, pinned engine-side by {@code RustAnchorRefreshJsonTest}
+     * and here by {@code GoAnchorRefreshJsonTest}): the applied record is
+     * built only when EVERY member parses, and anything unreadable is a
+     * refusal — never a half-built {@code applied:true} that keeps an
+     * error, which would break the record's own "error: null when applied"
+     * contract (PR #877 round-2).
+     */
+    static io.myotis.api.AnchorRefresh parseAnchorRefresh(String json) {
+        try {
+            JsonObject o = Json.parse(json).asObject();
+            boolean unconfirmed = o.getBoolean("unconfirmed", false);
+            if (!o.getBoolean("applied", false)) {
+                return new io.myotis.api.AnchorRefresh(false, null, 0, 0, List.of(), List.of(),
+                        unconfirmed, o.getString("error", "refused"));
+            }
+            return new io.myotis.api.AnchorRefresh(true, o.getString("root", null),
+                    o.getLong("slot", 0), o.getLong("epoch", 0), strings(o.get("operators")),
+                    strings(o.get("confirmedBy")), unconfirmed, null);
+        } catch (RuntimeException e) {
+            return io.myotis.api.AnchorRefresh.refused("malformed engine answer: " + e.getMessage());
+        }
+    }
+
+    private static List<String> strings(JsonValue v) {
+        List<String> out = new java.util.ArrayList<>();
+        if (v != null && v.isArray()) {
+            for (JsonValue e : v.asArray()) out.add(e.asString());
+        }
+        return out;
+    }
+
+    @Override
+    public boolean setStaleAnchorPolicy(io.myotis.api.StaleAnchorPolicy policy) {
+        // The engine's answer, verbatim — not the :myotis-api default's mapping.
+        // That default would report CONTINUE applied unconditionally and ASK
+        // applied even after a CONTINUE; here the engine says so: CONTINUE is
+        // APPLIED (the sticky consent re-read at every weak-subjectivity gate,
+        // a replaced CONTINUE withdrawn exactly like host.rs), ASK is applied or
+        // reports the dead handle, and CHECKPOINT answers false for its lack of
+        // a fetch (capabilities anchorRefresh:false). Same truth C-ABI hosts
+        // get (PR #877 review).
+        boolean ok = linked(() -> GoEngineNative.nativeSetStaleAnchorPolicy(handle, policy.ordinal()));
+        if (!ok) {
+            if (policy == io.myotis.api.StaleAnchorPolicy.CHECKPOINT) {
+                // CHECKPOINT is refused for its missing fetch. On a LIVE
+                // engine the refusal also withdraws a remembered CONTINUE
+                // (the engine un-arms on any replacement, host.rs) — and a
+                // one-shot accept goes with it however the two were
+                // ordered (the UI auto-continues exactly while CONTINUE
+                // is saved), both being
+                // the same acceptStale flag (PR #877 round 7; Rust
+                // identical, one accept_stale_anchor, host.rs:1625-1627).
+                // An UNKNOWN or CLOSED handle mutates nothing at all (the
+                // C lookup / closed check returns false before the
+                // withdrawal, internal review) — so the warn states the
+                // withdrawal conditionally instead of asserting it.
+                log.warn("[engines] setStaleAnchorPolicy(CHECKPOINT) not applied: the Go "
+                        + "engine has no checkpoint fetch. On a live engine this refusal also "
+                        + "withdraws a remembered 'continue anyway' if one was set (together "
+                        + "with any one-shot accept — they share one consent); a one-shot "
+                        + "accept alone survives it; an unknown or closed handle changed nothing");
+            } else {
+                log.warn("[engines] setStaleAnchorPolicy({}) not applied: unknown handle, or "
+                        + "a closed engine", policy);
+            }
+        }
+        return ok;
+    }
+
+    @Override
+    public void clearPeerState() {
+        // Same shape as the Rust engine: the Go engine's peer caches are files
+        // under the data dir and there is no FFI clear; hosts delete the files
+        // while the network is stopped.
+        log.debug("[engines] clearPeerState is a no-op on the Go engine (the hosts delete its cache files)");
+    }
+
+    // ---- verified operator queries ----
+
+    @Override
+    public AccountProofResult requestAccount(String hexAddress) {
+        return accountVerified(hexAddress, READ_SELECTOR);
+    }
+
+    /** The account read at an explicit selector — {@link GoVerifiedReads} drives
+     *  it with the request's own selector (the engine applies head tags,
+     *  near-head numbers and {@code finalized}, and permanently refuses what
+     *  it cannot, {@code RpcBlockWindow}-shaped). */
+    AccountProofResult accountVerified(String hexAddress, String block) {
+        JsonObject o = parseResultOrThrow(
+                gated(() -> GoEngineNative.nativeRequestAccountJson(handle, hexAddress, block)),
+                "account");
+        return accountFromJson(hexAddress, o);
+    }
+
+    @Override
+    public StorageProofResult getStorageProof(String hexAddress, long slot, String holderHexOrNull) {
+        // A holder is folded Go-side into the Solidity mapping key
+        // keccak256(pad32(holder) ‖ pad32(slot)) — the same rule as the Rust
+        // reader's storage_key (pinned there by reader.rs, here by
+        // TestStorageRequestShapes) — and a malformed holder is refused by name,
+        // never folded from wrong bytes.
+        //
+        // The by-name refusal must happen HERE, before the FFI (PR #832
+        // round-4 review): the Go fold SKIPS a blank holder silently
+        // (`if h := strings.TrimSpace(holder); h != ""`, capi.go) and gostrC
+        // maps NULL and "" alike, so a non-null-but-blank holder — "" straight
+        // from the daemon's CommandHandler on `"holder":""`, whitespace-only,
+        // or an unpaired surrogate that nz() rewrites to "" — read the PLAIN
+        // slot and got it back labelled with the holder that was sent (since
+        // the round-2 move of the labels to the request, silently plausible).
+        // The Rust twin refuses all three (`invalid holder (expected 20-byte
+        // hex)`, host.rs); accepting-and-ignoring is the #314 case, so the
+        // shape the Go storageKey would fold is validated up front and
+        // anything else is refused, never skipped.
+        if (holderHexOrNull != null && !isHolderShape(holderHexOrNull)) {
+            throw new EngineException("go engine: holder_hex must be a 20-byte address "
+                    + "or 32-byte word in hex, or null (got " + describeHolder(holderHexOrNull) + ")");
+        }
+        JsonObject o = parseResultOrThrow(
+                gated(() -> GoEngineNative.nativeGetStorageProofJson(
+                        handle, hexAddress, slot, holderHexOrNull)),
+                "storage");
+        return storageFromJson(hexAddress, slot, holderHexOrNull, o);
+    }
+
+    /**
+     * Verified read of a RAW 32-byte storage position at a block selector
+     * ({@code eth_getStorageAt}, the Go twin of
+     * {@code RustChainHandle.storageAtVerified}): the engine APPLIES the
+     * selector (head tags at the attested root, {@code finalized} at the
+     * finalized root, near-head numbers from head state — the window
+     * enforced engine-side too) and permanently refuses what it cannot.
+     * Returns the full 32-byte word, or null when the read produced no
+     * verdict (failReason set) — never throws at the adapter (the
+     * {@link EngineException} from {@code gated} is contained there).
+     */
+    byte[] storageAtVerified(String hexAddress, String position32Hex, String block) {
+        return storageValueFromJson(gated(() -> GoEngineNative.nativeGetStorageAtJson(
+                handle, hexAddress, position32Hex, block)));
+    }
+
+    /** The one decode of a Go storage JSON into the 32-byte word
+     *  (engine-parity with the Rust twin's same-named method): a read
+     *  without a verifyMethod carries no verdict → null; a proven-zero
+     *  slot (valueHex null) is the all-zero word; a value wider than a
+     *  word is shape drift — throw, never truncate into a different
+     *  word (the #314 rule on the value's own width). */
+    static byte[] storageValueFromJson(String json) {
+        JsonObject o = parseResultOrThrow(json, "storage");
+        try {
+            if (stringOrNull(o, "verifyMethod") == null) return null; // unverified → can't answer
+            // valueHex is the big-endian value MINIMAL (the Go reader's
+            // mpt.DecodeStorageLeaf rejects leading zeros — slot 42 arrives
+            // as "0x2a"), or null when the slot is proven zero. The pad is
+            // the ONE shared implementation (GoVerifiedReads.toWord, pinned
+            // by the width test); a null value is the all-zero word, and a
+            // value wider than 32 bytes is shape drift — throw, never
+            // truncate into a different word (the #314 rule on the value's
+            // own width).
+            String valueHex = stringOrNull(o, "valueHex");
+            if (valueHex == null) return new byte[32];
+            byte[] word = GoVerifiedReads.toWord(valueHex);
+            if (word == null) {
+                throw new EngineException("storage value exceeds 32 bytes: " + valueHex);
+            }
+            return word;
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed storage JSON from the Go engine: " + e.getMessage(), e);
+        }
+    }
+
+    /** The holder shape the Go {@code storageKey} folds: an optional {@code 0x}
+     *  prefix (exactly that one — its TrimPrefix does not cut {@code 0X}, and
+     *  the hex decoder rejects everything but even-length hex), then 20 or 32
+     *  bytes. Blank and whitespace-only fail on length, so neither can ride
+     *  through as "no holder". */
+    static boolean isHolderShape(String holder) {
+        String hex = holder.startsWith("0x") ? holder.substring(2) : holder;
+        if (hex.length() != 40 && hex.length() != 64) {
+            return false;
+        }
+        for (int i = 0; i < hex.length(); i++) {
+            char c = hex.charAt(i);
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Quotable form of a refused holder — blank and control characters stay
+     *  legible in the message instead of rendering as nothing. */
+    private static String describeHolder(String holder) {
+        return "\"" + (holder.length() <= 12 ? holder : holder.substring(0, 12) + "…")
+                + "\" (" + holder.length() + " chars)";
+    }
+
+    // ---- operator queries the Go engine does not serve yet ----
+
+    @Override
+    public HeadersResult getHeaders(long startBlock, int count) {
+        throw new EngineException(NOT_AVAILABLE);
+    }
+
+    @Override
+    public BlockResult getBlockVerified(long blockNumber) {
+        throw new EngineException(NOT_AVAILABLE);
+    }
+
+    @Override
+    public DialResult dialPeer(String host, int port, String pubkeyHex) {
+        throw new EngineException(NOT_AVAILABLE);
+    }
+
+    // ---- JSON → result records (Rust-twin shapes, pinned Go-side) ----
+
+    /** Package-private test seam: JSON → {@link AccountProofResult} without JNA. */
+    static AccountProofResult accountFromJson(String hexAddress, String json) {
+        return accountFromJson(hexAddress, parseResultOrThrow(json, "account"));
+    }
+
+    private static AccountProofResult accountFromJson(String hexAddress, JsonObject o) {
+        try {
+            return new AccountProofResult(
+                    o.getString("address", hexAddress),
+                    o.getBoolean("exists", false),
+                    o.getLong("nonce", -1L),
+                    stringOrNull(o, "balanceWei"),
+                    stringOrNull(o, "storageRootHex"),
+                    stringOrNull(o, "codeHashHex"),
+                    o.getLong("blockNumber", 0L),
+                    stringOrNull(o, "peerStateRootHex"),
+                    o.getBoolean("peerProofValid", false),
+                    o.getBoolean("beaconChainVerified", false),
+                    o.getBoolean("blsVerified", false),
+                    o.getLong("matchedBeaconSlot", -1L),
+                    stringOrNull(o, "verifyMethod"),
+                    stringOrNull(o, "failReason"),
+                    stringOrNull(o, "accountHashHex"),
+                    stringList(o, "proofNodesHex"),
+                    o.getBoolean("beaconSynced", false),
+                    o.getLong("finalizedPeriod", 0L),
+                    o.getLong("wallClockPeriod", 0L),
+                    o.getLong("finalizedBlockNumber", 0L),
+                    o.getLong("optimisticBlockNumber", 0L),
+                    longOrMinusOne(o, "blockTimestamp"),
+                    stringOrNull(o, "blockHash"));
+            // The Go shape's one extra key ("anchor": the side actually
+            // read, "head" for this handle's verified-head reads) is
+            // diagnostics; the record has no field for it and none is needed —
+            // the selector that produced the read is this handle's own constant.
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed account JSON from the Go engine: "
+                    + e.getMessage(), e);
+        }
+    }
+
+    /** Package-private test seam: JSON → {@link StorageProofResult} without JNA. */
+    static StorageProofResult storageFromJson(String hexAddress, long slot, String json) {
+        return storageFromJson(hexAddress, slot, null, parseResultOrThrow(json, "storage"));
+    }
+
+    /** Seam with the request's holder (the record labels slot/holder from the
+     *  request, never from the echo — see {@code storageFromJson}'s comment). */
+    static StorageProofResult storageFromJson(String hexAddress, long slot,
+                                              String holderHexOrNull, String json) {
+        return storageFromJson(hexAddress, slot, holderHexOrNull, parseResultOrThrow(json, "storage"));
+    }
+
+    private static StorageProofResult storageFromJson(String hexAddress, long slot,
+                                                      String holderHexOrNull, JsonObject o) {
+        try {
+            return new StorageProofResult(
+                    o.getString("addressHex", hexAddress),
+                    // The slot and holder come from the REQUEST, not the echo
+                    // (PR #832 review): the Go build echoes the slot as an
+                    // UNSIGNED decimal (eljson.go `Slot uint64`), so a slot at or
+                    // above 2^63 would throw in Long.parseLong and discard a
+                    // fully-ran verified read as "malformed", and for a holder
+                    // read it reports slot:0 / holderHex:null (the folded mapping
+                    // key is not a uint64). The two's-complement long we sent is
+                    // the truth about what was asked (the Go side recovers it —
+                    // pinned by TestStorageRequestShapes), and storageKeyHex (the
+                    // key the proof actually walked) stays the verified field.
+                    slot,
+                    holderHexOrNull,
+                    stringOrNull(o, "storageKeyHex"),
+                    stringOrNull(o, "storageKeyHashHex"),
+                    o.getBoolean("exists", false),
+                    stringOrNull(o, "valueHex"),
+                    stringOrNull(o, "valueDecimal"),
+                    o.getInt("slotsReturned", 0),
+                    stringOrNull(o, "storageRootHex"),
+                    stringList(o, "proofNodesHex"),
+                    o.getBoolean("storageProofValid", false),
+                    o.getBoolean("beaconSynced", false),
+                    o.getBoolean("beaconChainVerified", false),
+                    o.getBoolean("blsVerified", false),
+                    o.getLong("matchedBeaconSlot", -1L),
+                    stringOrNull(o, "verifyMethod"),
+                    stringOrNull(o, "failReason"),
+                    o.getLong("peerBlockNumber", 0L),
+                    o.getLong("finalizedBlockNumber", 0L),
+                    o.getLong("optimisticBlockNumber", 0L),
+                    o.getLong("finalizedSlot", 0L),
+                    o.getLong("optimisticSlot", 0L),
+                    o.getInt("maxHeaderChainGap", 0));
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed storage JSON from the Go engine: "
+                    + e.getMessage(), e);
+        }
+    }
+
+    /** Parse a native reply that must be a JSON object, mapping the error
+     *  envelope (retryable {@code {"error"}} or permanent
+     *  {@code {"error","code":-32602}}) to an {@link EngineException} that
+     *  carries the engine's own reason — the Go build reports a pruned-root
+     *  rotation, a stale-anchor park and a refused selector this way, exactly
+     *  as the Rust build does, and a caller decides retry from the text. */
+    private static JsonObject parseResultOrThrow(String json, String what) {
+        if (json == null || json.isBlank()) {
+            throw new EngineException("empty " + what + " JSON from the Go engine"
+                    + " (unknown handle?)");
+        }
+        JsonObject o;
+        try {
+            o = Json.parse(json).asObject();
+        } catch (RuntimeException e) {
+            throw new EngineException("malformed " + what + " JSON from the Go engine: "
+                    + e.getMessage(), e);
+        }
+        JsonValue err = o.get("error");
+        if (err != null && !err.isNull()) {
+            JsonValue code = o.get("code");
+            String suffix = code != null && code.isNumber() && code.asInt() == -32602
+                    ? " (permanent, do not retry)" : "";
+            throw new EngineException(what + " read failed on the Go engine: "
+                    + err.asString() + suffix);
+        }
+        return o;
+    }
+
+    private static String stringOrNull(JsonObject o, String key) {
+        JsonValue v = o.get(key);
+        return v == null || v.isNull() ? null : v.asString();
+    }
+
+    private static long longOrMinusOne(JsonObject o, String key) {
+        JsonValue v = o.get(key);
+        return v == null || v.isNull() ? -1L : v.asLong();
+    }
+
+    private static List<String> stringList(JsonObject o, String key) {
+        JsonValue v = o.get(key);
+        if (v == null || !v.isArray()) return List.of();
+        return v.asArray().values().stream().map(JsonValue::asString).toList();
+    }
+
+    /** 0x-hex → bytes via the shared strict parser (minSdk-safe, same as the
+     *  Rust engine's boundary; "0x"/null → empty). */
+    static byte[] hexToBytes(String hexOrNull) {
+        return Hex.parseHexPrefixed(hexOrNull);
+    }
+
+    @Override
+    public BeaconStatus beaconStatus() {
+        return beaconStatus(readStatus());
+    }
+
+    private BeaconStatus beaconStatus(ParsedStatus s) {
+        int peers = (int) Math.min(s.peerCount(), Integer.MAX_VALUE);
+        return new BeaconStatus(
+                s.beaconState(),
+                s.bootstrapped(),
+                s.currentPeriod(),
+                Math.max(s.targetPeriod(), s.currentPeriod()),
+                s.discv5TableSize(),
+                peers,                 // connectedPeers (CL libp2p peers)
+                s.peerCount(),         // lightClientPeers
+                s.servedPeersLastMinute(),
+                s.finalizedSlot(),
+                s.optimisticSlot(),
+                s.finalizedSlot() / 8192L,  // period OF the finalized slot
+                null,                  // executionStateRootHex (not in the status JSON)
+                null,                  // executionBlockHashHex (not in the status JSON)
+                s.finalizedBlockNumber(),  // executionBlockNumber (== finalized payload's block)
+                0,                     // knownStateRoots
+                0,                     // fillThreshold
+                s.wsBoundPeriods(),
+                List.<io.myotis.api.ClPeerInfo>of());
+    }
+}
