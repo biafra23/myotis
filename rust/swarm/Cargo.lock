@@ -2186,6 +2186,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "myotis-addr1"
+version = "0.1.21"
+dependencies = [
+ "k256",
+ "myotis-core",
+]
+
+[[package]]
+name = "myotis-core"
+version = "0.1.21"
+dependencies = [
+ "k256",
+ "sha2",
+ "sha3 0.10.9",
+]
+
+[[package]]
 name = "myotis-swarm"
 version = "0.0.0"
 dependencies = [
@@ -2194,6 +2211,7 @@ dependencies = [
  "ant-node",
  "ant-p2p",
  "libp2p",
+ "myotis-addr1",
  "tokio",
  "tracing",
 ]

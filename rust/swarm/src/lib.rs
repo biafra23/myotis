@@ -15,7 +15,9 @@
 //! channel ([`ant_control::ControlCommand`]), the in-process interface `antd`'s own control
 //! socket uses.
 //!
-//! **Not linked into the engine yet, and not ready for a release build**, for reasons inside
+//! **Linked into the engine only behind its off-by-default `swarm` feature, for dev builds:
+//! not ready for a release build** (owner, 2026-11-20: settled before any release that turns
+//! `swarm` on), for reasons inside
 //! ant that this crate cannot switch off:
 //! - ant listens on `0.0.0.0` and runs libp2p's UPnP behaviour, which asks the local router
 //!   for a port mapping and announces the public address to peers: more than a fetch-only
@@ -37,7 +39,6 @@ use std::time::{Duration, Instant};
 use ant_control::{ControlAck, ControlCommand, StatusSnapshot};
 use ant_node::{run_node, NodeConfig};
 use libp2p::identity::Keypair;
-use libp2p::Multiaddr;
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// Swarm mainnet's network id.
@@ -46,6 +47,13 @@ pub const MAINNET_NETWORK_ID: u64 = 1;
 /// Peers a reader keeps by default. A reader needs few; ant's own default (100) suits a node
 /// that serves.
 pub const READER_PEERS: usize = 24;
+
+/// The text a [`SwarmError::NotReady`] starts with once rendered: how a caller that only
+/// sees the message (the addr1 reader's `ChunkSource` carries text) tells it apart.
+pub const NOT_READY_TEXT: &str = "the Swarm node has no usable peers yet";
+
+/// A bootnode's address, as [`SwarmConfig::bootnodes`] takes it.
+pub use libp2p::Multiaddr;
 
 /// Errors of the reader.
 #[derive(Debug)]
@@ -64,7 +72,7 @@ impl std::fmt::Display for SwarmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stopped => write!(f, "the Swarm node is not running"),
-            Self::NotReady(m) => write!(f, "the Swarm node has no usable peers yet: {m}"),
+            Self::NotReady(m) => write!(f, "{NOT_READY_TEXT}: {m}"),
             Self::Failed(m) => write!(f, "Swarm read failed: {m}"),
             Self::Timeout => write!(f, "Swarm read timed out"),
         }
@@ -212,6 +220,12 @@ impl SwarmNode {
             .unwrap_or(Err(SwarmError::Timeout))
     }
 
+    /// [`Self::chunk`] with the error as text: what the addr1 reader's
+    /// [`ChunkSource`](myotis_addr1::client::ChunkSource) takes.
+    async fn chunk_text(&self, address: [u8; 32], expect_missing: bool) -> Result<Option<Vec<u8>>, String> {
+        self.chunk(address, expect_missing).await.map_err(|e| e.to_string())
+    }
+
     /// Stops the node: shuts its runtime down, which ends every task ant spawned (its swarm
     /// loop, listener and connections), waiting up to `timeout` for them. Blocking: call it
     /// from a thread that may block (not from inside an async task).
@@ -219,6 +233,17 @@ impl SwarmNode {
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(timeout);
         }
+    }
+}
+
+/// The addr1 reader reads through the node: every chunk it gets is checked there before use.
+impl myotis_addr1::client::ChunkSource for SwarmNode {
+    fn chunk(
+        &self,
+        address: [u8; 32],
+        expect_missing: bool,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send {
+        self.chunk_text(address, expect_missing)
     }
 }
 

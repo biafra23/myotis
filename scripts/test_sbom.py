@@ -298,6 +298,28 @@ class MadeUp(unittest.TestCase):
             with self.assertRaisesRegex(sbom.SbomError, "pkg:cargo/leaf@0.3.0 is not the package another lockfile pins"):
                 self.build("native")
 
+    def test_a_vendored_crate_is_its_upstreams_at_the_commit_not_ours(self):
+        commit = "b138f6bc074d8c28149017d4e7b1e80db8c67d4d"
+        self.tree.write("rust/vendor/up/VENDORED.md",
+                        f"# up\n\nUpstream: https://example.org/up\nCommit: {commit}\n")
+        self.tree.write("rust/vendor/up/crates/up-core/Cargo.toml", '[package]\nname = "up-core"\nversion = "0.2.0"\n')
+        self.tree.write("rust/Cargo.lock", Tree.CARGO.replace(
+            'dependencies = ["helper", "dup 1.0.0", "from-git"]',
+            'dependencies = ["helper", "dup 1.0.0", "from-git", "up-core"]')
+            + '\n[[package]]\nname = "up-core"\nversion = "0.2.0"\n')
+        refs = self.components("native")
+        source = f"git+https://example.org/up?rev={commit}#{commit}"
+        ref = "pkg:cargo/up-core@0.2.0?vcs_url=" + sbom.quote(source)
+        self.assertIn(ref, refs)
+        self.assertIn(("myotis:vendored", "rust/vendor/up"), self.properties(refs[ref]))
+        self.assertIn(("myotis:pinned-by", "rust/Cargo.lock"), self.properties(refs[ref]))
+        self.assertNotIn("hashes", refs[ref])
+
+    def test_a_vendored_tree_without_its_notes_is_an_error(self):
+        self.tree.write("rust/vendor/up/crates/up-core/Cargo.toml", '[package]\nname = "up-core"\nversion = "0.2.0"\n')
+        with self.assertRaisesRegex(sbom.SbomError, "without VENDORED.md"):
+            self.build("native")
+
     def test_a_crate_that_is_gone_is_an_error(self):
         with mock.patch.dict(sbom.PRODUCTS["native"], {"cargo": [("rust/Cargo.lock", ["renamed"])]}):
             with self.assertRaisesRegex(sbom.SbomError, "no workspace crate 'renamed'"):

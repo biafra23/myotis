@@ -18,6 +18,7 @@
 //! Golden vectors: the known-answer encodings of eth2swarm's `layout.rs` and the file
 //! references Bee 2.8.3 returned, in the tests.
 
+pub mod client;
 pub mod cover;
 pub mod lookup;
 pub mod records;
