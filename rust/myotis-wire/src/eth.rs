@@ -386,6 +386,12 @@ pub struct BlockBody {
     pub withdrawals: Option<RawList>,
 }
 
+/// The most withdrawals a body may carry: `MAX_WITHDRAWALS_PER_PAYLOAD` is 16 on
+/// mainnet and Sepolia and 8 on Gnosis, so no valid body exceeds 16. A body with
+/// more is refused before its withdrawals are copied or hashed into a trie, as
+/// transactions are bounded by gas (#454).
+pub const MAX_WITHDRAWALS_PER_BODY: usize = 16;
+
 /// keccak256 of the empty RLP list (`0xc0`): the `ommersHash` of every block
 /// without ommers, every post-Merge block among them.
 pub const EMPTY_OMMERS_HASH: [u8; 32] = [
@@ -418,10 +424,20 @@ pub fn decode_block_bodies(rlp_bytes: &[u8], requested: usize) -> Result<(u64, V
         if i >= kept(requested) {
             continue;
         }
+        if withdrawal_count > MAX_WITHDRAWALS_PER_BODY {
+            return Err(CoreError(format!(
+                "BlockBody: {withdrawal_count} withdrawals, more than {MAX_WITHDRAWALS_PER_BODY}"
+            )));
+        }
         let withdrawals = match withdrawals_field {
             Some(w) => {
                 let mut list = RawList::with_capacity(w.raw().len());
                 for item in w.as_list()? {
+                    // A withdrawal is an RLP list; a byte string wrapping one would
+                    // hash to the same trie leaf, so it is refused here.
+                    if !item.is_list() {
+                        return Err(CoreError("BlockBody: a withdrawal that is not a list".to_string()));
+                    }
                     list.push_item(item);
                 }
                 Some(list)
@@ -1438,6 +1454,36 @@ mod tests {
         assert_eq!(err.0, "BlockBody: expected >= 2 fields, got 1");
         let surplus = response(4, &[body(0, None), body(0, None), short, vec![0x80]]);
         assert!(decode_block_bodies(&surplus, 1).is_err());
+    }
+
+    #[test]
+    fn block_bodies_keep_the_ommers_hash_and_bounded_withdrawals() {
+        let body = |uncles: Vec<Item>, withdrawals: Option<Vec<Item>>| {
+            let mut fields = vec![Item::List(vec![]), Item::List(uncles)];
+            if let Some(w) = withdrawals {
+                fields.push(Item::List(w));
+            }
+            rlp::encode(&Item::List(fields))
+        };
+        let w = || Item::List(vec![Item::Bytes(vec![1]), Item::Bytes(vec![2])]);
+        let uncle = Item::List(vec![Item::Bytes(vec![7])]);
+        let uncle_rlp = rlp::encode(&Item::List(vec![uncle.clone()]));
+        let (_, bodies) =
+            decode_block_bodies(&response(1, &[body(vec![uncle], Some(vec![w(), w()])), body(vec![], None)]), 2)
+                .unwrap();
+        assert_eq!(bodies[0].ommers_hash, keccak256(&uncle_rlp));
+        assert_eq!(bodies[0].withdrawals.as_ref().map(|l| l.iter().len()), Some(2));
+        assert_eq!(bodies[0].withdrawals.as_ref().unwrap().iter().next(), Some(&rlp::encode(&w())[..]));
+        assert_eq!(bodies[1].ommers_hash, super::EMPTY_OMMERS_HASH);
+        assert_eq!(bodies[1].withdrawals, None);
+
+        // More than any network's MAX_WITHDRAWALS_PER_PAYLOAD is refused before the copy.
+        let many = body(vec![], Some((0..17).map(|_| w()).collect()));
+        let err = decode_block_bodies(&response(1, &[many]), 1).unwrap_err();
+        assert!(err.0.contains("17 withdrawals"), "{}", err.0);
+        // A withdrawal must be a list, not a byte string wrapping one.
+        let wrapped = body(vec![], Some(vec![Item::Bytes(rlp::encode(&w()))]));
+        assert!(decode_block_bodies(&response(1, &[wrapped]), 1).is_err());
     }
 
     #[test]

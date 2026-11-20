@@ -8333,14 +8333,17 @@ impl ElReader {
     }
 
     /// The snap pool's peers a read of block `target` anchored at `top` asks:
-    /// all of them, except at a deep anchor (`el::deep`), where a peer that
-    /// announces it cannot serve the block (eth/69 `earliestBlock` above it)
-    /// is left out and the rest are ordered by [`deep_read_peers`]. None left
-    /// is a retryable failure: a peer holding the block may join the pool.
+    /// all of them in the pool's order, except at a deep anchor (`el::deep`),
+    /// where [`deep_read_peers`] orders them by what they announce and, for a
+    /// read that fetches bodies or receipts (`bodies`), leaves out the peers
+    /// whose eth/69 `earliestBlock` is above the block. None left fails this
+    /// read (`Fatal`, not retried here); the host answers it with the
+    /// retryable -32000, since a peer holding the block may join the pool.
     async fn read_peers_for(
         &self,
         target: u64,
         top: WindowTop,
+        bodies: bool,
     ) -> Result<Vec<std::sync::Arc<ManagedPeer>>, PoolReadError> {
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
@@ -8350,7 +8353,7 @@ impl ElReader {
             return Ok(peers);
         }
         let total = peers.len();
-        let peers = deep_read_peers(peers, target, |p| p.earliest_block());
+        let peers = deep_read_peers(peers, target, !bodies, |p| p.earliest_block());
         if peers.is_empty() {
             return Err(PoolReadError::Fatal(format!(
                 "none of the {total} snap peer(s) announces block {target} \
@@ -8369,7 +8372,7 @@ impl ElReader {
         top: WindowTop,
     ) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, PoolReadError> {
         let span = top.number().saturating_sub(from);
-        let peers = self.read_peers_for(from, top).await?;
+        let peers = self.read_peers_for(from, top, false).await?;
         let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
         let out = hedged_race(
             &peers,
@@ -8460,7 +8463,9 @@ impl ElReader {
         // serve is eth-only (headers + bodies), so this is a superset of what's
         // needed. If eth peers exist but none negotiated snap, this fails closed
         // (Err → -32000), never a false "null". Reputation reuses the snap sinks.
-        let peers = self.read_peers_for(target_num, top).await?;
+        let peers = self
+            .read_peers_for(target_num, top, matches!(depth, BlockDepth::Body { .. }))
+            .await?;
         // Each peer's coverage of the anchored head, sampled before the race
         // (see pool_race_verdict; consulted only for a head-anchored window).
         let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
@@ -10301,7 +10306,7 @@ impl ElReader {
             return Ok(None); // above the head, not final: future/unknown → eth null
         };
         let (top, span) = self.deep_window_top(target_num, top).await?;
-        let peers = self.read_peers_for(target_num, top).await?;
+        let peers = self.read_peers_for(target_num, top, true).await?;
         let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
         // Hedged like get_block_by_number_inner, on the same span-scaled delay
         // and the same deferred-strike settle. It matters at least as much here:
@@ -10912,24 +10917,36 @@ fn choose_window_top(
     }
 }
 
-/// Pure: the peers a deep read of `target` asks, in order. A peer whose
-/// announced `earliestBlock` is above `target` is left out (it said it does not
-/// hold the block); peers that announce the block come first, the oldest
-/// history first, then eth/68 peers, which announce no range. Archive peers
-/// are a minority of the pool (7 of 18 in the survey of
+/// Pure: the peers a deep read of `target` asks, in order: the peers that
+/// announce the block (eth/69 `earliestBlock` at or below it) first, then
+/// eth/68 peers, which announce no range, then (only when `keep_pruned`) the
+/// peers that announce a later `earliestBlock`. Within each group the pool's
+/// own ladder order stays (proven servers before unproven, benched last).
+/// `earliestBlock` is about bodies and receipts, so a body or receipts read
+/// leaves the pruned peers out, while a header read (`keep_pruned`) only asks
+/// them last: a pruned peer may still serve old headers. Archive peers are a
+/// minority of the pool (7 of 18 in the survey of
 /// docs/ideas/deep-block-verification.md), so this is what makes a deep body
 /// a matter of asking the right peer.
-fn deep_read_peers<T>(peers: Vec<T>, target: u64, earliest: impl Fn(&T) -> Option<u64>) -> Vec<T> {
-    let mut kept: Vec<(u64, T)> = peers
-        .into_iter()
-        .filter_map(|p| match earliest(&p) {
-            Some(e) if e > target => None,
-            Some(e) => Some((e, p)),
-            None => Some((u64::MAX, p)),
-        })
-        .collect();
-    kept.sort_by_key(|(e, _)| *e);
-    kept.into_iter().map(|(_, p)| p).collect()
+fn deep_read_peers<T>(
+    peers: Vec<T>,
+    target: u64,
+    keep_pruned: bool,
+    earliest: impl Fn(&T) -> Option<u64>,
+) -> Vec<T> {
+    let (mut announcing, mut silent, mut pruned) = (Vec::new(), Vec::new(), Vec::new());
+    for p in peers {
+        match earliest(&p) {
+            Some(e) if e <= target => announcing.push(p),
+            None => silent.push(p),
+            Some(_) => pruned.push(p),
+        }
+    }
+    announcing.append(&mut silent);
+    if keep_pruned {
+        announcing.append(&mut pruned);
+    }
+    announcing
 }
 
 /// How many more requests a deep window may take from one peer after its
@@ -14201,14 +14218,20 @@ mod tests {
 
     #[test]
     fn deep_reads_ask_the_peers_that_hold_the_block() {
+        // In the pool's ladder order: the pruned peer is its best-ranked one.
         let peers = vec![("pruned", Some(25_000_000)), ("eth68", None), ("merge", Some(15_537_394)), ("archive", Some(0))];
-        let order = |target| -> Vec<&str> {
-            deep_read_peers(peers.clone(), target, |p| p.1).into_iter().map(|p| p.0).collect()
+        let order = |target, keep_pruned| -> Vec<&str> {
+            deep_read_peers(peers.clone(), target, keep_pruned, |p| p.1).into_iter().map(|p| p.0).collect()
         };
-        assert_eq!(order(1_000_000), vec!["archive", "eth68"]);
-        assert_eq!(order(20_000_000), vec!["archive", "merge", "eth68"]);
-        assert_eq!(order(26_000_000), vec!["archive", "merge", "pruned", "eth68"]);
-        assert!(deep_read_peers(vec![("pruned", Some(5))], 4, |p: &(&str, Option<u64>)| p.1).is_empty());
+        // Bodies: only the peers that announce the block, in ladder order, then eth/68.
+        assert_eq!(order(1_000_000, false), vec!["archive", "eth68"]);
+        assert_eq!(order(20_000_000, false), vec!["merge", "archive", "eth68"]);
+        assert_eq!(order(26_000_000, false), vec!["pruned", "merge", "archive", "eth68"]);
+        // Headers: everyone, the pruned peers last.
+        assert_eq!(order(1_000_000, true), vec!["archive", "eth68", "pruned", "merge"]);
+        let one = |p: &(&str, Option<u64>)| p.1;
+        assert!(deep_read_peers(vec![("pruned", Some(5))], 4, false, one).is_empty());
+        assert_eq!(deep_read_peers(vec![("pruned", Some(5))], 4, true, one).len(), 1);
     }
 
     #[test]
