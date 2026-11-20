@@ -610,6 +610,10 @@ pub struct VerifiedBlock {
     /// what `eth_getRawTransactionByBlock*AndIndex` serves (#715). Empty for a
     /// header-only read. Kept in the wire's compact list, as the body arrived.
     pub raw_transactions: crate::el::eth::messages::RawList,
+    /// The ommer (uncle) headers as they arrived, each an RLP list, checked against
+    /// `ommersHash`: what `uncles` renders (their hashes). Empty since the Merge and for a
+    /// header-only read.
+    pub ommers: crate::el::eth::messages::RawList,
 }
 
 /// What a verified block read fetches beyond its anchored header window.
@@ -8549,6 +8553,7 @@ impl ElReader {
                     tx_hashes: Vec::new(),
                     full_transactions: None,
                     raw_transactions: crate::el::eth::messages::RawList::new(),
+                    ommers: crate::el::eth::messages::RawList::new(),
                 });
             }
             BlockDepth::Body { full_transactions } => full_transactions,
@@ -8593,6 +8598,7 @@ impl ElReader {
             tx_hashes,
             full_transactions: full,
             raw_transactions: body.transactions,
+            ommers: body.ommers,
         })
     }
 
@@ -11133,7 +11139,9 @@ fn build_block_receipts(
 const MIN_GAS_PER_TX: u64 = 1_000;
 
 /// The body half of the per-block trust gate: the fetched transactions must
-/// rebuild the (already anchored) header's `transactionsRoot`. One
+/// rebuild the (already anchored) header's `transactionsRoot`, the ommers list
+/// must hash to its `ommersHash`, and from Shanghai on the withdrawals must
+/// rebuild its `withdrawalsRoot` (the body's shape must match the header's). One
 /// implementation for every consumer (block serve, fee estimate, tx scan,
 /// fee history), so a hardening never has to be applied in four places.
 /// A body with more transactions than the header's gas can pay for fails
@@ -13309,7 +13317,7 @@ mod tests {
         }
 
         fn empty_block(with_body: bool) -> Fetched {
-            let body = BlockBody { transactions: RawList::new(), uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None };
+            let body = BlockBody { transactions: RawList::new(), uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() };
             (with_body.then(|| Ok(vec![body])), Ok(Vec::new()))
         }
 
@@ -13361,7 +13369,7 @@ mod tests {
                 ..Default::default()
             };
             let vh = VerifiedHeader { hash: keccak256(&number.to_be_bytes()), raw_rlp: Vec::new(), header };
-            (vh, BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None }, BlockReceipts::Canonical(receipts))
+            (vh, BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() }, BlockReceipts::Canonical(receipts))
         }
 
         fn serve(number: u64, tip: u128, with_body: bool) -> Fetched {
@@ -13683,7 +13691,7 @@ mod tests {
             // not rebuild it is the peer's.
             let mut transactions = RawList::new();
             transactions.push(&[0x7f, 0xc0]);
-            let body = BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None };
+            let body = BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() };
             let mut header = BlockHeader { number: 10, gas_used: 21_000, ..Default::default() };
             header.transactions_root = triehash::ordered_trie_root(body.transactions.iter());
             let err = strict_body_tips(&header, vec![body.clone()]).unwrap_err();
@@ -13760,7 +13768,7 @@ mod tests {
                         Serve::After(delay) => {
                             tokio::time::sleep(delay).await;
                             // `Default` builds the empty list whatever type holds it.
-                            let empty = BlockBody { transactions: Default::default(), uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None };
+                            let empty = BlockBody { transactions: Default::default(), uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() };
                             Ok(vec![empty])
                         }
                         Serve::NoBody => Ok(Vec::new()),
@@ -14304,6 +14312,7 @@ mod tests {
             withdrawal_count: 0,
             ommers_hash,
             withdrawals,
+            ommers: Default::default(),
         };
         assert!(verify_body_transactions(&header, &body(EMPTY_OMMERS_HASH, Some(withdrawals.clone()))).is_ok());
         let err = verify_body_transactions(&header, &body([7; 32], Some(withdrawals.clone()))).unwrap_err();
@@ -14325,7 +14334,7 @@ mod tests {
             for _ in 0..n {
                 transactions.push(&[0x01]);
             }
-            BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None }
+            BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() }
         };
         let mut header = BlockHeader { number: 7, gas_used: 3 * MIN_GAS_PER_TX, ..Default::default() };
         header.transactions_root = triehash::ordered_trie_root(body(3).transactions.iter());
@@ -16734,7 +16743,7 @@ mod candidate_chunk_tests {
         Block {
             vh: VerifiedHeader { hash: [number as u8; 32], raw_rlp: Vec::new(), header },
             receipts: BlockReceipts::Canonical(receipts),
-            body: BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None },
+            body: BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() },
         }
     }
 

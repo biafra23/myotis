@@ -384,7 +384,14 @@ pub struct BlockBody {
     pub withdrawal_count: usize,
     pub ommers_hash: [u8; 32],
     pub withdrawals: Option<RawList>,
+    /// The ommer (uncle) headers as they arrived, each an RLP list: what `ommersHash`
+    /// commits to, at most [`MAX_OMMERS_PER_BODY`].
+    pub ommers: RawList,
 }
+
+/// The most ommers a body may carry: Ethash allowed two per block, and no block since the
+/// Merge has any. A body with more is refused before they are copied.
+pub const MAX_OMMERS_PER_BODY: usize = 2;
 
 /// The most withdrawals a body may carry: `MAX_WITHDRAWALS_PER_PAYLOAD` is 16 on
 /// mainnet and Sepolia and 8 on Gnosis, so no valid body exceeds 16. A body with
@@ -424,6 +431,16 @@ pub fn decode_block_bodies(rlp_bytes: &[u8], requested: usize) -> Result<(u64, V
         if i >= kept(requested) {
             continue;
         }
+        if uncle_count > MAX_OMMERS_PER_BODY {
+            return Err(CoreError(format!("BlockBody: {uncle_count} ommers, more than {MAX_OMMERS_PER_BODY}")));
+        }
+        let mut ommers = RawList::with_capacity(uncles.raw().len());
+        for item in uncles.as_list()? {
+            if !item.is_list() {
+                return Err(CoreError("BlockBody: an ommer that is not a header list".to_string()));
+            }
+            ommers.push_item(item);
+        }
         if withdrawal_count > MAX_WITHDRAWALS_PER_BODY {
             return Err(CoreError(format!(
                 "BlockBody: {withdrawal_count} withdrawals, more than {MAX_WITHDRAWALS_PER_BODY}"
@@ -457,6 +474,7 @@ pub fn decode_block_bodies(rlp_bytes: &[u8], requested: usize) -> Result<(u64, V
             withdrawal_count,
             ommers_hash: keccak256(uncles.raw()),
             withdrawals,
+            ommers,
         });
     }
     Ok((request_id, bodies))
@@ -1476,6 +1494,11 @@ mod tests {
         assert_eq!(bodies[0].withdrawals.as_ref().unwrap().iter().next(), Some(&rlp::encode(&w())[..]));
         assert_eq!(bodies[1].ommers_hash, super::EMPTY_OMMERS_HASH);
         assert_eq!(bodies[1].withdrawals, None);
+        assert_eq!(bodies[0].ommers.iter().collect::<Vec<_>>(), vec![&rlp::encode(&Item::List(vec![Item::Bytes(vec![7])]))[..]]);
+        assert_eq!(bodies[1].ommers.iter().len(), 0);
+        // More than Ethash's two ommers is refused.
+        let three = body(vec![Item::List(vec![]); 3], None);
+        assert!(decode_block_bodies(&response(1, &[three]), 1).unwrap_err().0.contains("3 ommers"));
 
         // More than any network's MAX_WITHDRAWALS_PER_PAYLOAD is refused before the copy.
         let many = body(vec![], Some((0..17).map(|_| w()).collect()));

@@ -434,7 +434,13 @@ impl ManagedPeer {
             },
         )));
 
-        let earliest = Arc::new(AtomicU64::new(peer_status.earliest_block.unwrap_or(EARLIEST_UNKNOWN)));
+        // The same meaning as a BlockRangeUpdate's: u64::MAX reads as pruned, not as "not
+        // announced", and a range that cannot be true (earliest above latest) is not taken.
+        let announced = match (peer_status.earliest_block, peer_status.latest_block) {
+            (Some(e), Some(l)) if e > l => None,
+            (e, _) => e,
+        };
+        let earliest = Arc::new(AtomicU64::new(announced.map_or(EARLIEST_UNKNOWN, |e| e.min(EARLIEST_UNKNOWN - 1))));
         let last_response: SharedLastResponse = Arc::new(std::sync::Mutex::new(None));
         let reader_task = tokio::spawn(read_loop(
             reader,
