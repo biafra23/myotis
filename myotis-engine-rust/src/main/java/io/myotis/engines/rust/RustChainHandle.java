@@ -1637,6 +1637,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                     "malformed blockReceipts JSON from the Rust engine: " + e.getMessage(), e);
         }
         if (v.isArray()) return json; // the verified receipts array
+        if (v.isObject() && permanentRefusal(v.asObject())) return json; // for the router
         if (v.isObject()) {
             var error = v.asObject().get("error");
             if (error != null && !error.isNull()) {
@@ -1646,9 +1647,21 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         throw new EngineException("blockReceipts JSON is neither an array nor an error object");
     }
 
-    /** Package-private test seam: native block payload → block JSON | "null" | throw. */
+    /** Package-private test seam: native block payload → block JSON | "null" | the
+     *  permanent {@code {"error","code":-32602}} envelope (passed through for the router,
+     *  as {@link #rawTransactionByBlockJson}'s is: the checkpoint table's alarm, #899) |
+     *  throw. */
     static String blockJsonOrThrow(String json) {
-        return jsonObjectOrThrow(json, "block");
+        return jsonObjectOrThrow(json, "block", true);
+    }
+
+    /** Whether {@code o} is the engine's permanent refusal {@code {"error","code":-32602}},
+     *  which the router answers with -32602 instead of the retryable -32000. */
+    private static boolean permanentRefusal(JsonObject o) {
+        var error = o.get("error");
+        var code = o.get("code");
+        return o.size() == 2 && error != null && !error.isNull()
+                && code != null && code.isNumber() && code.asInt() == -32602;
     }
 
     /** Package-private test seam: native tx payload → tx JSON | "null" | throw. */
@@ -1665,6 +1678,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      *  {@code "null"} literal (a VERIFIED eth-null) passes through, an {@code error}
      *  object / blank / malformed payload throws {@link EngineException}. */
     private static String jsonObjectOrThrow(String json, String what) {
+        return jsonObjectOrThrow(json, what, false);
+    }
+
+    /** {@link #jsonObjectOrThrow(String, String)}, passing the permanent refusal
+     *  envelope through when {@code passRefusal}. */
+    private static String jsonObjectOrThrow(String json, String what, boolean passRefusal) {
         if (json == null || json.isBlank()) {
             throw new EngineException(
                     "blank " + what + " JSON from the Rust engine (native failure?)");
@@ -1679,6 +1698,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
             throw new EngineException(
                     "malformed " + what + " JSON from the Rust engine: " + e.getMessage(), e);
         }
+        if (passRefusal && permanentRefusal(o)) return json;
         var error = o.get("error");
         if (error != null && !error.isNull()) {
             throw new EngineException(error.isString() ? error.asString() : error.toString());

@@ -2519,10 +2519,7 @@ impl ElReader {
         };
         // The deep anchors' state sits beside the peer cache, suffixed like it
         // (`peers-sepolia.cache` → `deep-anchors-sepolia.txt`).
-        let deep_store = cfg.cache_path.as_deref().and_then(|p| {
-            let suffix = p.file_stem()?.to_str()?.strip_prefix("peers")?.to_string();
-            Some(p.with_file_name(format!("deep-anchors{suffix}.txt")))
-        });
+        let deep_store = cfg.cache_path.as_deref().and_then(super::deep::store_path);
         let local_pubkey = key.public_key_bytes();
         let sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch = Arc::new(
             std::sync::Mutex::new(crate::el::sent_tx::SentTxTracker::new()),
@@ -8288,6 +8285,8 @@ impl ElReader {
         let WindowTop::Finalized { number, hash } = top else {
             return Err(beyond());
         };
+        // A re-anchor (STALE_ANCHOR) voids what was linked under the old anchor.
+        self.deep.observe_reanchors(self.anchor.reanchors());
         loop {
             match self.deep.plan(target_num, (number, hash)) {
                 None => return Err(beyond()),
@@ -8387,6 +8386,7 @@ impl ElReader {
             |_: &Vec<crate::el::eth::messages::VerifiedHeader>| true,
         )
         .await;
+        let out = excuse_deep_misses(out, top);
         let window = self
             .settle_pool_race(
                 &peers,
@@ -8494,6 +8494,7 @@ impl ElReader {
             |_: &BlockAttempt| true,
         )
         .await;
+        let out = excuse_deep_misses(out, top);
         match self
             .settle_pool_race(
                 &peers,
@@ -10328,6 +10329,7 @@ impl ElReader {
             |_: &([u8; 32], Vec<VerifiedReceipt>)| true,
         )
         .await;
+        let out = excuse_deep_misses(out, top);
         self.settle_pool_race(
             &peers,
             &coverage,
@@ -10953,6 +10955,32 @@ fn deep_read_peers<T>(
         announcing.append(&mut pruned);
     }
     announcing
+}
+
+/// Pure: whether a deep read's failure is the peer not holding the block (it pruned the
+/// history), not a fault: a short header window, no body, no receipts.
+fn deep_unavailable(error: &str) -> bool {
+    error.contains("headers, expected")
+        || error.contains("peer returned no block body")
+        || error.contains("peer returned no receipts")
+}
+
+/// A deep read's race with its availability misses excused (`deep_unavailable`): for a
+/// block below the window a miss is the normal answer of a peer that pruned history, not a
+/// lagging or lying one, so it earns no strike, bench or eviction. Proof failures (not
+/// hash-linked, over-served, a root mismatch) and silent peers keep theirs. Other tops
+/// pass through unchanged.
+fn excuse_deep_misses<T>(mut out: RaceOutcome<T>, top: WindowTop) -> RaceOutcome<T> {
+    if !matches!(top, WindowTop::Deep { .. }) {
+        return out;
+    }
+    let excused = |i: &usize| {
+        let mut errors = out.errors.iter().filter(|(j, _)| j == i).peekable();
+        errors.peek().is_some() && errors.all(|(_, e)| deep_unavailable(e))
+    };
+    let missed: Vec<usize> = out.missed.iter().copied().filter(|i| !excused(i)).collect();
+    out.missed = missed;
+    out
 }
 
 /// How many more requests a deep window may take from one peer after its
@@ -12330,6 +12358,29 @@ fn decode_ccip_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deep_miss_for_pruned_history_earns_no_strike() {
+        let out = || RaceOutcome::<()> {
+            accepted: None,
+            fallback: None,
+            missed: vec![0, 1, 2, 3],
+            outpaced: vec![],
+            errors: vec![
+                (0, "peer returned 0 headers, expected 449".to_string()),
+                (1, "peer returned no block body".to_string()),
+                (2, "header window is not hash-linked".to_string()),
+                (3, "peer returned no receipts".to_string()),
+                (3, "request timed out".to_string()),
+            ],
+        };
+        let deep = WindowTop::Deep { number: 2048, hash: [1; 32] };
+        // Pruned history is excused; a proof failure and a timeout keep their strikes.
+        assert_eq!(excuse_deep_misses(out(), deep).missed, vec![2, 3]);
+        // Any other top: unchanged.
+        let fin = WindowTop::Finalized { number: 2048, hash: [1; 32] };
+        assert_eq!(excuse_deep_misses(out(), fin).missed, vec![0, 1, 2, 3]);
+    }
     #[test]
     fn backfill_yields_only_while_head_follow_can_close_the_gap() {
         use super::{backfill_should_yield, BACKFILL_YIELD_MAX_TICKS};

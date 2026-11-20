@@ -568,6 +568,13 @@ fn handle_using(engine: &EngineState, snapshot_path: Option<&std::path::Path>) -
 
 /// `""` for mainnet, `-<net>` otherwise — the per-network file-name suffix
 /// shared with the Java hosts.
+/// The handle's deep-anchor state file (`myotis_net::el::deep`): beside its EL peer cache,
+/// under the host's dataDir, suffixed like it. `None` without a dataDir.
+fn deep_store_path(config: &ChainConfig) -> Option<std::path::PathBuf> {
+    let dir = config.snapshot_path.as_deref()?.parent()?;
+    Some(dir.join(format!("deep-anchors{}.txt", persistence_suffix(config))))
+}
+
 fn persistence_suffix(config: &ChainConfig) -> String {
     if config.name == "mainnet" {
         String::new()
@@ -1034,10 +1041,19 @@ pub fn status_json(handle: i64) -> String {
         Paused(&'static str, SyncStatus, u64),
         Unknown,
     }
+    // Where the handle's deep-anchor state is kept: the checkpoint table's alarm is read
+    // from it while no reader runs (a paused handle), so it does not come and go.
+    let mut deep_store: Option<std::path::PathBuf> = None;
     let snap = {
         let map = match engine.handles.lock() {
             Ok(m) => m,
             Err(_) => return "{}".to_string(),
+        };
+        deep_store = match map.get(&handle) {
+            Some(ChainEntry::Created(c)) | Some(ChainEntry::Running(c, _, _)) | Some(ChainEntry::Paused(c, _, _)) => {
+                deep_store_path(c)
+            }
+            None => None,
         };
         match map.get(&handle) {
             Some(ChainEntry::Created(config)) => {
@@ -1071,6 +1087,7 @@ pub fn status_json(handle: i64) -> String {
         .and_then(|m| m.get(&handle).cloned())
         .and_then(|w| w.advisory());
     let upgrade_advisory = cl_fork_watch::merge_advisories(el_advisory, cl_advisory);
+    let stored_alarm = deep_store.as_deref().and_then(myotis_net::el::deep::stored_alarm);
     // Data usage in every lifecycle state: the day's figures outlive a pause.
     let usage = usage_ledger(engine, handle).map(|l| l.tick(false));
     let metering = crate::usage::metering();
@@ -1080,7 +1097,7 @@ pub fn status_json(handle: i64) -> String {
             network,
             None,
             wall,
-            ElCounts { upgrade_advisory, usage, metering, ..ElCounts::default() },
+            ElCounts { upgrade_advisory, usage, metering, checkpoint_alarm: stored_alarm.clone(), ..ElCounts::default() },
         ),
         Snap::Running(network, status, wall, reader) => {
             let el = match reader {
@@ -1106,13 +1123,13 @@ pub fn status_json(handle: i64) -> String {
                             body_requests_served: b_served,
                             el_hunting: r.el_hunting(),
                             upgrade_advisory,
-                            checkpoint_alarm: r.checkpoint_alarm(),
+                            checkpoint_alarm: r.checkpoint_alarm().or_else(|| stored_alarm.clone()),
                             usage,
                             metering,
                         }
                     }
                 }),
-                None => ElCounts { upgrade_advisory, usage, metering, ..ElCounts::default() },
+                None => ElCounts { upgrade_advisory, usage, metering, checkpoint_alarm: stored_alarm.clone(), ..ElCounts::default() },
             };
             status_object(Lifecycle::Running, network, Some(status), wall, el)
         }
@@ -1123,7 +1140,7 @@ pub fn status_json(handle: i64) -> String {
             network,
             Some(frozen),
             wall,
-            ElCounts { upgrade_advisory, usage, metering, ..ElCounts::default() },
+            ElCounts { upgrade_advisory, usage, metering, checkpoint_alarm: stored_alarm.clone(), ..ElCounts::default() },
         ),
         Snap::Unknown => "{}".to_string(),
     }
