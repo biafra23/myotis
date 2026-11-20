@@ -4,8 +4,8 @@ Status: **analysis and measurements — nothing here is built.** The measurement
 were taken on 2026-11-16 against mainnet with `myotis-rpcd`; the deep-block
 probe behind §[Are deep blocks available?](#are-deep-blocks-available) was a
 local, unverified throwaway build that was never committed. Whether a bundled
-checkpoint table becomes a trust anchor is the owner's decision
-([§Open decisions](#open-decisions)).
+checkpoint table becomes a trust anchor was the owner's decision
+([§Open decisions](#open-decisions)): decided on 2026-11-20, bundled.
 
 ## TL;DR
 
@@ -24,10 +24,15 @@ checkpoint table becomes a trust anchor is the owner's decision
   which ANY block verifies with one `GetBlockHeaders` request of at most 1024
   headers (about 0.66 MB at most, 0.33 MB on average) plus its body. No proof format, no
   total difficulty, nothing devp2p does not already serve.
-- **The table is a new trust anchor.** It must be derived by a verified walk
-  from a beacon-attested block down to the genesis hash, committed as a pinned
-  asset, and re-derivable in CI. Adding it changes the trust model, which is
-  the owner's call.
+- **The table is a new trust anchor.** Proposed here: derived by a verified
+  walk from a beacon-attested block down to the genesis hash, committed as a
+  pinned asset, and re-derivable in CI. Adding it changed the trust model, the
+  owner's call: **decided 2026-11-20** (bundled). For the first mainnet table
+  the owner ruled the build's own checks enough: a walk from the source node's
+  finalized block to the genesis hash, its top cross-checked against a second
+  client implementation, then checked again by the running node's walk. A
+  beacon-attested start and a CI re-derivation remain the target for later
+  tables, not a requirement of the rule (`.claude/agent/data-sources.md`).
 
 ## Today
 
@@ -191,8 +196,10 @@ estimate, not a measurement.
 
 ### Building the table
 
-- **The first build** walks every header from a beacon-attested finalized
-  block down to genesis (~14.8 GB for mainnet, once). The walk must end exactly
+- **The first build** walks every header from a finalized block down to
+  genesis (~14.8 GB for mainnet, once). The first mainnet table started from
+  its source node's finalized block (owner's ruling, 2026-11-20, above); a
+  beacon-attested start is the target for later builds. The walk must end exactly
   at the network's genesis hash, an end-to-end check of the whole chain.
 - **Each release** only extends it over the blocks since the previous release
   (~4 MB of headers a day).
@@ -270,10 +277,13 @@ For the owner:
 
 1. **The checkpoint table as a trust anchor.** It adds a third embedded anchor
    next to the sync-committee checkpoint and the historical accumulators, and
-   it is only as good as the walk that produced it.
-2. **k**, and whether the table ships in the mobile apps (about 2.7 MB for
-   mainnet, Gnosis and Sepolia at k = 1024, plus the gap walks above) or only
-   in the daemon, the desktop app and `myotis-rpcd`.
+   it is only as good as the walk that produced it. **Decided (owner,
+   2026-11-20): bundled, k = 1024; the rule is in `.claude/agent/data-sources.md`
+   (Trust).**
+2. **k, and whether the table ships in the mobile apps.** **Decided (owner,
+   2026-11-20): k = 1024, and the table ships in every build of the Rust
+   engine, the mobile apps included** (about 2.7 MB for mainnet, Gnosis and
+   Sepolia at k = 1024, plus the gap walks above).
 3. **Pre-Merge bodies.** Served by archive peers only; whether that is enough
    to offer pre-Merge reads at all, or whether they stay refused.
 4. **The `-32000` → `-32602` fix** for block and receipt reads below the

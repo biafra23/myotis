@@ -4,9 +4,11 @@ names for the areas this diff touches (CLAUDE.md is the summary, they
 are the full rules), and hold the diff against the repo's
 standing rules, especially:
 - Trust model: peer data is NEVER trusted — everything must be
-  cryptographically verified (sync-committee signatures + the
-  embedded accumulators are the only trust anchors). Flag any new
-  code path that returns unverified data without saying so.
+  cryptographically verified (sync-committee signatures, the
+  embedded accumulators and the bundled checkpoint table are the only
+  trust anchors; the table's scope is in .claude/agent/data-sources.md,
+  Trust). Flag any new code path that returns unverified data without
+  saying so.
 - Data sources: devp2p/libp2p only in production; HTTP to a local
   client is debugging-only. No trusted-RPC fallbacks.
 - API boundary: hosts talk ONLY to :myotis-api — engine internals
