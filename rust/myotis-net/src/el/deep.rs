@@ -20,7 +20,8 @@
 //! Finality is never reorganized, so a hash linked from a finalized block stays canonical.
 //! The linked hashes, the check of the top and the alarm are kept beside the table, in a
 //! small file under the data dir (`deep-anchors[-net].txt`, keyed by the table's pin, so a
-//! new table starts afresh), and survive a restart. A running node never writes into the
+//! new table starts afresh), and survive a restart. A reader without a data dir keeps them in
+//! memory only, and says so in its log. A running node never writes into the
 //! bundled table. The fetching and verifying of a window is the reader's.
 
 use std::collections::BTreeMap;
@@ -91,6 +92,9 @@ impl DeepAnchors {
         if let Some(alarm) = &state.alarm {
             tracing::error!(alarm = %alarm, "deep block reads refused (kept from an earlier run)");
         }
+        if table.is_some() && store.is_none() {
+            tracing::warn!(chain_id, "no data dir: the deep anchors' state (alarm included) is kept in memory only");
+        }
         Self { table, store: store.filter(|_| table.is_some()), state: Mutex::new(state), ..Self::default() }
     }
 
@@ -115,21 +119,28 @@ impl DeepAnchors {
         if let Some((number, hash)) = table.anchor_at_or_above(n) {
             return Some(Plan::Anchor { number, hash });
         }
-        // The gap: the lowest linked hash at or above n, or the finalized block itself.
-        let above = state
-            .hashes
-            .range(n..)
-            .next()
-            .map(|(k, v)| (*k, *v))
-            .filter(|(k, _)| *k <= fin.0)
-            .unwrap_or(fin);
+        // The lowest linked hash at or above `from`, or the finalized block itself.
+        let lowest_from = |from: u64| {
+            state
+                .hashes
+                .range(from..)
+                .next()
+                .map(|(k, v)| (*k, *v))
+                .filter(|(k, _)| *k <= fin.0)
+                .unwrap_or(fin)
+        };
         let top = table.top().0;
+        // A read within K of the top closes the gap: walk down to the top first, so
+        // record_window checks it against the table. Each step records its bottom, which
+        // lowers the lowest linked hash above the top, until a window covers the top.
+        if n - top < K && !state.top_checked {
+            let low = lowest_from(top);
+            return Some(Plan::Walk { from: top.max(low.0.saturating_sub(K - 1)), top: low });
+        }
+        // The gap: each step records its bottom, which is above n, so it ends.
+        let above = lowest_from(n);
         Some(if above.0 - n >= K {
             Plan::Walk { from: above.0 - (K - 1), top: above }
-        } else if n - top < K && !state.top_checked {
-            // A read within K of the top closes the gap: the walk reaches the top, so
-            // record_window checks it against the table.
-            Plan::Walk { from: top.max(above.0.saturating_sub(K - 1)), top: above }
         } else {
             Plan::Anchor { number: above.0, hash: above.1 }
         })
@@ -140,10 +151,15 @@ impl DeepAnchors {
     /// `K`-th block and the bottom, and checks the table's top when the window covers it.
     /// Returns the alarm's message when this window raised it.
     pub(crate) fn record_window(&self, headers: &[(u64, [u8; 32])]) -> Option<String> {
-        let mut state = self.state.lock().ok()?;
-        let raised = self.record_locked(&mut state, headers);
-        if let (Some(table), Some(path)) = (&self.table, &self.store) {
-            if let Err(e) = save(path, &pin_key(table), &state) {
+        // Rendered under the lock, written after it: plan and alarm never wait on the disk.
+        let (raised, text) = {
+            let mut state = self.state.lock().ok()?;
+            let raised = self.record_locked(&mut state, headers);
+            let text = self.table.as_ref().map(|t| render_store(&pin_key(t), &state));
+            (raised, text)
+        };
+        if let (Some(text), Some(path)) = (text, &self.store) {
+            if let Err(e) = save(path, &text) {
                 tracing::warn!(path = %path.display(), error = %e, "deep anchors not saved");
             }
         }
@@ -240,9 +256,9 @@ fn render_store(key: &str, state: &Linked) -> String {
 }
 
 /// Written whole to a sibling and renamed over the file, so a crash leaves the old state.
-fn save(path: &std::path::Path, key: &str, state: &Linked) -> std::io::Result<()> {
+fn save(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("txt.tmp");
-    std::fs::write(&tmp, render_store(key, state))?;
+    std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)
 }
 
@@ -370,6 +386,41 @@ mod tests {
         let window: Vec<_> = (2977..=4000).map(|n| (n, h(n))).collect();
         d.record_window(&window);
         assert_eq!(d.plan(2200, fin), Some(Plan::Walk { from: 2100, top: (2977, h(2977)) }));
+    }
+
+    /// Drive plan + record_window to the end with a well-behaved chain, as the reader does.
+    fn drive(d: &DeepAnchors, n: u64, fin: (u64, [u8; 32])) -> (Plan, usize) {
+        for steps in 0..64 {
+            match d.plan(n, fin).unwrap() {
+                Plan::Walk { from, top } => {
+                    assert!(top.0 - from < K, "a walk is at most K headers");
+                    let w: Vec<_> = (from..=top.0)
+                        .map(|b| (b, if b == 2100 { [0x21; 32] } else if b == top.0 { top.1 } else { h(b) }))
+                        .collect();
+                    assert_eq!(d.record_window(&w), None);
+                }
+                done => return (done, steps),
+            }
+        }
+        panic!("the walk for {n} did not end");
+    }
+
+    #[test]
+    fn every_gap_read_ends_in_an_anchor() {
+        // The review's case: n = 3100 is within K of the top 2100, finality at 3500. The
+        // first window [2477 ..= 3500] holds nothing at or above 3100 but the top of it.
+        let d = DeepAnchors::with_table(table());
+        let (plan, steps) = drive(&d, 3100, (3500, h(3500)));
+        assert_eq!(plan, Plan::Anchor { number: 3500, hash: h(3500) });
+        assert_eq!(steps, 2);
+        // Every block of the gap, on fresh state, far and near the top.
+        for n in (2101..9000).step_by(37) {
+            let d = DeepAnchors::with_table(table());
+            let fin = (9000, h(9000));
+            let (plan, _) = drive(&d, n, fin);
+            let Plan::Anchor { number, .. } = plan else { panic!("{n}: {plan:?}") };
+            assert!(number >= n && number - n < K, "{n} → {number}");
+        }
     }
 
     #[test]

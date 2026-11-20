@@ -8297,6 +8297,17 @@ impl ElReader {
                     return Ok((WindowTop::Deep { number: a, hash: h }, a - target_num));
                 }
                 Some(Plan::Walk { from, top: (walk_num, walk_hash) }) => {
+                    // Held on a metered network, as the log-index backfill is
+                    // (docs/ideas/deep-block-verification.md, "What a running
+                    // node adds"): a gap walk can cost megabytes. Retryable:
+                    // it serves once the network is not metered.
+                    if device_metered() {
+                        return Err(PoolReadError::Fatal(format!(
+                            "block {target_num} is above the checkpoint table's top and \
+                             below the {BLOCK_LOOKBACK_MAX}-block window: the walk that \
+                             verifies it is held on a metered network"
+                        )));
+                    }
                     // One walk at a time: concurrent deep reads in the same
                     // gap wait for it and then plan again from what it linked.
                     let _walk = self.deep.walk_lock.lock().await;
@@ -8488,13 +8499,14 @@ impl ElReader {
         top: WindowTop,
         depth: BlockDepth,
     ) -> Result<VerifiedBlock, BlockFromError> {
-        // The contiguous forward window [target .. top], in one request. The
-        // caller's BLOCK_LOOKBACK_MAX (512) check bounds this to ~300 KB, within
-        // the eth response soft limit; a peer that caps its response below the
-        // window fails the anchored-window length check and is skipped (fails
-        // closed — the caller tries the next peer), so deep pins carry a slightly
-        // higher liveness risk than a batched fetch would. The common case
-        // (latest / a few blocks back) is one small response.
+        // The contiguous forward window [target .. top]. Anchored at the head or
+        // the finalized block it is one request, bounded by the caller's
+        // BLOCK_LOOKBACK_MAX (512) to ~300 KB, within the eth response soft
+        // limit; a peer that caps its response below it fails the length check
+        // and is skipped (fails closed — the caller tries the next peer). At a
+        // deep anchor (el::deep) it is up to 1024 headers (~0.66 MB), and
+        // fetch_anchored_window asks the same peer again past a response cap.
+        // The common case (latest / a few blocks back) is one small response.
         let window =
             fetch_anchored_window(peer, target_num, top).await.map_err(BlockFromError::Peer)?;
         let vh = &window[0];

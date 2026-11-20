@@ -27,6 +27,11 @@ const MAX_HEADER_CHAIN_GAP: i64 = 8192;
 /// side turns into an `EngineException` (distinct from a verification failure,
 /// which is a full result with `failReason` set).
 pub fn error_json(message: &str) -> String {
+    // The checkpoint table's alarm refuses for good (.claude/agent/data-sources.md,
+    // Trust): whichever read it reaches through, it is the permanent envelope.
+    if message.starts_with(myotis_net::el::deep::ALARM_PREFIX) {
+        return invalid_params_json(message);
+    }
     let mut obj = serde_json::Map::new();
     obj.insert("error".into(), message.into());
     serde_json::Value::Object(obj).to_string()
@@ -1651,6 +1656,11 @@ mod tests {
     fn error_json_shape() {
         let v: serde_json::Value = serde_json::from_str(&error_json("no snap peer")).unwrap();
         assert_eq!(v["error"], "no snap peer");
+        assert!(v.get("code").is_none(), "retryable: no code");
+        // The checkpoint table's alarm is permanent, whichever read it reaches through.
+        let alarm = format!("{} block 1 is not the top", myotis_net::el::deep::ALARM_PREFIX);
+        let v: serde_json::Value = serde_json::from_str(&error_json(&alarm)).unwrap();
+        assert_eq!(v["code"], INVALID_PARAMS);
     }
 
     #[test]

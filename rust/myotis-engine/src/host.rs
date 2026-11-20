@@ -3274,20 +3274,10 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions:
     {
         Ok(Some(block)) => eljson::block_json(&block),
         Ok(None) => "null".to_string(), // verified future/unknown block → eth null
-        Err(e) => block_read_error_json(&e),
+        Err(e) => eljson::error_json(&e),
     }
 }
 
-/// A block or receipts read's failure as its envelope: the checkpoint table's
-/// alarm (`myotis_net::el::deep::ALARM_PREFIX`) refuses for good, so it is the
-/// permanent `{"error","code":-32602}`; anything else is the retryable `{"error"}`.
-fn block_read_error_json(e: &str) -> String {
-    if e.starts_with(myotis_net::el::deep::ALARM_PREFIX) {
-        eljson::invalid_params_json(e)
-    } else {
-        eljson::error_json(e)
-    }
-}
 
 /// `nativeGetTransactionReceiptJson`: verified `eth_getTransactionReceipt` for a
 /// running handle. `tx_hash_hex` is the 0x-hex 32-byte tx hash. Returns the
@@ -3654,7 +3644,7 @@ pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
     match outcome {
         Ok(Some(receipts)) => eljson::block_receipts_json(&receipts),
         Ok(None) => "null".to_string(),
-        Err(e) => block_read_error_json(&e),
+        Err(e) => eljson::error_json(&e),
     }
 }
 
