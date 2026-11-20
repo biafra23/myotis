@@ -9,7 +9,8 @@
 # ant is vendored in rust/vendor/ant (its VENDORED.md): this lane builds it as a
 # path dependency, and checks that the copy is upstream's at the recorded commit
 # (scripts/vendor_ant.sh --check). That check is the only step in CI that fetches
-# ant from GitHub; the builds never do.
+# ant from GitHub; the builds never do. cargo-locks.yml keeps git sources out of
+# every lock.
 #
 # Path-filtered, and `push` scoped to main as in the other Rust lanes, so a push
 # to a branch with an open PR runs once (under pull_request).
@@ -49,15 +50,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust/swarm
+          # ant's crates are path dependencies (rust/vendor/ant): without this the cache's
+          # clean-up drops their artifacts and every run compiles all of ant again.
+          cache-workspace-crates: true
       - name: Tests
         run: cargo test --manifest-path rust/swarm/Cargo.toml --locked
       - name: Clippy
         run: cargo clippy --locked --manifest-path rust/swarm/Cargo.toml --all-targets -- -D warnings
       - name: rust/vendor/ant is upstream's ant at its recorded commit
         run: scripts/vendor_ant.sh --check
-      - name: No git sources in the lock (ant is vendored)
-        run: |
-          if grep -n '^source = "git+' rust/swarm/Cargo.lock; then
-            echo "::error file=rust/swarm/Cargo.lock::a git source is back in the lock; vendor it under rust/vendor instead (rust/vendor/ant/VENDORED.md)"
-            exit 1
-          fi

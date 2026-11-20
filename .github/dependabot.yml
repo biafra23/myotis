@@ -111,10 +111,10 @@ updates:
       - "/rust/roost"
       - "/rust/tor-poc"
       - "/rust/swarm"
-    # rust/vendor holds third-party sources copied in verbatim (rust/vendor/ant/VENDORED.md):
-    # Dependabot must not edit their manifests. An ant update is scripts/vendor_ant.sh.
-    exclude-paths:
-      - "rust/vendor/**"
+    # /rust/swarm reaches ant through path dependencies in rust/vendor/ant (third-party
+    # sources copied in verbatim, VENDORED.md there), so Dependabot needs those manifests to
+    # resolve its graph and is not told to skip them. Should a PR of its own edit one, the
+    # swarm lane's `vendor_ant.sh --check` fails it: an ant update is that script.
     schedule:
       interval: monthly
     cooldown:

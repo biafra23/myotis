@@ -35,6 +35,11 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 git -C "$work" init -q src
+# Upstream's bytes, whatever this machine's git does with line endings (core.autocrlf on
+# Windows) and whatever upstream's own .gitattributes say.
+git -C "$work/src" config core.autocrlf false
+git -C "$work/src" config core.eol lf
+echo '* -text' > "$work/src/.git/info/attributes"
 git -C "$work/src" fetch -q --depth 1 "$REPO" "$commit"
 git -C "$work/src" -c advice.detachedHead=false checkout -q FETCH_HEAD
 [ "$(git -C "$work/src" rev-parse HEAD)" = "$commit" ] || { echo "fetched another commit" >&2; exit 1; }
@@ -53,16 +58,22 @@ members=$(printf '  "crates/%s",\n' "${CRATES[@]}")
 python3 - "$work/src/Cargo.toml" "$out/Cargo.toml" "$members" <<'EOF'
 import re, sys
 src, dst, members = sys.argv[1], sys.argv[2], sys.argv[3]
-text = open(src).read()
-new, n = re.subn(r'(?ms)^members = \[\n.*?^\]', 'members = [\n' + members.rstrip('\n') + '\n]', text, count=1)
+text = open(src, 'rb').read()
+lines = members.rstrip('\n').encode()
+new, n = re.subn(rb'(?ms)^members = \[\n.*?^\]', b'members = [\n' + lines + b'\n]', text, count=1)
 if n != 1:
     sys.exit("ant's Cargo.toml has no `members = [ ... ]` list in the expected form")
-open(dst, 'w').write(new)
+open(dst, 'wb').write(new)
 EOF
 
 if [ "$mode" = check ]; then
-  # VENDORED.md is ours; everything else must match.
-  if diff -r -x VENDORED.md "$out" "$dest"; then
+  # What git tracks (the index: a commit in CI, staged changes locally), not the working
+  # tree: build leftovers there (a target/, a Cargo.lock from building inside the copy) are
+  # not part of the copy. File modes count, and the top-level VENDORED.md, ours, does not.
+  tracked=$work/tracked
+  (cd "$root" && git ls-files -z -- rust/vendor/ant | git checkout-index -z --stdin --prefix="$tracked/")
+  rm -f "$tracked/rust/vendor/ant/VENDORED.md"
+  if git -c core.autocrlf=false diff --no-index --stat --exit-code "$out" "$tracked/rust/vendor/ant"; then
     echo "rust/vendor/ant matches $REPO at $commit"
   else
     echo "rust/vendor/ant differs from $REPO at $commit (above)" >&2
@@ -81,4 +92,6 @@ if [ -n "$notes" ]; then
 else
   echo "Commit: $commit" > "$dest/VENDORED.md"
 fi
+grep -qx "Commit: $commit" "$dest/VENDORED.md" \
+  || { echo "VENDORED.md does not record Commit: $commit; fix its Commit line by hand" >&2; exit 1; }
 echo "rust/vendor/ant is now $REPO at $commit; review the diff, then update rust/swarm/Cargo.lock"
