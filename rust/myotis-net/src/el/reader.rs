@@ -2172,6 +2172,9 @@ pub struct ElReader {
     /// The chain's id: `ElConfig::network_id`, which equals it on every
     /// network served. A send signed for another chain is refused (#665).
     chain_id: u64,
+    /// Where a by-number read below the 512-block window verifies: the bundled
+    /// checkpoint table and the hashes linked above its top (`el::deep`).
+    deep: super::deep::DeepAnchors,
     /// Cross-call EVM caches, shared across every `eth_call` on this reader. Both
     /// hold `stateRoot`-keyed / content-addressed cryptographic facts, so reuse is
     /// sound. Because a call pins to the CURRENT head (whose root advances ~every
@@ -2510,6 +2513,12 @@ impl ElReader {
             Some(path) => crate::el::peercache::ElPeerCache::load(path.clone()),
             None => crate::el::peercache::ElPeerCache::disabled(),
         };
+        // The deep anchors' state sits beside the peer cache, suffixed like it
+        // (`peers-sepolia.cache` → `deep-anchors-sepolia.txt`).
+        let deep_store = cfg.cache_path.as_deref().and_then(|p| {
+            let suffix = p.file_stem()?.to_str()?.strip_prefix("peers")?.to_string();
+            Some(p.with_file_name(format!("deep-anchors{suffix}.txt")))
+        });
         let local_pubkey = key.public_key_bytes();
         let sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch = Arc::new(
             std::sync::Mutex::new(crate::el::sent_tx::SentTxTracker::new()),
@@ -2558,6 +2567,7 @@ impl ElReader {
             min_suggested_tip_wei: cfg.min_suggested_tip_wei,
             block_time: cfg.block_time,
             chain_id: cfg.network_id,
+            deep: super::deep::DeepAnchors::for_chain(cfg.network_id, deep_store),
             evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
             evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
             read_stats,
@@ -8240,8 +8250,86 @@ impl ElReader {
         from: u64,
         (head_num, head_hash): (u64, [u8; 32]),
     ) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, PoolReadError> {
-        let top = WindowTop::Head { number: head_num, hash: head_hash };
-        let span = head_num.saturating_sub(from);
+        self.anchored_header_window(from, WindowTop::Head { number: head_num, hash: head_hash })
+            .await
+    }
+
+    /// The top a by-number read at `target_num` verifies against, and the
+    /// window's span: `top` itself within [`BLOCK_LOOKBACK_MAX`]; deeper, for a
+    /// block at or below the finalized block, a deep anchor (`el::deep`): the
+    /// bundled checkpoint table's at or below its top, else a hash linked from
+    /// finality, walking the gap down first (one window of at most 1024
+    /// headers per step) when no linked hash is close enough. Without a table
+    /// for this network, today's refusal. The alarm (a walk that found another
+    /// hash at the table's top) refuses for good, with [`super::deep::ALARM_PREFIX`].
+    async fn deep_window_top(
+        &self,
+        target_num: u64,
+        top: WindowTop,
+    ) -> Result<(WindowTop, u64), PoolReadError> {
+        use super::deep::Plan;
+        let span = top.number() - target_num;
+        if span < BLOCK_LOOKBACK_MAX {
+            return Ok((top, span));
+        }
+        let beyond = || {
+            PoolReadError::Fatal(format!(
+                "block {target_num} is {span} behind {} — beyond the {BLOCK_LOOKBACK_MAX}-block \
+                 verify window",
+                top.kind()
+            ))
+        };
+        // Only a finalized top: a deep read above finality (a long stretch
+        // without it) has no anchor a walk could start from.
+        let WindowTop::Finalized { number, hash } = top else {
+            return Err(beyond());
+        };
+        loop {
+            match self.deep.plan(target_num, (number, hash)) {
+                None => return Err(beyond()),
+                Some(Plan::Refused) => {
+                    let alarm = self.deep.alarm().unwrap_or_else(|| {
+                        format!("{} raised", super::deep::ALARM_PREFIX)
+                    });
+                    return Err(PoolReadError::Fatal(alarm));
+                }
+                Some(Plan::Anchor { number: a, hash: h }) => {
+                    return Ok((WindowTop::Deep { number: a, hash: h }, a - target_num));
+                }
+                Some(Plan::Walk { from, top: (walk_num, walk_hash) }) => {
+                    // One walk at a time: concurrent deep reads in the same
+                    // gap wait for it and then plan again from what it linked.
+                    let _walk = self.deep.walk_lock.lock().await;
+                    if self.deep.plan(target_num, (number, hash))
+                        != Some(Plan::Walk { from, top: (walk_num, walk_hash) })
+                    {
+                        continue;
+                    }
+                    let window = self
+                        .anchored_header_window(
+                            from,
+                            WindowTop::Deep { number: walk_num, hash: walk_hash },
+                        )
+                        .await?;
+                    let linked: Vec<(u64, [u8; 32])> =
+                        window.iter().map(|vh| (vh.header.number, vh.hash)).collect();
+                    if let Some(alarm) = self.deep.record_window(&linked) {
+                        return Err(PoolReadError::Fatal(alarm));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The verified header window `[from ..= top]` — header only, raced across
+    /// the snap pool as the block reads are and settled the same way
+    /// ([`Self::settle_pool_race`]).
+    async fn anchored_header_window(
+        &self,
+        from: u64,
+        top: WindowTop,
+    ) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, PoolReadError> {
+        let span = top.number().saturating_sub(from);
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
@@ -8262,7 +8350,7 @@ impl ElReader {
                 &coverage,
                 out,
                 (from, span),
-                true,
+                top.is_head(),
                 "a verifiable header window",
                 "verified header window fetch failed against every snap peer",
             )
@@ -8329,15 +8417,9 @@ impl ElReader {
         };
         // The cap bounds the ONE-request window, so it is measured to the
         // window's own top: a finalized read during a long non-finality
-        // stretch is one header, not "far behind the head".
-        let span = top.number() - target_num;
-        if span >= BLOCK_LOOKBACK_MAX {
-            return Err(PoolReadError::Fatal(format!(
-                "block {target_num} is {span} behind {} — beyond the {BLOCK_LOOKBACK_MAX}-block \
-                 verify window",
-                top.kind()
-            )));
-        }
+        // stretch is one header, not "far behind the head". Deeper, a deep
+        // anchor (the checkpoint table, or a hash linked above its top).
+        let (top, span) = self.deep_window_top(target_num, top).await?;
         // Serve over the snap pool (the peer set the reader maintains); a block
         // serve is eth-only (headers + bodies), so this is a superset of what's
         // needed. If eth peers exist but none negotiated snap, this fails closed
@@ -10184,14 +10266,7 @@ impl ElReader {
         let Some(top) = self.window_top(target_num, (head_num, head_hash)) else {
             return Ok(None); // above the head, not final: future/unknown → eth null
         };
-        let span = top.number() - target_num;
-        if span >= BLOCK_LOOKBACK_MAX {
-            return Err(PoolReadError::Fatal(format!(
-                "block {target_num} is {span} behind {} — beyond the {BLOCK_LOOKBACK_MAX}-block \
-                 verify window",
-                top.kind()
-            )));
-        }
+        let (top, span) = self.deep_window_top(target_num, top).await?;
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
@@ -10297,6 +10372,13 @@ impl ElReader {
     fn window_top(&self, target_num: u64, head: (u64, [u8; 32])) -> Option<WindowTop> {
         let fin = self.anchor.finalized_execution().map(|f| (f.block_number, f.block_hash));
         choose_window_top(target_num, head, fin)
+    }
+
+    /// The checkpoint table's alarm (`el::deep`), once raised: a walk from an
+    /// attested finalized block found another hash at the table's top, and
+    /// every read resting on the table is refused. Kept across restarts.
+    pub fn checkpoint_alarm(&self) -> Option<String> {
+        self.deep.alarm()
     }
 
     /// The beacon-anchored optimistic head `(number, hash)`, or the standard
@@ -10732,18 +10814,26 @@ enum WindowTop {
     /// head observation is left alone; and a whole-pool miss on it is a
     /// pruned or lagging pool, never the one-slot race `latest` can lose.
     Finalized { number: u64, hash: [u8; 32] },
+    /// A deep anchor (`el::deep`): a bundled checkpoint table entry or its top,
+    /// or a hash this node linked from a finalized block. As canonical as
+    /// finality; serving it proves only that the peer holds an old block.
+    Deep { number: u64, hash: [u8; 32] },
 }
 
 impl WindowTop {
     fn number(&self) -> u64 {
         match self {
-            WindowTop::Head { number, .. } | WindowTop::Finalized { number, .. } => *number,
+            WindowTop::Head { number, .. }
+            | WindowTop::Finalized { number, .. }
+            | WindowTop::Deep { number, .. } => *number,
         }
     }
 
     fn hash(&self) -> &[u8; 32] {
         match self {
-            WindowTop::Head { hash, .. } | WindowTop::Finalized { hash, .. } => hash,
+            WindowTop::Head { hash, .. }
+            | WindowTop::Finalized { hash, .. }
+            | WindowTop::Deep { hash, .. } => hash,
         }
     }
 
@@ -10754,10 +10844,10 @@ impl WindowTop {
     }
 
     fn kind(&self) -> &'static str {
-        if self.is_head() {
-            "the optimistic head"
-        } else {
-            "the finalized block"
+        match self {
+            WindowTop::Head { .. } => "the optimistic head",
+            WindowTop::Finalized { .. } => "the finalized block",
+            WindowTop::Deep { .. } => "a deep anchor",
         }
     }
 }
@@ -10791,6 +10881,11 @@ fn choose_window_top(
     }
 }
 
+/// How many more requests a deep window may take from one peer after its
+/// first answer stopped short (a 512-header cap needs one; three covers a
+/// 256-header cap on a 1024-header window).
+const DEEP_WINDOW_EXTRA_REQUESTS: usize = 3;
+
 /// Fetch the contiguous header window `[from ..= top]` from one peer and run
 /// the trust gate every anchored read shares: exact length, the right starting
 /// number, the window top IS the beacon-anchored hash (`top`), and every
@@ -10807,7 +10902,25 @@ async fn fetch_anchored_window(
     let Some(count) = top.number().checked_sub(from).map(|span| span + 1) else {
         return Err(format!("window start {from} is above its anchor {}", top.number()));
     };
-    let window = peer.get_block_headers_by_number(from, count, 0, false).await?;
+    let mut window = peer.get_block_headers_by_number(from, count, 0, false).await?;
+    // A deep window (up to 1024 headers) can meet a peer's response cap: some
+    // clients serve at most 512 headers per request. Ask the same peer for the
+    // rest, from where its answer stopped; the checks below cover the seam
+    // (every header must hash-link to the next). Head and finalized windows
+    // stay one request, so a short one keeps its tip-lag meaning.
+    if matches!(top, WindowTop::Deep { .. }) {
+        for _ in 0..DEEP_WINDOW_EXTRA_REQUESTS {
+            let have = window.len() as u64;
+            if have == 0 || have >= count {
+                break;
+            }
+            let more = peer.get_block_headers_by_number(from + have, count - have, 0, false).await?;
+            if more.is_empty() {
+                break;
+            }
+            window.extend(more);
+        }
+    }
     // Distinct messages on purpose: a SHORT window is tip-lag-shaped (the peer
     // may simply not have imported up to our anchor yet — all_tip_lag matches
     // "headers, expected"), while returning MORE than asked is a protocol

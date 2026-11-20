@@ -1102,6 +1102,7 @@ pub fn status_json(handle: i64) -> String {
                             body_requests_served: b_served,
                             el_hunting: r.el_hunting(),
                             upgrade_advisory,
+                            checkpoint_alarm: r.checkpoint_alarm(),
                             usage,
                             metering,
                         }
@@ -1164,6 +1165,9 @@ struct ElCounts {
     /// Peers announce (or already activated) a network upgrade this build does
     /// not support — EL-derived like the counts, but NOT zeroed while paused.
     upgrade_advisory: Option<fork_watch::Advisory>,
+    /// The checkpoint table's alarm (`ElReader::checkpoint_alarm`), once raised:
+    /// every deep read resting on the table is refused. Kept across restarts.
+    checkpoint_alarm: Option<String>,
     /// The handle's data usage (both layers; not zeroed while paused). None
     /// only where no ledger exists, which no live handle lacks.
     usage: Option<UsageSnapshot>,
@@ -3270,7 +3274,18 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions:
     {
         Ok(Some(block)) => eljson::block_json(&block),
         Ok(None) => "null".to_string(), // verified future/unknown block → eth null
-        Err(e) => eljson::error_json(&e),
+        Err(e) => block_read_error_json(&e),
+    }
+}
+
+/// A block or receipts read's failure as its envelope: the checkpoint table's
+/// alarm (`myotis_net::el::deep::ALARM_PREFIX`) refuses for good, so it is the
+/// permanent `{"error","code":-32602}`; anything else is the retryable `{"error"}`.
+fn block_read_error_json(e: &str) -> String {
+    if e.starts_with(myotis_net::el::deep::ALARM_PREFIX) {
+        eljson::invalid_params_json(e)
+    } else {
+        eljson::error_json(e)
     }
 }
 
@@ -3639,7 +3654,7 @@ pub fn get_block_receipts_json(handle: i64, selector: &str) -> String {
     match outcome {
         Ok(Some(receipts)) => eljson::block_receipts_json(&receipts),
         Ok(None) => "null".to_string(),
-        Err(e) => eljson::error_json(&e),
+        Err(e) => block_read_error_json(&e),
     }
 }
 
@@ -4175,6 +4190,13 @@ fn status_object(
             None => serde_json::Value::Null,
         },
     );
+    // The checkpoint table's alarm: null, or why every read resting on the
+    // bundled table is refused (.claude/agent/data-sources.md, Trust). Older
+    // wrappers ignore the unknown key.
+    obj.insert(
+        "checkpointAlarm".into(),
+        el.checkpoint_alarm.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+    );
     // Data usage (docs/how-it-works/data-usage.md): this handle's bytes since it was
     // created, by layer, and the local day's figures with their metered part.
     obj.insert(
@@ -4219,7 +4241,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
     r#""finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,"#,
     r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
-    r#""peerBodyRequests":0,"peerBodyRequestsServed":0,"upgradeAdvisory":null,"#,
+    r#""peerBodyRequests":0,"peerBodyRequestsServed":0,"upgradeAdvisory":null,"checkpointAlarm":null,"#,
     r#""dataUsage":null,"networkMetering":"UNKNOWN"}"#,
 );
 
@@ -4961,6 +4983,7 @@ mod tests {
             body_requests_served: 0,
             el_hunting: false,
             upgrade_advisory: None,
+            checkpoint_alarm: None,
             usage: Some(UsageSnapshot {
                 session: myotis_net::traffic::TrafficSnapshot { el_rx: 10, el_tx: 2, cl_rx: 30, cl_tx: 4 },
                 day: "2026-10-20".to_string(),
