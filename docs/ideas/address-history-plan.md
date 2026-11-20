@@ -172,7 +172,9 @@ Fully specified in [deep-block-verification.md](deep-block-verification.md); wor
 first, because deep `eth_getBlockByNumber` and receipt reads are useful on their own.
 
 - **Generator (item 3).** A verified walk from a beacon-attested block down to the genesis
-  hash, not hashes read from a node's RPC: otherwise D1 anchors on an RPC's word. Output: the
+  hash, not hashes read from a node's RPC: otherwise D1 anchors on an RPC's word. This is
+  the target for later tables. The first mainnet table started from its source node's
+  finalized block, with the top cross-checked, which the owner ruled enough (D1). Output: the
   hash of every 1024th block, per network (mainnet 0.83 MB, Gnosis 1.54 MB, Sepolia 0.38 MB).
 - **Bridging the gap (item 7).** A lookup walks at most 1024 headers up to the next table
   entry (one request, ~0.66 MB at most). Entries the node records itself as finality passes

@@ -259,10 +259,13 @@ Full text, including the complete minSdk 29 JDK-API budget: `.claude/agent/platf
 - The bundled checkpoint table (owner's decision D1, 2026-11-20), Rust engine:
   per network the hash of every 1024th block, pinned by keccak256, built by a
   `parentHash` walk down to the genesis hash; a block at or below its top is
-  canonical when its headers hash-link up to the first entry at or above it.
-  Above the top today's attested window applies; a gap walk that misses the top
-  entry refuses every table read (`-32602`); a running node never writes into
-  it. Scope and limits: `.claude/agent/data-sources.md`.
+  canonical when its headers hash-link up to the first entry at or above it
+  (until a walk has checked the top, on the build's cross-check alone). Above
+  the top, today's window or a walk up to a hash the node linked from an
+  attested finalized block; a walk that finds another hash at the top raises
+  an alarm, kept across restarts, that refuses every table read (`-32602`); the
+  table changes only in a release PR, never by a running node. Scope and
+  limits: `.claude/agent/data-sources.md`.
 - One bounded exception (owner's decision, 2026-09-25): a seeded log history of
   a root-committing protocol is served on its publisher's word. Scope and
   limits: `.claude/agent/data-sources.md`.

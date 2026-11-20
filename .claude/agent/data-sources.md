@@ -33,20 +33,27 @@
   pinned in the source; the loader refuses a table that does not match.
   It is built off-line by hashing every header and linking each by
   parentHash from that finalized block down to the network's genesis
-  hash, its top cross-checked against a second, independent client.
+  hash (an extension: down to the previous table's last entry), its top
+  cross-checked against a second client implementation.
   It is the release's word, as the embedded checkpoint is.
   - A block at or below the top is canonical when the headers from it
     up to the first entry at or above it (one GetBlockHeaders, at most
-    1024) hash-link to that entry. Above the top, today's window from the attested
-    finalized block applies.
-  - A walk that closes the gap between the attested finalized block
-    and the top must end exactly at the top entry. A mismatch is an
-    alarm that refuses every read resting on the table (-32602), never
-    outvoted.
-  - The table changes only in a PR that names its build (tool, source
-    node, top, cross-check), extended at a release (releases.md). A
-    running node never writes into it; hashes it linked to an attested
-    finalized block may be kept in a local table beside it.
+    1024) hash-link to that entry. Until a walk has checked the top
+    (next bullet), such a read rests on the build's cross-check alone
+    (owner's ruling, 2026-11-20).
+  - Above the top, a block verifies through today's window, or by the
+    same walk up to a hash this node linked down from an attested
+    finalized block: through the sync-committee anchor, not the table.
+  - A walk from an attested finalized block that reaches the top must
+    find the top's hash there. A mismatch is an alarm that refuses
+    every read resting on the table (-32602), never outvoted. The
+    check and the alarm are kept per table (keyed by its pin) across
+    restarts, and the host is told. After a STALE_ANCHOR re-anchor the
+    alarm names both anchors as in doubt.
+  - The table changes only in a release PR that names its build (tool,
+    source node, top, cross-check). Each release extends it
+    (releases.md). A running node never writes into it; the hashes it
+    linked are kept beside it.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** A well-formed result computed against
   something other than what the caller asked for is indistinguishable from a
