@@ -165,6 +165,10 @@ pub struct ExecAnchor {
     /// Wakes the pool's resolver when a hash becomes pending (`notify_one`
     /// stores a permit, so a hash noted between two waits is not missed).
     pending_changed: tokio::sync::Notify,
+    /// How many times the light client was re-anchored on a fresh checkpoint at a
+    /// STALE_ANCHOR park (the sync loop's `reanchor`): the deep anchors (`el::deep`) drop
+    /// what they linked under the old anchor when it moves.
+    reanchors: std::sync::atomic::AtomicU64,
 }
 
 impl Default for ExecAnchor {
@@ -172,11 +176,22 @@ impl Default for ExecAnchor {
         ExecAnchor {
             inner: Mutex::new(Inner::default()),
             pending_changed: tokio::sync::Notify::new(),
+            reanchors: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
 
 impl ExecAnchor {
+    /// The light client was re-anchored on a fresh checkpoint (STALE_ANCHOR).
+    pub fn note_reanchor(&self) {
+        self.reanchors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many times [`Self::note_reanchor`] was called.
+    pub fn reanchors(&self) -> u64 {
+        self.reanchors.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn new() -> ExecAnchor {
         ExecAnchor::default()
     }
