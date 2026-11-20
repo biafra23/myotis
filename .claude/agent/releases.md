@@ -220,20 +220,29 @@ question does not rest on memory.
    (`rust/myotis-core/checkpoints/`) anchors deep reads up to its top;
    above it a running node walks the gap down from its finalized
    block, about 7 requests (4-5 MB) per day since the table's build.
-   On the nuc, against its Erigon, cross-checked against zbox's geth:
+   On the nuc, against its Erigon, cross-checked against zbox's geth,
+   extending the committed table:
 
    ```bash
-   ethswarm checkpoint-table --out mainnet-1024.hashes \
+   ethswarm checkpoint-table \
+     --extend rust/myotis-core/checkpoints/mainnet-1024.hashes \
+     --out mainnet-1024.next.hashes \
      --rpc <nuc erigon> --cross-check <zbox geth>
    ```
 
-   (eth2swarm; a full walk to the genesis hash, ~25 min. An extension
-   from the previous table's last entry once the tool has one.)
-   Replace the table and its sidecar, and move `MAINNET_PIN` in
-   `rust/myotis-core/src/checkpoints.rs` in the same commit. The release
+   (eth2swarm, `--extend` since VesperBats/eth2swarm#33: it walks only
+   the blocks above the old table's last entry, checks that entry and
+   the old top against the chain again, and keeps the old entries byte
+   for byte; seconds for a few weeks of blocks. Without `--extend` it
+   rebuilds the whole table down to the genesis hash, ~40 min.)
+   Replace the table and its sidecar with the new pair, and move
+   `MAINNET_PIN` in `rust/myotis-core/src/checkpoints.rs`, appending
+   the new pin to `MAINNET_SHIPPED`, in the same commit. The release
    PR names the build: tool and version, source node, top,
    cross-check. The new table's bytes up to the old last entry must
-   equal the old table's (`cmp -n`), so a release only appends. The
+   equal the old table's (`cmp -n`; the test
+   `every_shipped_table_is_a_prefix` checks it too), so a release only
+   appends. The
    release's `reproducible builds` run covers it like any embedded
    asset.
 
