@@ -39,7 +39,6 @@ use std::time::{Duration, Instant};
 use ant_control::{ControlAck, ControlCommand, StatusSnapshot};
 use ant_node::{run_node, NodeConfig};
 use libp2p::identity::Keypair;
-use libp2p::Multiaddr;
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// Swarm mainnet's network id.
@@ -48,6 +47,13 @@ pub const MAINNET_NETWORK_ID: u64 = 1;
 /// Peers a reader keeps by default. A reader needs few; ant's own default (100) suits a node
 /// that serves.
 pub const READER_PEERS: usize = 24;
+
+/// The text a [`SwarmError::NotReady`] starts with once rendered: how a caller that only
+/// sees the message (the addr1 reader's `ChunkSource` carries text) tells it apart.
+pub const NOT_READY_TEXT: &str = "the Swarm node has no usable peers yet";
+
+/// A bootnode's address, as [`SwarmConfig::bootnodes`] takes it.
+pub use libp2p::Multiaddr;
 
 /// Errors of the reader.
 #[derive(Debug)]
@@ -66,7 +72,7 @@ impl std::fmt::Display for SwarmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stopped => write!(f, "the Swarm node is not running"),
-            Self::NotReady(m) => write!(f, "the Swarm node has no usable peers yet: {m}"),
+            Self::NotReady(m) => write!(f, "{NOT_READY_TEXT}: {m}"),
             Self::Failed(m) => write!(f, "Swarm read failed: {m}"),
             Self::Timeout => write!(f, "Swarm read timed out"),
         }

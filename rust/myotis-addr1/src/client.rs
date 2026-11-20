@@ -295,6 +295,32 @@ impl<'a, S: ChunkSource> Index<'a, S> {
         Ok(out)
     }
 
+    /// Up to `want` entries of `address` in slice `s`, newest first, strictly older than
+    /// `before`, merged by key; `None` if the descriptor or the bucket was not delivered.
+    async fn slice_entries(
+        &self,
+        head: &HeadRecord,
+        s: SliceId,
+        address: &[u8; 20],
+        before: (u64, u32),
+        want: usize,
+        plan: &crate::cover::Plan,
+    ) -> ReadResult<Option<Vec<Entry>>> {
+        let Some(slice) = self.slice(s, head.first_unit).await? else {
+            return Ok(None);
+        };
+        let Some(found) = self.in_slice(address, &slice).await? else {
+            return Ok(None);
+        };
+        let mut here: Vec<Entry> =
+            found.entries.iter().copied().filter(|e| key(e) < before && plan.keep(e.block)).collect();
+        for (reference, _count) in &found.spill_files {
+            let spilled = self.spill_newest(&slice, *reference, before, want).await?;
+            here.extend(spilled.into_iter().filter(|e| plan.keep(e.block)));
+        }
+        Ok(Some(merge_by_key(here)))
+    }
+
     /// A page of `address`'s entries at `head`: up to `limit`, newest first, strictly older
     /// than `before` (`None`: from the head). The slices of the head's cover are read newest
     /// first until the page is full; one that is not delivered becomes a [`Gap`].
@@ -321,24 +347,18 @@ impl<'a, S: ChunkSource> Index<'a, S> {
                 break;
             }
             let gap = Gap { from_block: first.max(plan.from_block), to_block: last };
-            let Some(slice) = self.slice(*s, head.first_unit).await? else {
-                gaps.push(gap);
-                continue;
-            };
-            let Some(found) = self.in_slice(address, &slice).await? else {
-                gaps.push(gap);
-                continue;
-            };
             let want = limit - entries.len();
-            let mut here: Vec<Entry> =
-                found.entries.iter().copied().filter(|e| key(e) < before && plan.keep(e.block)).collect();
-            // One more than wanted, so a page cut short shows as cut.
-            for (reference, _count) in &found.spill_files {
-                let spilled = self.spill_newest(&slice, *reference, before, want + 1).await?;
-                here.extend(spilled.into_iter().filter(|e| plan.keep(e.block)));
-            }
-            here.sort_unstable_by(|a, b| key(b).cmp(&key(a)));
-            here.dedup();
+            // A chunk of this slice Swarm did not deliver (its descriptor, its bucket, a
+            // pages or spill chunk) makes the slice a gap; invalid data stays an error.
+            let here = match self.slice_entries(head, *s, address, before, want + 1, &plan).await {
+                Ok(Some(here)) => here,
+                Ok(None) | Err(ReadError::Unavailable(_)) => {
+                    gaps.push(gap);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let mut here = here;
             if here.len() > want {
                 here.truncate(want);
                 exhausted = false;
@@ -355,6 +375,21 @@ impl<'a, S: ChunkSource> Index<'a, S> {
 
 fn key(e: &Entry) -> (u64, u32) {
     (e.block, e.slot)
+}
+
+/// Newest first, one entry per `(block, slot)`: two records of one fingerprint (an inline
+/// one and a spill file, or two spill files) can name one appearance with other roles. They
+/// are merged, so a page cut, which is by key, never splits one.
+fn merge_by_key(mut entries: Vec<Entry>) -> Vec<Entry> {
+    entries.sort_unstable_by(|a, b| key(b).cmp(&key(a)));
+    let mut out: Vec<Entry> = Vec::with_capacity(entries.len());
+    for e in entries {
+        match out.last_mut() {
+            Some(last) if key(last) == key(&e) => last.roles |= e.roles,
+            _ => out.push(e),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -393,6 +428,13 @@ mod tests {
         let chunks = file_tree(data);
         let root = chunks.last().expect("a root").0;
         (Map(chunks.into_iter().collect()), root)
+    }
+
+    #[test]
+    fn one_key_with_two_roles_is_one_entry() {
+        let e = |block, slot, roles| Entry { block, slot, roles };
+        let merged = merge_by_key(vec![e(100, 5, 0x01), e(101, 1, 0x04), e(100, 5, 0x02), e(99, 9, 0x10)]);
+        assert_eq!(merged, vec![e(101, 1, 0x04), e(100, 5, 0x03), e(99, 9, 0x10)]);
     }
 
     #[test]

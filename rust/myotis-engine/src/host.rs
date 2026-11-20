@@ -239,6 +239,10 @@ pub fn set_tor_enabled(on: bool) -> bool {
     #[cfg(feature = "tor")]
     {
         myotis_net::el::tor::set_enabled(on);
+        if on {
+            // The Swarm reader does not route through Tor: it stops at the switch.
+            crate::addrhist::tor_switched_on();
+        }
         true
     }
     #[cfg(not(feature = "tor"))]
@@ -3279,6 +3283,10 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions:
 /// head gap. Refused with the permanent -32602 where the carve-out says so.
 #[allow(dead_code)] // exported over the FFI by part 7 of #899
 pub fn address_history_json(handle: i64, address: &str, cursor: &str, limit: i64) -> String {
+    // A build without the reader refuses for good, whatever the handle's state.
+    if let Some(refused) = crate::addrhist::early_refusal() {
+        return refused;
+    }
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
@@ -3287,7 +3295,7 @@ pub fn address_history_json(handle: i64, address: &str, cursor: &str, limit: i64
         Err(msg) => return eljson::error_json(msg),
     };
     let head = Some(reader.optimistic_block_number()).filter(|h| *h > 0);
-    crate::addrhist::history_json(chain_id, head, address, cursor, limit)
+    crate::addrhist::history_json(&engine.rt, chain_id, head, address, cursor, limit)
 }
 
 /// `set_address_history_config_json`: the address history's settings (`addrhist`):

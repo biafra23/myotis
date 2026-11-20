@@ -99,6 +99,11 @@ pub fn parse_config(json: &str) -> Result<Config, String> {
                     if bootnodes.is_empty() {
                         return Err("swarm network 'dev' needs at least one bootnode".into());
                     }
+                    #[cfg(feature = "swarm")]
+                    for b in &bootnodes {
+                        b.parse::<myotis_swarm::Multiaddr>()
+                            .map_err(|_| format!("invalid bootnode multiaddr '{b}'"))?;
+                    }
                     Network::Dev { network_id, bootnodes }
                 }
                 _ => return Err("swarm network must be 'mainnet' or 'dev'".into()),
@@ -111,7 +116,8 @@ pub fn parse_config(json: &str) -> Result<Config, String> {
 
 fn parse_address(s: &str) -> Option<[u8; 20]> {
     let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
-    if h.len() != 40 {
+    // from_str_radix takes a leading '+': check the digits first.
+    if h.len() != 40 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 20];
@@ -132,6 +138,10 @@ fn hex(bytes: &[u8]) -> String {
 /// A page's cursor as the API carries it: `"<block>:<slot>"`, exclusive.
 pub fn parse_cursor(s: &str) -> Option<(u64, u32)> {
     let (b, slot) = s.split_once(':')?;
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|c| c.is_ascii_digit());
+    if !digits(b) || !digits(slot) {
+        return None;
+    }
     Some((b.parse().ok()?, slot.parse().ok()?))
 }
 
@@ -158,6 +168,17 @@ fn config() -> Config {
     CONFIG.lock().ok().and_then(|c| c.clone()).unwrap_or_default()
 }
 
+/// The refusal of a build without the reader, before the chain handle is even looked up.
+pub fn early_refusal() -> Option<String> {
+    build_refusal().map(|why| eljson::invalid_params_json(why))
+}
+
+/// Tor routing was turned on: the reader stops, so no Swarm connection outlives the switch
+/// (refusing the next read alone would leave the node connected, outside Tor).
+pub fn tor_switched_on() {
+    reader::stop();
+}
+
 /// The refusal a read gets before any I/O, if any.
 fn refusal(cfg: &Config) -> Option<String> {
     if let Some(why) = build_refusal() {
@@ -167,6 +188,7 @@ fn refusal(cfg: &Config) -> Option<String> {
         return Some("no importer key is set for the address history (an experimental setting)".to_string());
     }
     if tor_on() {
+        reader::stop();
         return Some(
             "the address history is not available while Tor routing is on: the Swarm reader does not route through Tor"
                 .to_string(),
@@ -189,7 +211,14 @@ fn refusal(cfg: &Config) -> Option<String> {
 ///
 /// A refusal is the permanent `-32602`; Swarm not delivering what the read needs is the
 /// retryable `{"error"}`.
-pub fn history_json(chain_id: u64, chain_head: Option<u64>, address: &str, cursor: &str, limit: i64) -> String {
+pub fn history_json(
+    rt: &tokio::runtime::Runtime,
+    chain_id: u64,
+    chain_head: Option<u64>,
+    address: &str,
+    cursor: &str,
+    limit: i64,
+) -> String {
     let cfg = config();
     if let Some(why) = refusal(&cfg) {
         return eljson::invalid_params_json(&why);
@@ -209,7 +238,7 @@ pub fn history_json(chain_id: u64, chain_head: Option<u64>, address: &str, curso
         return eljson::invalid_params_json(&format!("invalid limit (expected 1 to {MAX_PAGE})"));
     }
     let importer = cfg.importer.expect("refusal() checked it");
-    match reader::page(&cfg, chain_id, importer, &address, before, limit as usize) {
+    match reader::page(rt, &cfg, chain_id, importer, &address, before, limit as usize) {
         Ok(read) => page_json(&read, importer, chain_head),
         Err(reader::Failure::Refused(msg)) => eljson::invalid_params_json(&msg),
         Err(reader::Failure::Retry(msg)) => eljson::error_json(&msg),
@@ -270,6 +299,7 @@ mod reader {
     use myotis_addr1::client::{Index, ReadError};
     use myotis_swarm::{SwarmConfig, SwarmNode};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     pub enum Failure {
         /// The index's data was invalid, or the settings cannot work: permanent.
@@ -281,17 +311,29 @@ mod reader {
     struct Running {
         network: Network,
         node: Arc<SwarmNode>,
+        started: Instant,
         /// The newest head update found per (chain, importer): where the next probe starts.
         hints: std::collections::HashMap<(u64, [u8; 20]), u64>,
     }
 
     static NODE: Mutex<Option<Running>> = Mutex::new(None);
 
-    /// How long a read waits for a freshly started node to have usable peers.
-    const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+    /// How long after its start a node may answer "no usable peers" and be asked again.
+    const STARTUP_WAIT: Duration = Duration::from_secs(20);
+    /// The most one page may take, retries included.
+    const READ_DEADLINE: Duration = Duration::from_secs(120);
+
+    /// Stop the node, if one runs: it shuts down when the last read holding it lets go.
+    pub fn stop() {
+        if let Ok(mut slot) = NODE.lock() {
+            if slot.take().is_some() {
+                tracing::info!("addr1: Swarm reader stopped");
+            }
+        }
+    }
 
     /// The node for `network`, started (or restarted for another network) on first use.
-    fn node(network: &Network) -> Result<(Arc<SwarmNode>, u64), Failure> {
+    fn node(network: &Network) -> Result<(Arc<SwarmNode>, Instant), Failure> {
         let mut slot = NODE.lock().map_err(|_| Failure::Retry("Swarm reader lock poisoned".into()))?;
         if slot.as_ref().map(|r| &r.network) != Some(network) {
             let cfg = match network {
@@ -305,11 +347,15 @@ mod reader {
                 }
             };
             let node = SwarmNode::start(cfg).map_err(|e| Failure::Retry(format!("Swarm reader did not start: {e}")))?;
-            // The old node, if any, stops when its last read lets go of it.
-            *slot = Some(Running { network: network.clone(), node: Arc::new(node), hints: Default::default() });
+            *slot = Some(Running {
+                network: network.clone(),
+                node: Arc::new(node),
+                started: Instant::now(),
+                hints: Default::default(),
+            });
         }
         let running = slot.as_ref().expect("set above");
-        Ok((Arc::clone(&running.node), 0))
+        Ok((Arc::clone(&running.node), running.started))
     }
 
     fn hint(chain_id: u64, importer: [u8; 20]) -> u64 {
@@ -331,9 +377,16 @@ mod reader {
         }
     }
 
-    /// One page, read on a runtime of its own: the engine's runtime drives the chain, and a
-    /// page is a short burst of chunk reads through the node's own runtime.
+    /// A failure of the node itself (not a miss, not invalid data): on a freshly started node
+    /// "no usable peers yet" (`myotis_swarm::NOT_READY_TEXT`) or a stream that could not be
+    /// opened yet, worth asking again while the node is fresh, and only then.
+    fn transient(e: &ReadError) -> bool {
+        matches!(e, ReadError::Source(_))
+    }
+
+    /// One page, on the engine's runtime (as every other host read).
     pub fn page(
+        rt: &tokio::runtime::Runtime,
         cfg: &Config,
         chain_id: u64,
         importer: [u8; 20],
@@ -341,33 +394,31 @@ mod reader {
         before: Option<(u64, u32)>,
         limit: usize,
     ) -> Result<Read, Failure> {
-        let (node, _) = node(&cfg.network)?;
+        let (node, started) = node(&cfg.network)?;
         let start = hint(chain_id, importer);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .map_err(|e| Failure::Retry(format!("runtime: {e}")))?;
         let read = rt.block_on(async {
-            // A node just started has few usable peers (connected, but before the BZZ
-            // handshake), and a read can meet "no usable peers": it is tried again, up to a
-            // bound. Invalid data or a miss ends it at once.
             let index = Index::new(node.as_ref(), chain_id, importer);
-            let t = std::time::Instant::now();
-            loop {
-                let attempt = async {
-                    let origin = index.origin().await?;
-                    let (n, head) = index.head(&origin, start).await?;
-                    let page = index.page(&head, address, before, limit).await?;
-                    Ok::<_, ReadError>(Read { head_update: n, page })
-                };
-                match attempt.await {
-                    Err(ReadError::Source(e)) if t.elapsed() < STARTUP_WAIT => {
-                        tracing::debug!(error = %e, "addr1: Swarm reader not ready yet");
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let attempts = async {
+                loop {
+                    let attempt = async {
+                        let origin = index.origin().await?;
+                        let (n, head) = index.head(&origin, start).await?;
+                        let page = index.page(&head, address, before, limit).await?;
+                        Ok::<_, ReadError>(Read { head_update: n, page })
+                    };
+                    match attempt.await {
+                        // A freshly started node is connected before its peers are usable.
+                        Err(e) if transient(&e) && started.elapsed() < STARTUP_WAIT => {
+                            tracing::debug!(error = %e, "addr1: Swarm reader not ready yet");
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        other => break other,
                     }
-                    other => break other,
                 }
-            }
+            };
+            tokio::time::timeout(READ_DEADLINE, attempts)
+                .await
+                .unwrap_or_else(|_| Err(ReadError::Source(format!("no page within {READ_DEADLINE:?}"))))
         });
         let read = read.map_err(failure)?;
         remember(chain_id, importer, read.head_update);
@@ -385,7 +436,10 @@ mod reader {
         Retry(String),
     }
 
+    pub fn stop() {}
+
     pub fn page(
+        _rt: &tokio::runtime::Runtime,
         _cfg: &Config,
         _chain_id: u64,
         _importer: [u8; 20],
@@ -429,7 +483,7 @@ mod tests {
     #[test]
     fn cursors_round_trip() {
         assert_eq!(parse_cursor("26458303:256"), Some((26_458_303, 256)));
-        for bad in ["", "1", "a:1", "1:b", "1:2:3"] {
+        for bad in ["", "1", "a:1", "1:b", "1:2:3", "+5:+1", ":1", "1:"] {
             assert_eq!(parse_cursor(bad), None, "{bad}");
         }
     }
@@ -442,7 +496,9 @@ mod tests {
         assert!(none.contains("importer") || none.contains("Swarm reader") || none.contains("mobile"), "{none}");
         // The arguments are checked once the reader may run; with the default settings the
         // refusal comes first, so check the shapes through parse_cursor/limit rules here.
-        assert_eq!(code(history_json(1, None, "0x00", "", 10)), serde_json::json!(eljson::INVALID_PARAMS));
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        assert_eq!(code(history_json(&rt, 1, None, "0x00", "", 10)), serde_json::json!(eljson::INVALID_PARAMS));
+        assert_eq!(parse_address(&format!("0x{}", "+f".repeat(20))), None, "a '+' is no hex digit");
     }
 
     /// Live, against a local Swarm network holding an index: `MYOTIS_ADDR1_DEV="<network id>
@@ -456,11 +512,12 @@ mod tests {
         let cfg = format!(r#"{{"importer":"{}","swarm":{{"network":"dev","networkId":{},"bootnodes":["{}"]}}}}"#, f[2], f[0], f[1]);
         assert_eq!(set_config_json(&cfg), "{}");
         let weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
-        let first: serde_json::Value = serde_json::from_str(&history_json(1, None, weth, "", 5)).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let first: serde_json::Value = serde_json::from_str(&history_json(&rt, 1, None, weth, "", 5)).unwrap();
         assert!(first["error"].is_null(), "{first}");
         assert_eq!(first["entries"].as_array().unwrap().len(), 5, "{first}");
         let next = first["next"].as_str().unwrap().to_string();
-        let second: serde_json::Value = serde_json::from_str(&history_json(1, None, weth, &next, 5)).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&history_json(&rt, 1, None, weth, &next, 5)).unwrap();
         let (a, b) = (&first["entries"][4], &second["entries"][0]);
         assert!((a["block"].as_u64(), a["slot"].as_u64()) > (b["block"].as_u64(), b["slot"].as_u64()));
         println!("{first}\n{second}");

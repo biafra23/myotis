@@ -271,3 +271,42 @@ fn a_slice_swarm_does_not_deliver_is_a_gap() {
     assert_eq!(page.gaps[0].to_block, range.end * 64 - 1);
     assert!(page.entries.iter().all(|e| e.block < range.start * 64));
 }
+
+#[test]
+fn a_spill_file_swarm_does_not_deliver_makes_its_slice_a_gap() {
+    use myotis_addr1::client::Index;
+    // Every content-addressed chunk withheld (the SOCs stay): the slices whose address
+    // records spill, or whose bucket is paged, cannot be read.
+    let log = std::fs::read(dir().join("addr1.export")).unwrap();
+    let mut files = Vec::new();
+    let mut rest = &log[..];
+    while !rest.is_empty() {
+        let n = u32::from_be_bytes(rest[33..37].try_into().unwrap()) as usize;
+        if rest[0] == 1 {
+            files.push(rest[37..37 + n].to_vec());
+        }
+        rest = &rest[37 + n..];
+    }
+    let mut chunks = Chunks::new();
+    for data in &files {
+        for (r, _) in myotis_addr1::swarm::file_tree(data) {
+            chunks.0.remove(&r);
+        }
+    }
+    let owner: [u8; 20] = unhex(OWNER).try_into().unwrap();
+    let index = Index::new(&chunks, CHAIN, owner);
+    let origin = block_on(index.origin()).unwrap();
+    let (_, head) = block_on(index.head(&origin, 0)).unwrap();
+    let mut gaps = 0;
+    for (address, want) in expected() {
+        // Never an error: what could be read, and a gap for each slice that could not.
+        let page = block_on(index.page(&head, &address, None, 10_000)).unwrap();
+        if page.gaps.is_empty() {
+            assert_eq!(page.entries.len(), want.len(), "address {address:02x?}");
+        } else {
+            assert!(page.entries.len() < want.len(), "address {address:02x?}");
+            gaps += 1;
+        }
+    }
+    assert!(gaps > 0, "the fixture's spill files make at least one gap");
+}
