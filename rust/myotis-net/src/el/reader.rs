@@ -610,6 +610,10 @@ pub struct VerifiedBlock {
     /// what `eth_getRawTransactionByBlock*AndIndex` serves (#715). Empty for a
     /// header-only read. Kept in the wire's compact list, as the body arrived.
     pub raw_transactions: crate::el::eth::messages::RawList,
+    /// The body's withdrawals as they arrived (each an RLP list `[index,
+    /// validatorIndex, address, amount]`), checked against `withdrawalsRoot`;
+    /// `None` before Shanghai and for a header-only read.
+    pub withdrawals: Option<crate::el::eth::messages::RawList>,
 }
 
 /// What a verified block read fetches beyond its anchored header window.
@@ -8548,6 +8552,7 @@ impl ElReader {
                     tx_hashes: Vec::new(),
                     full_transactions: None,
                     raw_transactions: crate::el::eth::messages::RawList::new(),
+                    withdrawals: None,
                 });
             }
             BlockDepth::Body { full_transactions } => full_transactions,
@@ -8592,6 +8597,7 @@ impl ElReader {
             tx_hashes,
             full_transactions: full,
             raw_transactions: body.transactions,
+            withdrawals: body.withdrawals,
         })
     }
 
