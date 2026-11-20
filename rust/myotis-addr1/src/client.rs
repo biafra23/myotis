@@ -33,7 +33,17 @@ pub trait ChunkSource: Sync {
         &self,
         address: [u8; 32],
         expect_missing: bool,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, String>> + Send;
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, SourceError>> + Send;
+}
+
+/// A source's failure, other than a miss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceError {
+    /// This one read failed (a timeout, a peer that reset the stream, no usable peers yet):
+    /// the chunk was not delivered, and asking again may work.
+    Transient(String),
+    /// The source itself is gone (its node stopped): no read can work.
+    Stopped(String),
 }
 
 /// Why a read failed.
@@ -41,10 +51,12 @@ pub trait ChunkSource: Sync {
 pub enum ReadError {
     /// A chunk the read needs was not delivered (retryable): what it was.
     Unavailable(String),
-    /// A chunk was delivered and failed its checks: the importer's index, or a peer's
-    /// answer, is not what the format allows. Not retryable from the same chunk.
+    /// A chunk was delivered and failed its checks: content its author (the importer) put
+    /// there that the format does not allow. Not retryable from the same chunk.
     Invalid(Error),
-    /// The source itself failed (its node stopped, a timeout).
+    /// A read failed for now (`SourceError::Transient`): within a page, its slice is a gap.
+    Transient(String),
+    /// The source itself is gone (`SourceError::Stopped`).
     Source(String),
 }
 
@@ -53,7 +65,17 @@ impl std::fmt::Display for ReadError {
         match self {
             ReadError::Unavailable(what) => write!(f, "not delivered by Swarm: {what}"),
             ReadError::Invalid(e) => write!(f, "invalid index data: {e}"),
+            ReadError::Transient(e) => write!(f, "Swarm read failed for now: {e}"),
             ReadError::Source(e) => write!(f, "Swarm reader: {e}"),
+        }
+    }
+}
+
+impl From<SourceError> for ReadError {
+    fn from(e: SourceError) -> Self {
+        match e {
+            SourceError::Transient(m) => ReadError::Transient(m),
+            SourceError::Stopped(m) => ReadError::Source(m),
         }
     }
 }
@@ -106,7 +128,7 @@ impl<'a, S: ChunkSource> Index<'a, S> {
     async fn soc(&self, identifier: [u8; 32], expect_missing: bool) -> ReadResult<Option<Vec<u8>>> {
         let address = soc_address(&identifier, &self.owner);
         match self.src.chunk(address, expect_missing).await {
-            Err(e) => Err(ReadError::Source(e)),
+            Err(e) => Err(e.into()),
             Ok(None) => Ok(None),
             Ok(Some(wire)) => Ok(Some(verify_soc(&wire, &address, &self.owner)?)),
         }
@@ -115,7 +137,7 @@ impl<'a, S: ChunkSource> Index<'a, S> {
     /// A content-addressed chunk, as delivered (checked by its decoder), or unavailable.
     async fn cac(&self, reference: [u8; 32], what: &str) -> ReadResult<Vec<u8>> {
         match self.src.chunk(reference, false).await {
-            Err(e) => Err(ReadError::Source(e)),
+            Err(e) => Err(e.into()),
             Ok(None) => Err(ReadError::Unavailable(format!("{what} chunk {}", crate::hex(&reference)))),
             Ok(Some(wire)) => Ok(wire),
         }
@@ -130,9 +152,10 @@ impl<'a, S: ChunkSource> Index<'a, S> {
         Ok(HeadRecord::decode(&payload)?)
     }
 
-    /// Head update `n`, checked against the origin, or `None` if not delivered.
-    async fn head_update(&self, origin: &HeadRecord, n: u64) -> ReadResult<Option<HeadRecord>> {
-        let Some(payload) = self.soc(head_id(self.chain_id, n), true).await? else {
+    /// Head update `n`, checked against the origin, or `None` if not delivered. `known` marks
+    /// an update this reader found before: it is asked for in full, not as a likely miss.
+    async fn head_update(&self, origin: &HeadRecord, n: u64, known: bool) -> ReadResult<Option<HeadRecord>> {
+        let Some(payload) = self.soc(head_id(self.chain_id, n), !known).await? else {
             return Ok(None);
         };
         let head = HeadRecord::decode(&payload)?;
@@ -144,7 +167,7 @@ impl<'a, S: ChunkSource> Index<'a, S> {
     /// to exist, 0 for the origin), then a binary search. A withheld update makes the head
     /// found older than the newest, never wrong: every update is checked against the origin.
     pub async fn head(&self, origin: &HeadRecord, hint: u64) -> ReadResult<(u64, HeadRecord)> {
-        let start = match self.head_update(origin, hint).await? {
+        let start = match self.head_update(origin, hint, true).await? {
             Some(h) => (hint, h),
             None => (0, origin.clone()),
         };
@@ -153,7 +176,7 @@ impl<'a, S: ChunkSource> Index<'a, S> {
         // Gallop: the first missing update above the last found one.
         let missing = loop {
             let n = found.0.saturating_add(step);
-            match self.head_update(origin, n).await? {
+            match self.head_update(origin, n, false).await? {
                 Some(h) => {
                     found = (n, h);
                     step = step.saturating_mul(2);
@@ -165,7 +188,7 @@ impl<'a, S: ChunkSource> Index<'a, S> {
         let (mut lo, mut hi) = (found, missing);
         while hi - lo.0 > 1 {
             let mid = lo.0 + (hi - lo.0) / 2;
-            match self.head_update(origin, mid).await? {
+            match self.head_update(origin, mid, false).await? {
                 Some(h) => lo = (mid, h),
                 None => hi = mid,
             }
@@ -260,9 +283,19 @@ impl<'a, S: ChunkSource> Index<'a, S> {
                 Ok::<_, ReadError>(spill_page(slice, &bytes, i == last)?)
             }
         };
-        // The newest page whose first entry is older than `before`.
+        // The newest page whose first entry is older than `before`. The last page first: that
+        // is the answer without a cursor, and for a cursor near the head.
         let (mut lo, mut hi) = (0u64, pages);
         let mut cached: Option<(u64, Vec<Entry>)> = None;
+        if pages > 1 {
+            let entries = page(last).await?;
+            if key(&entries[0]) < before {
+                (lo, hi) = (last, pages);
+                cached = Some((last, entries));
+            } else {
+                hi = last;
+            }
+        }
         while hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
             let entries = page(mid).await?;
@@ -339,8 +372,8 @@ impl<'a, S: ChunkSource> Index<'a, S> {
         for s in &plan.slices {
             let range = units(*s);
             let (first, last) = (range.start * UNIT_BLOCKS, range.end * UNIT_BLOCKS - 1);
-            if first > before.0 {
-                continue; // newer than the cursor
+            if (first, 0) >= before {
+                continue; // nothing in it is older than the cursor
             }
             if entries.len() >= limit {
                 exhausted = false;
@@ -352,7 +385,8 @@ impl<'a, S: ChunkSource> Index<'a, S> {
             // pages or spill chunk) makes the slice a gap; invalid data stays an error.
             let here = match self.slice_entries(head, *s, address, before, want + 1, &plan).await {
                 Ok(Some(here)) => here,
-                Ok(None) | Err(ReadError::Unavailable(_)) => {
+                // Not delivered, or not delivered for now: a gap, never the whole page.
+                Ok(None) | Err(ReadError::Unavailable(_)) | Err(ReadError::Transient(_)) => {
                     gaps.push(gap);
                     continue;
                 }
@@ -406,10 +440,86 @@ mod tests {
             &self,
             address: [u8; 32],
             _expect_missing: bool,
-        ) -> impl Future<Output = Result<Option<Vec<u8>>, String>> + Send {
+        ) -> impl Future<Output = Result<Option<Vec<u8>>, SourceError>> + Send {
             let got = self.0.get(&address).cloned();
             async move { Ok(got) }
         }
+    }
+
+    /// A spill file of `n` entries in one slice, as Swarm serves it, and the slice.
+    fn spill(n: u32) -> (Map, [u8; 32], SliceRecord, Vec<Entry>) {
+        let entries: Vec<Entry> = (0..n).map(|i| Entry { block: 64_000 + (i as u64 / 3), slot: 1 + i % 3, roles: 1 }).collect();
+        let data = crate::records::spill_file(&entries);
+        let (map, root) = files(&data);
+        let slice = SliceRecord {
+            level: 10,
+            index: 0,
+            first_block: 0,
+            last_block_hash: [0; 32],
+            bucket_count: 1,
+            addresses: 1,
+            appearances: n as u64,
+            buckets_root: [0; 32],
+            roles: 1,
+        };
+        (map, root, slice, entries)
+    }
+
+    #[test]
+    fn a_spill_file_of_many_pages_reads_newest_first_from_any_cursor() {
+        let (map, root, slice, entries) = spill(4000);
+        let pages = crate::records::spill_file(&entries).len().div_ceil(PAGE_SIZE);
+        assert!(pages >= 3, "{pages} pages");
+        let index = Index::new(&map, 1, [0; 20]);
+        let newest: Vec<Entry> = entries.iter().rev().copied().collect();
+        // No cursor: the newest entries.
+        let got = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10)).unwrap();
+        assert_eq!(got, newest[..10]);
+        // A cursor anywhere, and on either side of a page boundary: the entries below it.
+        let firsts: Vec<usize> = {
+            // The index (in `entries`) of each page's first entry.
+            let mut out = vec![0];
+            let mut seen = 0;
+            for p in 0..pages {
+                let start = p * PAGE_SIZE;
+                let leaf = &crate::records::spill_file(&entries)[start..(start + PAGE_SIZE).min(crate::records::spill_file(&entries).len())];
+                seen += spill_page(&slice, leaf, p + 1 == pages).unwrap().len();
+                out.push(seen);
+            }
+            out
+        };
+        for &i in firsts.iter().take(pages) {
+            for at in [i.saturating_sub(1), i, i + 1] {
+                if at >= entries.len() {
+                    continue;
+                }
+                let before = key(&entries[at]);
+                let want: Vec<Entry> = entries[..at].iter().rev().take(25).copied().collect();
+                let got = block_on(index.spill_newest(&slice, root, before, 25)).unwrap();
+                assert_eq!(got, want, "cursor at entry {at}");
+            }
+        }
+        // Everything, from the newest down.
+        let all = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10_000)).unwrap();
+        assert_eq!(all, newest);
+    }
+
+    #[test]
+    fn a_withheld_middle_page_is_not_delivered_not_invalid() {
+        let (map, root, slice, entries) = spill(4000);
+        let data = crate::records::spill_file(&entries);
+        // The chunks of the middle page's leaf withheld.
+        let mid = data.len().div_ceil(PAGE_SIZE) / 2;
+        let leaf = &data[mid * PAGE_SIZE..(mid + 1) * PAGE_SIZE];
+        let leaf_ref = crate::swarm::file_reference(leaf);
+        let mut partial = map.0.clone();
+        partial.remove(&leaf_ref);
+        let partial = Map(partial);
+        let index = Index::new(&partial, 1, [0; 20]);
+        let r = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10_000));
+        assert!(matches!(r, Err(ReadError::Unavailable(_))), "{r:?}");
+        // The newest pages above it still read.
+        assert!(block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10)).is_ok());
     }
 
     fn block_on<F: Future>(f: F) -> F::Output {

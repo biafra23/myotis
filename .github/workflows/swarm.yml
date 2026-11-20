@@ -3,8 +3,10 @@
 #
 # Its own workflow for the same reason as roost.yml: it is deliberately NOT a
 # workspace member (rust/Cargo.toml `exclude`), so `cargo test --workspace` and
-# rust-clippy.yml do not see it. No engine crate depends on it yet; once one does
-# (behind a feature), this lane must also build that feature and its sources.
+# rust-clippy.yml do not see it. myotis-engine links it behind its off-by-default
+# `swarm` feature, which no other lane enables: this lane also builds and tests the
+# engine with that feature (addrhist, the Swarm reader's only caller) and lints it at
+# rust-clippy.yml's level, and runs on changes to the crates that feature builds.
 #
 # ant is vendored in rust/vendor/ant (its VENDORED.md): this lane builds it as a
 # path dependency, and never fetches it. Cargo decides whether a path crate is
@@ -22,6 +24,9 @@ on:
     paths:
       - "rust/swarm/**"
       - "rust/vendor/ant/**"
+      - "rust/myotis-addr1/**"
+      - "rust/myotis-engine/**"
+      - "rust/Cargo.lock"
       - ".github/workflows/swarm.yml"
       - ".github/actions/rust-toolchain/**"
       - "rust/rust-toolchain.toml"
@@ -29,6 +34,9 @@ on:
     paths:
       - "rust/swarm/**"
       - "rust/vendor/ant/**"
+      - "rust/myotis-addr1/**"
+      - "rust/myotis-engine/**"
+      - "rust/Cargo.lock"
       - ".github/workflows/swarm.yml"
       - ".github/actions/rust-toolchain/**"
       - "rust/rust-toolchain.toml"
@@ -47,8 +55,15 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
-          workspaces: rust/swarm
+          workspaces: |
+            rust/swarm
+            rust
       - name: Tests
         run: cargo test --manifest-path rust/swarm/Cargo.toml --locked
       - name: Clippy
         run: cargo clippy --locked --manifest-path rust/swarm/Cargo.toml --all-targets -- -D warnings
+      # The engine with the reader linked: the only build of addrhist's Swarm half.
+      - name: Engine with `swarm` (tests)
+        run: cargo test --locked --manifest-path rust/Cargo.toml -p myotis-engine --features swarm --lib addrhist
+      - name: Engine with `swarm` (clippy, rust-clippy.yml's level)
+        run: cargo clippy --locked --manifest-path rust/Cargo.toml -p myotis-engine --features swarm --all-targets --keep-going -- -D clippy::incompatible_msrv

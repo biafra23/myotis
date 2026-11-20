@@ -127,7 +127,7 @@ pub struct SwarmNode {
     commands: mpsc::Sender<ControlCommand>,
     status: watch::Receiver<StatusSnapshot>,
     chunk_timeout: Duration,
-    runtime: Option<tokio::runtime::Runtime>,
+    runtime: std::sync::Mutex<Option<tokio::runtime::Runtime>>,
 }
 
 impl SwarmNode {
@@ -168,7 +168,7 @@ impl SwarmNode {
             commands,
             status,
             chunk_timeout: cfg.chunk_timeout,
-            runtime: Some(runtime),
+            runtime: std::sync::Mutex::new(Some(runtime)),
         })
     }
 
@@ -220,18 +220,40 @@ impl SwarmNode {
             .unwrap_or(Err(SwarmError::Timeout))
     }
 
-    /// [`Self::chunk`] with the error as text: what the addr1 reader's
-    /// [`ChunkSource`](myotis_addr1::client::ChunkSource) takes.
-    async fn chunk_text(&self, address: [u8; 32], expect_missing: bool) -> Result<Option<Vec<u8>>, String> {
-        self.chunk(address, expect_missing).await.map_err(|e| e.to_string())
+    /// [`Self::chunk`] with the error the addr1 reader's
+    /// [`ChunkSource`](myotis_addr1::client::ChunkSource) takes: a stopped node is
+    /// `Stopped`, every other failure (no usable peers yet, a timeout, a failed fetch)
+    /// `Transient`, for this read only.
+    async fn chunk_typed(
+        &self,
+        address: [u8; 32],
+        expect_missing: bool,
+    ) -> Result<Option<Vec<u8>>, myotis_addr1::client::SourceError> {
+        use myotis_addr1::client::SourceError;
+        self.chunk(address, expect_missing).await.map_err(|e| match e {
+            SwarmError::Stopped => SourceError::Stopped(e.to_string()),
+            other => SourceError::Transient(other.to_string()),
+        })
     }
 
     /// Stops the node: shuts its runtime down, which ends every task ant spawned (its swarm
     /// loop, listener and connections), waiting up to `timeout` for them. Blocking: call it
     /// from a thread that may block (not from inside an async task).
-    pub fn shutdown(mut self, timeout: Duration) {
-        if let Some(rt) = self.runtime.take() {
+    pub fn shutdown(self, timeout: Duration) {
+        let rt = self.runtime.lock().ok().and_then(|mut r| r.take());
+        if let Some(rt) = rt {
             rt.shutdown_timeout(timeout);
+        }
+    }
+
+    /// Stops the node now, from a shared reference, without waiting: every read in flight
+    /// ends with [`SwarmError::Stopped`] and the node's tasks, listener and connections end
+    /// with its runtime. Safe inside an async context. For a switch that must take effect at
+    /// once (Tor routing turned on), however many readers still hold the node.
+    pub fn stop(&self) {
+        let rt = self.runtime.lock().ok().and_then(|mut r| r.take());
+        if let Some(rt) = rt {
+            rt.shutdown_background();
         }
     }
 }
@@ -242,17 +264,15 @@ impl myotis_addr1::client::ChunkSource for SwarmNode {
         &self,
         address: [u8; 32],
         expect_missing: bool,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send {
-        self.chunk_text(address, expect_missing)
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, myotis_addr1::client::SourceError>> + Send {
+        self.chunk_typed(address, expect_missing)
     }
 }
 
 impl Drop for SwarmNode {
     /// Dropping the node stops it too, without waiting (safe inside an async context).
     fn drop(&mut self) {
-        if let Some(rt) = self.runtime.take() {
-            rt.shutdown_background();
-        }
+        self.stop();
     }
 }
 
@@ -356,7 +376,7 @@ mod tests {
     }
 
     /// Against a running bee-factory (not run by default):
-    /// `SWARM_DEV_BOOTNODE=/ip4/127.0.0.1/tcp/1734/p2p/<queen peer id> SWARM_DEV_NETWORK=1337
+    /// `SWARM_DEV_BOOTNODE=<multiaddr of a node> SWARM_DEV_NETWORK=<network id>
     /// SWARM_DEV_CHUNK=<hex address> cargo test --manifest-path rust/swarm/Cargo.toml --
     /// --ignored --nocapture`.
     #[test]
