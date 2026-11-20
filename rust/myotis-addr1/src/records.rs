@@ -560,7 +560,7 @@ fn flush_page(file: &mut Vec<u8>, body: &[u8], count: u16, last: bool) {
 
 /// The canonical spill file of `entries` (pages of `count ‖ first_block ‖ entries`, filled
 /// greedily): what [`spill_entries`] compares a read file with.
-fn spill_file(entries: &[Entry]) -> Vec<u8> {
+pub(crate) fn spill_file(entries: &[Entry]) -> Vec<u8> {
     let mut file = Vec::new();
     let mut body = Vec::new();
     let mut count = 0u16;

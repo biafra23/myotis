@@ -60,9 +60,10 @@ members = ["myotis-addr1", "myotis-bls", "myotis-consensus", "myotis-core", "myo
 #
 # swarm (crate myotis-swarm, the embedded ant Swarm node) is excluded too: a member is
 # built by every `cargo build --workspace`, the release build included, and would pull
-# ant's libp2p features (dns, ping, upnp) into the engine. No engine crate depends on it
-# yet (rust/swarm/src/lib.rs, "Not linked into the engine yet"). Its own lock is
-# rust/swarm/Cargo.lock, seeded from this one.
+# ant's libp2p features (dns, ping, upnp) into the engine. myotis-engine links it only
+# behind its off-by-default `swarm` feature (dev builds; rust/swarm/src/lib.rs, "Not ready
+# for a release build"), so this lock records its graph and no shipped build compiles it.
+# Its own lock, rust/swarm/Cargo.lock, is for building it on its own (tests, the example).
 #
 # vendor holds third-party sources copied in verbatim, today ant (vendor/ant/VENDORED.md):
 # not on crates.io, and as a git dependency it would make every cold build fetch it.
