@@ -97,6 +97,27 @@ pub struct Gap {
     pub to_block: u64,
 }
 
+/// Which entries a page holds: those with a role in `roles` (any of its bits), in block
+/// `from_block` or later. Applied while reading, so a page is full whatever it leaves out,
+/// and the reading stops at the first slice (or spill page) older than `from_block`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Filter {
+    pub roles: u8,
+    pub from_block: u64,
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Filter { roles: 0xff, from_block: 0 }
+    }
+}
+
+impl Filter {
+    pub fn keeps(&self, e: &Entry) -> bool {
+        e.roles & self.roles != 0 && e.block >= self.from_block
+    }
+}
+
 /// A page of an address's entries, newest first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
@@ -272,6 +293,7 @@ impl<'a, S: ChunkSource> Index<'a, S> {
         reference: [u8; 32],
         before: (u64, u32),
         limit: usize,
+        filter: &Filter,
     ) -> ReadResult<Vec<Entry>> {
         let root = FileChunk::decode_root(&self.cac(reference, "spill").await?, &reference, MAX_SPAN)?;
         let pages = root.span().div_ceil(PAGE_SIZE as u64);
@@ -317,8 +339,9 @@ impl<'a, S: ChunkSource> Index<'a, S> {
             if let Some(newer) = &newer {
                 check_page_boundary(&entries, newer)?;
             }
-            out.extend(entries.iter().rev().filter(|e| key(e) < before));
-            if out.len() >= limit || i == 0 {
+            out.extend(entries.iter().rev().filter(|e| key(e) < before && filter.keeps(e)));
+            // Older pages hold only older entries: none of them in the range.
+            if out.len() >= limit || i == 0 || entries[0].block < filter.from_block {
                 break;
             }
             newer = Some(entries);
@@ -338,6 +361,7 @@ impl<'a, S: ChunkSource> Index<'a, S> {
         before: (u64, u32),
         want: usize,
         plan: &crate::cover::Plan,
+        filter: &Filter,
     ) -> ReadResult<Option<Vec<Entry>>> {
         let Some(slice) = self.slice(s, head.first_unit).await? else {
             return Ok(None);
@@ -345,24 +369,30 @@ impl<'a, S: ChunkSource> Index<'a, S> {
         let Some(found) = self.in_slice(address, &slice).await? else {
             return Ok(None);
         };
-        let mut here: Vec<Entry> =
-            found.entries.iter().copied().filter(|e| key(e) < before && plan.keep(e.block)).collect();
+        let mut here: Vec<Entry> = found
+            .entries
+            .iter()
+            .copied()
+            .filter(|e| key(e) < before && plan.keep(e.block) && filter.keeps(e))
+            .collect();
         for (reference, _count) in &found.spill_files {
-            let spilled = self.spill_newest(&slice, *reference, before, want).await?;
+            let spilled = self.spill_newest(&slice, *reference, before, want, filter).await?;
             here.extend(spilled.into_iter().filter(|e| plan.keep(e.block)));
         }
         Ok(Some(merge_by_key(here)))
     }
 
-    /// A page of `address`'s entries at `head`: up to `limit`, newest first, strictly older
-    /// than `before` (`None`: from the head). The slices of the head's cover are read newest
-    /// first until the page is full; one that is not delivered becomes a [`Gap`].
+    /// A page of `address`'s entries at `head`: up to `limit` that `filter` keeps, newest
+    /// first, strictly older than `before` (`None`: from the head). The slices of the head's
+    /// cover are read newest first until the page is full or the slices are older than the
+    /// filter's first block; one that is not delivered becomes a [`Gap`].
     pub async fn page(
         &self,
         head: &HeadRecord,
         address: &[u8; 20],
         before: Option<(u64, u32)>,
         limit: usize,
+        filter: &Filter,
     ) -> ReadResult<Page> {
         let plan = slices_to_read(head, None)?;
         let before = before.unwrap_or((u64::MAX, u32::MAX));
@@ -375,6 +405,9 @@ impl<'a, S: ChunkSource> Index<'a, S> {
             if (first, 0) >= before {
                 continue; // nothing in it is older than the cursor
             }
+            if last < filter.from_block {
+                break; // this slice and every older one lie below the range
+            }
             if entries.len() >= limit {
                 exhausted = false;
                 break;
@@ -383,7 +416,7 @@ impl<'a, S: ChunkSource> Index<'a, S> {
             let want = limit - entries.len();
             // A chunk of this slice Swarm did not deliver (its descriptor, its bucket, a
             // pages or spill chunk) makes the slice a gap; invalid data stays an error.
-            let here = match self.slice_entries(head, *s, address, before, want + 1, &plan).await {
+            let here = match self.slice_entries(head, *s, address, before, want + 1, &plan, filter).await {
                 Ok(Some(here)) => here,
                 // Not delivered, or not delivered for now: a gap, never the whole page.
                 Ok(None) | Err(ReadError::Unavailable(_)) | Err(ReadError::Transient(_)) => {
@@ -473,7 +506,7 @@ mod tests {
         let index = Index::new(&map, 1, [0; 20]);
         let newest: Vec<Entry> = entries.iter().rev().copied().collect();
         // No cursor: the newest entries.
-        let got = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10)).unwrap();
+        let got = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10, &Filter::default())).unwrap();
         assert_eq!(got, newest[..10]);
         // A cursor anywhere, and on either side of a page boundary: the entries below it.
         let firsts: Vec<usize> = {
@@ -495,12 +528,12 @@ mod tests {
                 }
                 let before = key(&entries[at]);
                 let want: Vec<Entry> = entries[..at].iter().rev().take(25).copied().collect();
-                let got = block_on(index.spill_newest(&slice, root, before, 25)).unwrap();
+                let got = block_on(index.spill_newest(&slice, root, before, 25, &Filter::default())).unwrap();
                 assert_eq!(got, want, "cursor at entry {at}");
             }
         }
         // Everything, from the newest down.
-        let all = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10_000)).unwrap();
+        let all = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10_000, &Filter::default())).unwrap();
         assert_eq!(all, newest);
     }
 
@@ -516,10 +549,10 @@ mod tests {
         partial.remove(&leaf_ref);
         let partial = Map(partial);
         let index = Index::new(&partial, 1, [0; 20]);
-        let r = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10_000));
+        let r = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10_000, &Filter::default()));
         assert!(matches!(r, Err(ReadError::Unavailable(_))), "{r:?}");
         // The newest pages above it still read.
-        assert!(block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10)).is_ok());
+        assert!(block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10, &Filter::default())).is_ok());
     }
 
     fn block_on<F: Future>(f: F) -> F::Output {

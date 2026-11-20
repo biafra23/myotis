@@ -3303,7 +3303,7 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions:
 /// (`addrhist`), for the chain of a running handle; the handle's verified head bounds the
 /// head gap. Refused with the permanent -32602 where the carve-out says so.
 #[allow(dead_code)] // exported over the FFI by part 7 of #899
-pub fn address_history_json(handle: i64, address: &str, cursor: &str, limit: i64) -> String {
+pub fn address_history_json(handle: i64, address: &str, options_json: &str) -> String {
     // A build without the reader refuses for good, whatever the handle's state.
     if let Some(refused) = crate::addrhist::early_refusal() {
         return refused;
@@ -3316,7 +3316,7 @@ pub fn address_history_json(handle: i64, address: &str, cursor: &str, limit: i64
         Err(msg) => return eljson::error_json(msg),
     };
     let head = Some(reader.optimistic_block_number()).filter(|h| *h > 0);
-    crate::addrhist::history_json(&engine.rt, chain_id, head, address, cursor, limit)
+    crate::addrhist::history_json(&engine.rt, chain_id, head, address, options_json)
 }
 
 /// `verify_address_history_json`: check entries of `address`'s history (as a page returns

@@ -225,7 +225,7 @@ fn the_client_pages_every_address_newest_first_as_eth2swarm_found_it() {
     for (address, want) in expected() {
         let newest_first: Vec<Entry> = want.iter().rev().copied().collect();
         // One page holds everything.
-        let all = block_on(index.page(&head, &address, None, 10_000)).unwrap();
+        let all = block_on(index.page(&head, &address, None, 10_000, &myotis_addr1::client::Filter::default())).unwrap();
         assert_eq!(all.entries, newest_first, "address {address:02x?}");
         assert_eq!((all.next, all.gaps.len()), (None, 0));
         assert_eq!((all.from_block, all.to_block), (1920, 33 * 64 - 1));
@@ -234,7 +234,7 @@ fn the_client_pages_every_address_newest_first_as_eth2swarm_found_it() {
             let mut got = Vec::new();
             let mut cursor = None;
             loop {
-                let page = block_on(index.page(&head, &address, cursor, size)).unwrap();
+                let page = block_on(index.page(&head, &address, cursor, size, &myotis_addr1::client::Filter::default())).unwrap();
                 assert!(page.entries.len() <= size);
                 got.extend(page.entries);
                 match page.next {
@@ -246,7 +246,7 @@ fn the_client_pages_every_address_newest_first_as_eth2swarm_found_it() {
         }
     }
     // An address the index never saw: an empty, complete answer.
-    let none = block_on(index.page(&head, &[0x42; 20], None, 10)).unwrap();
+    let none = block_on(index.page(&head, &[0x42; 20], None, 10, &myotis_addr1::client::Filter::default())).unwrap();
     assert!(none.entries.is_empty() && none.next.is_none() && none.gaps.is_empty());
 }
 
@@ -265,7 +265,7 @@ fn a_slice_swarm_does_not_deliver_is_a_gap() {
     chunks.0.remove(&soc_address(&slice_id(CHAIN, newest.0, newest.1), &owner));
     let index = Index::new(&chunks, CHAIN, owner);
     let (address, _) = expected().into_iter().next().unwrap();
-    let page = block_on(index.page(&head, &address, None, 10_000)).unwrap();
+    let page = block_on(index.page(&head, &address, None, 10_000, &myotis_addr1::client::Filter::default())).unwrap();
     assert_eq!(page.gaps.len(), 1);
     let range = myotis_addr1::cover::units(newest);
     assert_eq!(page.gaps[0].to_block, range.end * 64 - 1);
@@ -300,7 +300,7 @@ fn a_spill_file_swarm_does_not_deliver_makes_its_slice_a_gap() {
     let mut gaps = 0;
     for (address, want) in expected() {
         // Never an error: what could be read, and a gap for each slice that could not.
-        let page = block_on(index.page(&head, &address, None, 10_000)).unwrap();
+        let page = block_on(index.page(&head, &address, None, 10_000, &myotis_addr1::client::Filter::default())).unwrap();
         if page.gaps.is_empty() {
             assert_eq!(page.entries.len(), want.len(), "address {address:02x?}");
         } else {
@@ -309,4 +309,42 @@ fn a_spill_file_swarm_does_not_deliver_makes_its_slice_a_gap() {
         }
     }
     assert!(gaps > 0, "the fixture's spill files make at least one gap");
+}
+
+#[test]
+fn a_filtered_page_holds_only_what_the_filter_keeps_and_is_still_full() {
+    use myotis_addr1::client::{Filter, Index};
+    let chunks = Chunks::new();
+    let owner: [u8; 20] = unhex(OWNER).try_into().unwrap();
+    let index = Index::new(&chunks, CHAIN, owner);
+    let origin = block_on(index.origin()).unwrap();
+    let (_, head) = block_on(index.head(&origin, 0)).unwrap();
+    for (address, want) in expected() {
+        let mid = want.get(want.len() / 2).map_or(0, |e| e.block);
+        for filter in [
+            Filter { roles: 0x01, from_block: 0 },             // FROM only
+            Filter { roles: 0x04 | 0x08, from_block: 0 },      // log roles
+            Filter { roles: 0xff, from_block: mid },           // a block range
+            Filter { roles: 0x02, from_block: mid },
+        ] {
+            let filtered: Vec<Entry> = want.iter().rev().copied().filter(|e| filter.keeps(e)).collect();
+            // In pages of 3, followed by their cursors.
+            let mut got = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = block_on(index.page(&head, &address, cursor, 3, &filter)).unwrap();
+                assert!(page.entries.len() <= 3);
+                // Full until the last page.
+                if page.next.is_some() {
+                    assert_eq!(page.entries.len(), 3, "a filtered page is still full");
+                }
+                got.extend(page.entries);
+                match page.next {
+                    Some(c) => cursor = Some(c),
+                    None => break,
+                }
+            }
+            assert_eq!(got, filtered, "address {address:02x?}, {filter:?}");
+        }
+    }
 }
