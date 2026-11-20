@@ -6,6 +6,11 @@
 # rust-clippy.yml do not see it. No engine crate depends on it yet; once one does
 # (behind a feature), this lane must also build that feature and its sources.
 #
+# ant is vendored in rust/vendor/ant (its VENDORED.md): this lane builds it as a
+# path dependency, and checks that the copy is upstream's at the recorded commit
+# (scripts/vendor_ant.sh --check). That check is the only step in CI that fetches
+# ant from GitHub; the builds never do.
+#
 # Path-filtered, and `push` scoped to main as in the other Rust lanes, so a push
 # to a branch with an open PR runs once (under pull_request).
 name: swarm
@@ -15,12 +20,16 @@ on:
     branches: ["main"]
     paths:
       - "rust/swarm/**"
+      - "rust/vendor/ant/**"
+      - "scripts/vendor_ant.sh"
       - ".github/workflows/swarm.yml"
       - ".github/actions/rust-toolchain/**"
       - "rust/rust-toolchain.toml"
   pull_request:
     paths:
       - "rust/swarm/**"
+      - "rust/vendor/ant/**"
+      - "scripts/vendor_ant.sh"
       - ".github/workflows/swarm.yml"
       - ".github/actions/rust-toolchain/**"
       - "rust/rust-toolchain.toml"
@@ -44,3 +53,11 @@ jobs:
         run: cargo test --manifest-path rust/swarm/Cargo.toml --locked
       - name: Clippy
         run: cargo clippy --locked --manifest-path rust/swarm/Cargo.toml --all-targets -- -D warnings
+      - name: rust/vendor/ant is upstream's ant at its recorded commit
+        run: scripts/vendor_ant.sh --check
+      - name: No git sources in the lock (ant is vendored)
+        run: |
+          if grep -n '^source = "git+' rust/swarm/Cargo.lock; then
+            echo "::error file=rust/swarm/Cargo.lock::a git source is back in the lock; vendor it under rust/vendor instead (rust/vendor/ant/VENDORED.md)"
+            exit 1
+          fi

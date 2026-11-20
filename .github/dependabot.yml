@@ -111,6 +111,10 @@ updates:
       - "/rust/roost"
       - "/rust/tor-poc"
       - "/rust/swarm"
+    # rust/vendor holds third-party sources copied in verbatim (rust/vendor/ant/VENDORED.md):
+    # Dependabot must not edit their manifests. An ant update is scripts/vendor_ant.sh.
+    exclude-paths:
+      - "rust/vendor/**"
     schedule:
       interval: monthly
     cooldown:

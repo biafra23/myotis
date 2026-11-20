@@ -1,0 +1,40 @@
+[package]
+name = "ant-node"
+version = "0.5.78"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ant-control = { path = "../ant-control" }
+ant-crypto = { path = "../ant-crypto" }
+# Propagate `default-features = false` so the iOS slice (via ant-ffi)
+# can opt out of the `reqwest`/`hyper-rustls`/`ring` chain used only by
+# the JSON-RPC writer side of ant-chain. Desktop binaries (`antd`,
+# `antctl`) keep the default `chain-rpc` feature on so nothing changes
+# for them.
+ant-p2p = { path = "../ant-p2p", default-features = false }
+ant-retrieval = { path = "../ant-retrieval" }
+async-trait.workspace = true
+futures = "0.3.31"
+hex.workspace = true
+libp2p.workspace = true
+memmap2 = "0.9.10"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# `test-util` enables `#[tokio::test(start_paused = true)]`, used to
+# auto-advance the clock through push back-off in the re-queue test.
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = ["chain-rpc"]
+chain-rpc = ["ant-p2p/chain-rpc"]
+
+[lints]
+workspace = true

@@ -1,0 +1,61 @@
+[package]
+name = "ant-p2p"
+version = "0.5.78"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[example]]
+name = "cheque_smoke"
+path = "examples/cheque_smoke.rs"
+
+[dependencies]
+# `default-features = false` cuts the `chain-rpc` chain (reqwest +
+# hyper-rustls + ring) for embedders that only need ant-chain's
+# pure-compute helpers (cheque signing, EIP-712 hashes, calldata
+# builders) — `ant-ffi` is the canonical such embedder. The
+# `chain-rpc` feature below propagates the cut back on for any consumer
+# that does need a JSON-RPC client.
+ant-chain = { path = "../ant-chain", default-features = false }
+ant-control = { path = "../ant-control" }
+ant-crypto = { path = "../ant-crypto" }
+ant-postage = { path = "../ant-postage" }
+ant-retrieval = { path = "../ant-retrieval" }
+async-trait = "0.1.89"
+base64 = "0.22.1"
+futures = "0.3.31"
+hex.workspace = true
+if-addrs = "0.15.0"
+hickory-resolver = { version = "0.25.2", default-features = false, features = [
+  "system-config",
+  "tokio"
+] }
+k256.workspace = true
+libp2p.workspace = true
+libp2p-stream = "0.4.0-alpha"
+libp2p-swarm = "0.47.1"
+primitive-types = { version = "0.14.0", default-features = false }
+prost.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unsigned-varint.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# The cheque-verdict test runs bee's FIN-vs-RST endings over real yamux.
+tokio-util = { version = "0.7", features = ["compat"] }
+yamux = "0.13.10"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+# `test-util` enables `#[tokio::test(start_paused = true)]` so the probe
+# late-delivery tests resolve their timeouts in virtual time.
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = ["chain-rpc"]
+chain-rpc = ["ant-chain/chain-rpc"]
+
+[lints]
+workspace = true

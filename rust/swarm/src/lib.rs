@@ -24,13 +24,10 @@
 //!   advisories that `myotis-net` keeps out of every build on purpose.
 //! - ant would run inside the engine under the workspace's `panic = "abort"`: a panic anywhere
 //!   in its networking code, on input from any Swarm peer, would end the host process.
-//! - ant is a git dependency (not on crates.io): in the engine's lock it would make every
-//!   cold build of the workspace fetch it, default builds included, with no advisory coverage
-//!   and no registry checksum.
 //!
 //! Each needs a change in ant (an option for no listener and no UPnP, DNS behind a feature or
-//! through the host's resolver, a crates.io release or a mirror the owner controls) or an
-//! owner's decision.
+//! through the host's resolver, a panic contract) or an owner's decision. ant itself is
+//! vendored (`rust/vendor/ant`, its `VENDORED.md`): no build fetches it from GitHub.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

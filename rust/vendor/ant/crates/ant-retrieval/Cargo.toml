@@ -1,0 +1,50 @@
+[package]
+name = "ant-retrieval"
+version = "0.5.78"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ant-crypto = { path = "../ant-crypto" }
+ant-postage = { path = "../ant-postage" }
+async-trait = "0.1.89"
+crossbeam-channel = "0.5"
+# Free-space check before rebuilding a legacy chunk cache with VACUUM
+# (statvfs via rustix / GetDiskFreeSpaceEx); already used by ant-postage.
+fs4 = "1.0.2"
+futures = "0.3.31"
+# OS randomness for encrypted-upload ciphertext padding (bee pads the
+# ciphertext tail with crypto/rand bytes; keys come from ant-crypto).
+getrandom = "0.3.2"
+hex.workspace = true
+# ACT grantee lists carry secp256k1 public keys (bee stores them as
+# uncompressed SEC1 points); serde/serde_json serialize the ACT
+# key-value store's bee-compatible simple-manifest JSON.
+k256.workspace = true
+libp2p.workspace = true
+libp2p-stream = "0.4.0-alpha"
+lru = "0.17.0"
+prost.workspace = true
+# Reed-Solomon erasure decoding for swarm-redundancy-level reads. Same
+# Backblaze/klauspost GF(2^8) construction bee uses; byte-compatibility
+# with bee-generated parities is proven by ant-conformance's rs tests.
+reed-solomon-erasure = "6.0.0"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unsigned-varint.workspace = true
+
+[dev-dependencies]
+k256.workspace = true
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+# `test-util` enables `#[tokio::test(start_paused = true)]` so the feed
+# finder's probe-retry backoff resolves in virtual time during tests.
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

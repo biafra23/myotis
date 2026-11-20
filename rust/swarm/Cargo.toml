@@ -13,13 +13,14 @@ description = "Myotis's embedded Swarm reader: an ant light node linked into the
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# ant (https://github.com/freedom-hq/ant), pinned by commit; its crates are not on
-# crates.io. default-features = false drops ant-chain's JSON-RPC writer (reqwest,
-# rustls): reads need no chain access.
-ant-node = { git = "https://github.com/freedom-hq/ant", rev = "b138f6bc074d8c28149017d4e7b1e80db8c67d4d", default-features = false }
-ant-control = { git = "https://github.com/freedom-hq/ant", rev = "b138f6bc074d8c28149017d4e7b1e80db8c67d4d" }
-ant-p2p = { git = "https://github.com/freedom-hq/ant", rev = "b138f6bc074d8c28149017d4e7b1e80db8c67d4d", default-features = false }
-ant-crypto = { git = "https://github.com/freedom-hq/ant", rev = "b138f6bc074d8c28149017d4e7b1e80db8c67d4d" }
+# ant (https://github.com/freedom-hq/ant), vendored in ../vendor/ant at the commit its
+# VENDORED.md names: its crates are not on crates.io, and a git dependency would make
+# every cold build fetch it. default-features = false drops ant-chain's JSON-RPC writer
+# (reqwest, rustls): reads need no chain access.
+ant-node = { path = "../vendor/ant/crates/ant-node", default-features = false }
+ant-control = { path = "../vendor/ant/crates/ant-control" }
+ant-p2p = { path = "../vendor/ant/crates/ant-p2p", default-features = false }
+ant-crypto = { path = "../vendor/ant/crates/ant-crypto" }
 libp2p = { version = "=0.56.0", features = ["secp256k1"] }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
