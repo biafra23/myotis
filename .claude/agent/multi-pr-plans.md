@@ -70,7 +70,8 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    through a PR into the feature
    branch like a part, because the resolution is new code — and, like
    a part, it gets no artifact build (the exception below): a resolution in
-   `rust/` or a host module is cross-compiled only at the final PR unless the
+   `rust/` or a host module is cross-compiled only at the final PR (for the
+   APK and the dmg: in the merge queue, when the owner queues it) unless the
    merge PR dispatches the APK / dmg / iOS workflow on its branch. Build and
    Test (`ci.yml`) and nearly every other push trigger fire only on `main`
    (path-filtered `roost.yml` is the exception), so a clean merge is first
@@ -109,15 +110,26 @@ on the PR workflows' `pull_request` triggers (`pull_request_target` for
 `ci.yml`, `android-apk.yml` and siblings), which is what
 gives part PRs the tests, clippy, the lockfile check and the Claude review; do
 not narrow them to `main`. **The artifact builds are the exception** (owner
-ruling, 2026-10-09): the Android APK + emulator smoke, the macOS dmg and the
-iOS framework skip a PR whose base is not `main` (a job-level `if` in those
-workflows — the checks show as skipped, not absent), because a packaging leg
-per part costs more than it tells; the final `feature/<topic>` → `main` PR
-builds everything, and a part that touches what those legs alone check (the
-Rust engine's Android/iOS cross-compiles, the engine's C ABI, the minSdk-29
-budget — `check_apk_min_api.py` runs only in the APK workflow) can dispatch
-the workflow on its branch from the Actions tab. A PR retargeted to `main`
-after it was opened keeps its skipped checks — a base change is an `edited`
-event, which these workflows do not run on — so push a commit or dispatch the
-three workflows before it merges, or the first artifact build of that head is
-the post-merge run on `main`.
+ruling, 2026-10-09): the iOS framework and the Windows msi skip a PR whose
+base is not `main` (a job-level `if` — the check shows as skipped, not
+absent), because a packaging leg per part costs more than it tells. **The Android APK and the macOS dmg build
+on no PR at all, but in the merge queue** (owner's request, 2026-11-19): once
+per PR into `main`, on the commit `main` will become, when the owner queues
+it. The non-blocking emulator smoke runs after the merge, on `main`. Their workflows still start on every PR and
+report `Android APK result` and `Desktop DMG result` as passed, the checks the
+queue requires. The final `feature/<topic>` → `main` PR goes through the queue
+like any other, so it still builds everything before it lands. A part, or any
+PR, that touches what those legs alone check can dispatch the workflow on
+its branch from the Actions tab before it is queued. They alone check: the
+Rust engine's Android cross-compile and the engine's C ABI; the regenerate-
+and-diff of the committed UniFFI bindings (`build.md`: a doc-comment edit on
+an exported fn is enough to drift them); the engine-load and 16 KB alignment
+checks on the built APKs; the minSdk-29 budget (`check_apk_min_api.py`); the
+macOS-only desktop tests (the Objective-C bridges) and jpackage itself.
+Whether such a PR must have a green dispatched run before it is reported
+ready, as `reproducibility.md` asks for its gate, is open: the owner
+decides. A PR
+retargeted to `main` after it was opened keeps its skipped iOS framework check
+— a base change is an `edited` event, which that workflow does not run on — so
+push a commit or dispatch it before it merges, or its first build of that head
+is the post-merge run on `main`.

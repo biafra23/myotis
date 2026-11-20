@@ -26,10 +26,10 @@
   don't import the `:core` helpers — they inline the few lines instead (hosts
   talk only to `:myotis-api`). The ENFORCEMENT is
   `scripts/check_apk_min_api.py`, run by the android-apk workflow against the
-  built APK's dex — the post-desugaring ground truth — on pushes to `main`, on
-  PRs into `main` and on dispatch; a part PR into a feature branch does not
-  build the APK (see the multi-PR section), so for a feature plan this check
-  first runs at the final PR unless a part dispatches the workflow. It also resolves calls
+  built APK's dex — the post-desugaring ground truth — on pushes to `main`, in
+  the merge queue and on dispatch; no PR builds the APK (owner's request,
+  2026-11-19; see the multi-PR section), so this check first runs when the
+  owner queues a PR, unless the PR's branch dispatches the workflow first. It also resolves calls
   that reach a JDK method through a third-party subclass, which lint-style
   source checks and a naive api-versions.xml lookup both miss (that is exactly
   how `SnappyFramedInputStream.readAllBytes()` once slipped through), plus

@@ -13,7 +13,9 @@
 #     build:
 #       needs: review-gate
 #
-# Callers: android-apk, desktop-dmg, desktop-windows-msi, ios-framework. Build
+# Callers: desktop-windows-msi, ios-framework. (android-apk and desktop-dmg
+# called it until they moved to the merge queue, 2026-11-19: they no longer
+# build on a PR, and on any other event this file waits for nothing.) Build
 # and Test (ci.yml) and the other Linux checks stay ungated on purpose: they are
 # the test signal, and holding them for the review would only delay it.
 #
@@ -37,8 +39,8 @@
 # this file failing to load (a YAML error, a rename without its callers): the
 # callers then fail at startup, builds and tag release uploads included,
 # as with any broken workflow file. A PR that does that goes red on
-# android-apk and desktop-dmg, which run on every PR into main, before it can
-# merge.
+# desktop-windows-msi and ios-framework before it can merge: both list this
+# file in their PR `paths`.
 #
 # THE CALLER'S JOB MAY CARRY AN `if:` ONLY IF IT IS TRUE ON EVERY EVENT BUT
 # pull_request. When a job is skipped, GitHub skips every job in the `needs:`

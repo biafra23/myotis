@@ -20,7 +20,8 @@ name: Desktop MSI (Windows)
 on:
   push:
     branches: [ "main" ]
-  # Path-filtered, unlike the dmg. A Windows packaging leg on every PR would
+  # Path-filtered, unlike the dmg (which builds in the merge queue for every PR
+  # into main since 2026-11-19). A Windows packaging leg on every PR would
   # cost more than it tells (the reason desktop-linux-deb.yml has no PR trigger
   # at all), but a change to the packaging, or to what the smoke below reads
   # (the engine loader's log line, the log file's location), should prove the
@@ -28,11 +29,13 @@ on:
   # engine for Windows today (node-binding.yml's Windows leg runs on main), and
   # this leg on every Rust PR would be the deb's queue problem again. Base
   # branches stay unscoped (CLAUDE.md, "Multi-PR plans"); the review gate's
-  # `if` below skips a PR whose base is not main, as for the other artifact
-  # builds.
+  # `if` below skips a PR whose base is not main, as the iOS framework's does.
+  # (The APK and the dmg build on no PR: they build in the merge queue.)
   pull_request:
     paths:
       - ".github/workflows/desktop-windows-msi.yml"
+      # The review gate it calls: a PR that breaks that file goes red here.
+      - ".github/workflows/wait-for-claude-review.yml"
       - ".java-version"
       - ".github/actions/rust-toolchain/**"
       - "rust/rust-toolchain.toml"
@@ -59,8 +62,8 @@ defaults:
     shell: bash
 
 jobs:
-  # Holds the build until this PR's Claude review has finished, like the dmg
-  # and APK builds (see wait-for-claude-review.yml). Its `if:` must stay true
+  # Holds the build until this PR's Claude review has finished, as the iOS
+  # framework's build does (see wait-for-claude-review.yml). Its `if:` must stay true
   # on every non-pull_request event: skipping it skips the build too.
   review-gate:
     name: Review gate
