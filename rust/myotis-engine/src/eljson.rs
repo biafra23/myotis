@@ -296,12 +296,12 @@ pub fn block_json(b: &VerifiedBlock) -> String {
     // The ommers' hashes, from the body verified against `sha3Uncles` (empty since the
     // Merge, and for a header-only serve).
     s.push_str("],\"uncles\":[");
-    for (i, ommer) in b.ommers.iter().enumerate() {
+    for (i, hash) in b.ommer_hashes().iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
         s.push('"');
-        s.push_str(&hex0x(&myotis_core::keccak::keccak256(ommer)));
+        s.push_str(&hex0x(hash));
         s.push('"');
     }
     s.push_str("]}");

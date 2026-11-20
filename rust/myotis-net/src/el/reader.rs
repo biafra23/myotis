@@ -616,6 +616,13 @@ pub struct VerifiedBlock {
     pub ommers: crate::el::eth::messages::RawList,
 }
 
+impl VerifiedBlock {
+    /// The hashes of the block's ommer headers (`uncles`), in body order.
+    pub fn ommer_hashes(&self) -> Vec<[u8; 32]> {
+        self.ommers.iter().map(keccak256).collect()
+    }
+}
+
 /// What a verified block read fetches beyond its anchored header window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockDepth {
