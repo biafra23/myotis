@@ -33,13 +33,15 @@ If the folder is missing (a different machine), create the crate from these two 
 name = "myotis-workbook"
 version = "1.0.0"
 edition = "2021"
+# The Myotis workspace's minimum rustc (rust/Cargo.toml).
+rust-version = "1.99"
 publish = false
 
 # Same versions as the Myotis workspace, so `cargo test --offline` finds them
 # in your local cargo cache (~/.cargo/registry) with no network.
 [dependencies]
 tokio = { version = "=1.52.3", features = ["macros", "rt", "time"] }
-futures = "=0.3.32"
+futures = "=0.3.34"
 
 [dev-dependencies]
 tokio = { version = "=1.52.3", features = ["macros", "rt", "time", "test-util"] }

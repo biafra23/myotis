@@ -74,15 +74,22 @@ jobs:
           done
       # roost, tor-poc and the workbook are not members, so they state the
       # workspace's minimum rustc by hand (rust/Cargo.toml [workspace.package]).
+      # This checks that the copies agree, not that their own graphs fit under
+      # the floor (verifyRustVersionFloor does that for the workspace only):
+      # while the pin is on the floor's line, a crate needing more fails their
+      # builds anyway (rust/rust-toolchain.toml, the bump note).
       - name: Standalone crates state the workspace's rust-version
         run: |
           set -eu
-          floor=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' rust/Cargo.toml)
+          # As lenient as Gradle's reader (build.gradle.kts): any spacing, a trailing comment.
+          read_floor() { sed -nE 's/^rust-version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$1"; }
+          floor=$(read_floor rust/Cargo.toml)
           [ -n "$floor" ] || { echo "::error file=rust/Cargo.toml::no rust-version line"; exit 1; }
           fail=0
+          # The workbook's starter/ is compared with solution/ by the next step.
           for manifest in rust/roost/Cargo.toml rust/tor-poc/Cargo.toml \
-                          docs/tour/workbook/solution/Cargo.toml docs/tour/workbook/starter/Cargo.toml; do
-            got=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' "$manifest")
+                          docs/tour/workbook/solution/Cargo.toml; do
+            got=$(read_floor "$manifest")
             echo "$manifest: ${got:-none} (workspace: $floor)"
             if [ "$got" != "$floor" ]; then
               echo "::error file=$manifest::rust-version is '${got:-none}', the workspace's is $floor (rust/Cargo.toml)"

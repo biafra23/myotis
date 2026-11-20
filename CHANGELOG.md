@@ -29,7 +29,7 @@ its trust anchors and release checks.
 
 - Rust: the minimum version is 1.99, for the engine workspace and every
   standalone crate (roost, tor-poc, the tour's workbook); the pinned toolchain
-  is 1.99.1.
+  is 1.99.1 (#897).
 - Engine library: the shared `LoopbackRpc` JSON-RPC listener port moved from
   `:myotis-engine-rust` to `:myotis-engine-common`, so the Go engine
   (`:myotis-engine-go`) takes the same loopback listener without either engine

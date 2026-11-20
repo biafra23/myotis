@@ -69,8 +69,9 @@ exclude = ["tor-poc", "roost"]
 # 1.99 for every Rust tree here, by the owner's decision of 2026-11-20, not by
 # the dependency graph, which alone needs 1.92 today (Arti 0.48, the `tor`
 # feature's arti-client / tor-rtcompat tree). 1.99 is the floor of ant
-# (https://github.com/freedom-hq/ant), the Swarm light node the addr1 reader
-# embeds (docs/ideas/swarm-read-economics.md), so linking it raises nothing.
+# (https://github.com/freedom-hq/ant), the Swarm light node that the
+# feature/swarm-addr1 branch embeds for the addr1 reader (candidate source:
+# docs/ideas/swarm-read-economics.md), so linking it will raise nothing.
 # Moving the toolchain pin (rust-toolchain.toml) does not move this line.
 # The standalone crates (roost, tor-poc, the tour's workbook) state the same
 # floor by hand, and cargo-locks.yml fails when one differs from this line;
