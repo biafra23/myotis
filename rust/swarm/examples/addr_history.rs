@@ -1,10 +1,10 @@
 //! Reads one address's history from an addr1 index over Swarm, through the embedded node:
 //! the origin, the newest head update, and pages of entries, newest first. A development
-//! tool for a local network (bee-factory); every chunk is checked as in the engine.
+//! tool for a local network; every chunk is checked as in the engine.
 //!
 //! ```text
 //! cargo run --release --manifest-path rust/swarm/Cargo.toml --example addr_history -- \
-//!   --network-id 1337 --bootnode /ip4/127.0.0.1/tcp/1734/p2p/<peer id> \
+//!   --network-id <id> --bootnode <multiaddr> \
 //!   --owner 0x… --chain 1 --address 0x… [--limit 20] [--pages 2] [--hint N]
 //! ```
 
@@ -23,7 +23,7 @@ fn hex20(s: &str) -> [u8; 20] {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
-    let network_id: u64 = arg("--network-id").unwrap_or("1337".into()).parse().unwrap();
+    let network_id: u64 = arg("--network-id").expect("--network-id").parse().unwrap();
     let bootnodes = args
         .iter()
         .enumerate()
@@ -31,7 +31,7 @@ fn main() {
         .map(|(i, _)| args[i + 1].parse().expect("multiaddr"))
         .collect();
     let owner = hex20(&arg("--owner").expect("--owner"));
-    let chain: u64 = arg("--chain").unwrap_or("1".into()).parse().unwrap();
+    let chain: u64 = arg("--chain").expect("--chain").parse().unwrap();
     let address = hex20(&arg("--address").expect("--address"));
     let limit: usize = arg("--limit").unwrap_or("20".into()).parse().unwrap();
     let pages: usize = arg("--pages").unwrap_or("1".into()).parse().unwrap();

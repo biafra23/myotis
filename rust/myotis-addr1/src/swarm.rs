@@ -59,7 +59,36 @@ pub(crate) fn verify_cac(wire: &[u8], address: &[u8; 32]) -> Result<Vec<u8>> {
         hex(&got),
         hex(address)
     );
-    Ok(payload.to_vec())
+    // What the address commits to is the payload zero-padded to 4096 bytes, so a relay can
+    // add or strip trailing zeros without changing it. The committed content is that buffer
+    // cut to the length the span gives; take it, so only the chunk's author can fail a
+    // decoder, never a peer on the way (claude-review of #903).
+    let committed = if span <= CHUNK_SIZE as u64 {
+        span as usize
+    } else {
+        (span.div_ceil(child_cap(span)) as usize).saturating_mul(32)
+    };
+    canonical(payload, committed)
+}
+
+/// `payload` as the `len` bytes it commits to: zeros past `len` dropped, a short payload
+/// zero-extended. Non-zero bytes past `len` are content the chunk's author put there (a
+/// non-canonical chunk), refused.
+fn canonical(payload: &[u8], len: usize) -> Result<Vec<u8>> {
+    if len > CHUNK_SIZE {
+        return Ok(payload.to_vec()); // more than one chunk can hold: the decoder refuses it
+    }
+    if payload.len() >= len {
+        ensure!(
+            payload[len..].iter().all(|b| *b == 0),
+            "chunk with content past its span ({} bytes, span {len})",
+            payload.len()
+        );
+        return Ok(payload[..len].to_vec());
+    }
+    let mut out = payload.to_vec();
+    out.resize(len, 0);
+    Ok(out)
 }
 
 /// The payload of a SOC in wire form (`identifier ‖ signature ‖ span ‖ payload`), checked:
@@ -78,7 +107,7 @@ pub fn verify_soc(wire: &[u8], address: &[u8; 32], owner: &[u8; 20]) -> Result<V
     let span = u64::from_le_bytes(wire[span_at..span_at + SPAN_LEN].try_into().expect("8"));
     let payload = &wire[span_at + SPAN_LEN..];
     ensure!(
-        payload.len() <= CHUNK_SIZE && span == payload.len() as u64,
+        payload.len() <= CHUNK_SIZE && span <= CHUNK_SIZE as u64,
         "SOC wraps a multi-chunk or malformed payload (span {span}, {} bytes)",
         payload.len()
     );
@@ -99,7 +128,8 @@ pub fn verify_soc(wire: &[u8], address: &[u8; 32], owner: &[u8; 20]) -> Result<V
         hex(&signer),
         hex(owner)
     );
-    Ok(payload.to_vec())
+    // The signed content is the payload zero-padded to 4096, cut to the span (as for a CAC).
+    canonical(payload, span as usize)
 }
 
 /// The address that signed `hash` with `sig` (`r ‖ s ‖ v`), as the reference reader and Bee
@@ -424,6 +454,27 @@ pub fn file_tree(data: &[u8]) -> Vec<([u8; 32], Vec<u8>)> {
         level = next;
     }
     out
+}
+
+#[cfg(test)]
+mod padding_tests {
+    use super::*;
+
+    #[test]
+    fn a_relay_that_pads_or_strips_zeros_changes_nothing() {
+        let data = [1u8, 2, 3, 0, 0];
+        let span = data.len() as u64;
+        let address = cac_address(span, &data);
+        let wire = |p: &[u8]| [&span.to_le_bytes()[..], p].concat();
+        assert_eq!(verify_cac(&wire(&data), &address).unwrap(), data);
+        // Zeros added, or the trailing zeros stripped: the same address, the same content.
+        assert_eq!(verify_cac(&wire(&[&data[..], &[0; 100]].concat()), &address).unwrap(), data);
+        assert_eq!(verify_cac(&wire(&data[..3]), &address).unwrap(), data);
+        // Content past the span (the author's) is refused.
+        let odd = [1u8, 2, 3, 0, 0, 9];
+        let odd_address = cac_address(span, &odd);
+        assert!(verify_cac(&wire(&odd), &odd_address).is_err());
+    }
 }
 
 #[cfg(test)]

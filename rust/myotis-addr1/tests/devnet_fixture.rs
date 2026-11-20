@@ -196,7 +196,7 @@ impl myotis_addr1::client::ChunkSource for Chunks {
         &self,
         address: [u8; 32],
         _expect_missing: bool,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send {
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, myotis_addr1::client::SourceError>> + Send {
         let got = self.0.get(&address).cloned();
         async move { Ok(got) }
     }

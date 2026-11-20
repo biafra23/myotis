@@ -53,7 +53,7 @@ pub enum Network {
     /// Swarm mainnet, through its published bootnodes.
     #[default]
     Mainnet,
-    /// A local network (bee-factory): its network id and the multiaddrs of its nodes.
+    /// A local network: its network id and the multiaddrs of its nodes.
     Dev { network_id: u64, bootnodes: Vec<String> },
 }
 
@@ -135,14 +135,24 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// A page's cursor as the API carries it: `"<block>:<slot>"`, exclusive.
-pub fn parse_cursor(s: &str) -> Option<(u64, u32)> {
-    let (b, slot) = s.split_once(':')?;
+/// A page's cursor as the API carries it: `"<head update>:<block>:<slot>"`, exclusive in
+/// `(block, slot)`. The head update is the one the page was read at: a later page is read at
+/// that head or a newer one, never an older (which would miss entries between its end and
+/// the cursor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cursor {
+    pub head_update: u64,
+    pub before: (u64, u32),
+}
+
+pub fn parse_cursor(s: &str) -> Option<Cursor> {
+    let mut f = s.split(':');
+    let (u, b, slot) = (f.next()?, f.next()?, f.next()?);
     let digits = |x: &str| !x.is_empty() && x.bytes().all(|c| c.is_ascii_digit());
-    if !digits(b) || !digits(slot) {
+    if f.next().is_some() || !digits(u) || !digits(b) || !digits(slot) {
         return None;
     }
-    Some((b.parse().ok()?, slot.parse().ok()?))
+    Some(Cursor { head_update: u.parse().ok()?, before: (b.parse().ok()?, slot.parse().ok()?) })
 }
 
 /// The most entries one page returns.
@@ -155,9 +165,14 @@ static CONFIG: std::sync::Mutex<Option<Config>> = std::sync::Mutex::new(None);
 pub fn set_config_json(json: &str) -> String {
     match parse_config(json) {
         Ok(cfg) => {
-            if let Ok(mut c) = CONFIG.lock() {
-                *c = Some(cfg);
+            let Ok(mut c) = CONFIG.lock() else {
+                return eljson::error_json("address history settings lock poisoned");
+            };
+            // No importer: nothing may be read, so no node keeps running for it.
+            if cfg.importer.is_none() {
+                reader::stop();
             }
+            *c = Some(cfg);
             "{}".to_string()
         }
         Err(msg) => eljson::invalid_params_json(&msg),
@@ -202,12 +217,17 @@ fn refusal(cfg: &Config) -> Option<String> {
 /// `chain_head` is the node's verified head, for the head gap. The answer:
 ///
 /// ```json
-/// {"importer":"0x…","headUpdate":73,"coveredFrom":26236928,"coveredTo":26458303,
-///  "headGap":{"fromBlock":26458304,"toBlock":26458400} | null,
+/// {"importer":"0x…","headUpdate":<n>,"coveredFrom":<first block>,"coveredTo":<last block>,
+///  "headGap":{"fromBlock":<last block + 1>,"toBlock":<verified head> | null} | null,
+///  "tailGap":{"fromBlock":0,"toBlock":<first block - 1>} | null,
 ///  "gaps":[{"fromBlock":…,"toBlock":…}],
 ///  "entries":[{"block":…,"slot":…,"roles":["from","to"],"state":"unverified"}],
-///  "next":"26458303:256" | null}
+///  "next":"<head update>:<block>:<slot>" | null}
 /// ```
+///
+/// Every range the index does not cover is named: the head gap above it (open, `toBlock`
+/// null, while the node has no verified head), the tail gap below an index that starts
+/// late, and the slices Swarm did not deliver.
 ///
 /// A refusal is the permanent `-32602`; Swarm not delivering what the read needs is the
 /// retryable `{"error"}`.
@@ -226,7 +246,7 @@ pub fn history_json(
     let Some(address) = parse_address(address) else {
         return eljson::invalid_params_json("invalid address (expected 20-byte hex)");
     };
-    let before = if cursor.is_empty() {
+    let cursor = if cursor.is_empty() {
         None
     } else {
         match parse_cursor(cursor) {
@@ -238,7 +258,7 @@ pub fn history_json(
         return eljson::invalid_params_json(&format!("invalid limit (expected 1 to {MAX_PAGE})"));
     }
     let importer = cfg.importer.expect("refusal() checked it");
-    match reader::page(rt, &cfg, chain_id, importer, &address, before, limit as usize) {
+    match reader::page(rt, &cfg, chain_id, importer, &address, cursor, limit as usize) {
         Ok(read) => page_json(&read, importer, chain_head),
         Err(reader::Failure::Refused(msg)) => eljson::invalid_params_json(&msg),
         Err(reader::Failure::Retry(msg)) => eljson::error_json(&msg),
@@ -271,15 +291,20 @@ fn page_json(read: &Read, importer: [u8; 20], chain_head: Option<u64>) -> String
         .map(|(_, n)| n)
         .collect()
     };
-    let head_gap = chain_head
-        .filter(|h| *h > p.to_block)
-        .map(|h| serde_json::json!({"fromBlock": p.to_block + 1, "toBlock": h}));
+    let head_gap = match chain_head {
+        Some(h) if h > p.to_block => Some(serde_json::json!({"fromBlock": p.to_block + 1, "toBlock": h})),
+        Some(_) => None,
+        // No verified head yet: the gap above the index is open, never "none".
+        None => Some(serde_json::json!({"fromBlock": p.to_block + 1, "toBlock": null})),
+    };
+    let tail_gap = (p.from_block > 0).then(|| serde_json::json!({"fromBlock": 0, "toBlock": p.from_block - 1}));
     serde_json::json!({
         "importer": hex(&importer),
         "headUpdate": read.head_update,
         "coveredFrom": p.from_block,
         "coveredTo": p.to_block,
         "headGap": head_gap,
+        "tailGap": tail_gap,
         "gaps": p.gaps.iter().map(|g| serde_json::json!({"fromBlock": g.from_block, "toBlock": g.to_block})).collect::<Vec<_>>(),
         "entries": p.entries.iter().map(|e| serde_json::json!({
             "block": e.block,
@@ -287,7 +312,7 @@ fn page_json(read: &Read, importer: [u8; 20], chain_head: Option<u64>) -> String
             "roles": roles(e.roles),
             "state": "unverified",
         })).collect::<Vec<_>>(),
-        "next": p.next.map(|(b, s)| format!("{b}:{s}")),
+        "next": p.next.map(|(b, s)| format!("{}:{b}:{s}", read.head_update)),
     })
     .to_string()
 }
@@ -326,7 +351,10 @@ mod reader {
     /// Stop the node, if one runs: it shuts down when the last read holding it lets go.
     pub fn stop() {
         if let Ok(mut slot) = NODE.lock() {
-            if slot.take().is_some() {
+            if let Some(running) = slot.take() {
+                // At once, also for reads still holding the node: no Swarm request may
+                // outlive the switch (the node does not route through Tor).
+                running.node.stop();
                 tracing::info!("addr1: Swarm reader stopped");
             }
         }
@@ -335,6 +363,13 @@ mod reader {
     /// The node for `network`, started (or restarted for another network) on first use.
     fn node(network: &Network) -> Result<(Arc<SwarmNode>, Instant), Failure> {
         let mut slot = NODE.lock().map_err(|_| Failure::Retry("Swarm reader lock poisoned".into()))?;
+        // Checked again under the lock: Tor turned on between the caller's check and here
+        // (its stop() found no node) must not see one started now.
+        if super::tor_on() {
+            return Err(Failure::Refused(
+                "the address history is not available while Tor routing is on".to_string(),
+            ));
+        }
         if slot.as_ref().map(|r| &r.network) != Some(network) {
             let cfg = match network {
                 Network::Mainnet => SwarmConfig::mainnet(),
@@ -377,11 +412,12 @@ mod reader {
         }
     }
 
-    /// A failure of the node itself (not a miss, not invalid data): on a freshly started node
-    /// "no usable peers yet" (`myotis_swarm::NOT_READY_TEXT`) or a stream that could not be
-    /// opened yet, worth asking again while the node is fresh, and only then.
+    /// A read that failed for now (`ReadError::Transient`) before any page could be read
+    /// (the origin, the head): on a freshly started node "no usable peers yet"
+    /// (`myotis_swarm::NOT_READY_TEXT`) or a stream that could not be opened yet. Worth
+    /// asking again while the node is fresh, and only then; a stopped node never is.
     fn transient(e: &ReadError) -> bool {
-        matches!(e, ReadError::Source(_))
+        matches!(e, ReadError::Transient(_))
     }
 
     /// One page, on the engine's runtime (as every other host read).
@@ -391,11 +427,13 @@ mod reader {
         chain_id: u64,
         importer: [u8; 20],
         address: &[u8; 20],
-        before: Option<(u64, u32)>,
+        cursor: Option<super::Cursor>,
         limit: usize,
     ) -> Result<Read, Failure> {
         let (node, started) = node(&cfg.network)?;
-        let start = hint(chain_id, importer);
+        let floor = cursor.map(|c| c.head_update).unwrap_or(0);
+        let start = hint(chain_id, importer).max(floor);
+        let before = cursor.map(|c| c.before);
         let read = rt.block_on(async {
             let index = Index::new(node.as_ref(), chain_id, importer);
             let attempts = async {
@@ -421,6 +459,14 @@ mod reader {
                 .unwrap_or_else(|_| Err(ReadError::Source(format!("no page within {READ_DEADLINE:?}"))))
         });
         let read = read.map_err(failure)?;
+        if read.head_update < floor {
+            // An update the cursor's page was read at was not found now: retryable, never
+            // a page from an older head (it would miss entries without naming a gap).
+            return Err(Failure::Retry(format!(
+                "the index's head update {} was found, older than the cursor's {floor}: try again",
+                read.head_update
+            )));
+        }
         remember(chain_id, importer, read.head_update);
         Ok(read)
     }
@@ -444,7 +490,7 @@ mod reader {
         _chain_id: u64,
         _importer: [u8; 20],
         _address: &[u8; 20],
-        _before: Option<(u64, u32)>,
+        _cursor: Option<super::Cursor>,
         _limit: usize,
     ) -> Result<Read, Failure> {
         Err(Failure::Refused(super::build_refusal().unwrap_or("no Swarm reader").to_string()))
@@ -457,17 +503,17 @@ mod tests {
 
     #[test]
     fn settings_are_applied_or_refused_whole() {
-        let ok = parse_config(r#"{"importer":"0xefdb28e3Eac685FC0fFb8B61A2692FC671559e4b","swarm":{"network":"dev","networkId":1337,"bootnodes":["/ip4/127.0.0.1/tcp/1734/p2p/QmQxLnj3rigCh7JbpoDSwW7VsNWWQ65ANuQ5GXN11KEPKM"]}}"#).unwrap();
-        assert_eq!(ok.importer.map(|a| a[0]), Some(0xef));
-        assert!(matches!(ok.network, Network::Dev { network_id: 1337, .. }));
+        let ok = parse_config(r#"{"importer":"0x1111111111111111111111111111111111111111","swarm":{"network":"dev","networkId":7,"bootnodes":["/ip4/192.0.2.1/tcp/1634"]}}"#).unwrap();
+        assert_eq!(ok.importer, Some([0x11; 20]));
+        assert!(matches!(ok.network, Network::Dev { network_id: 7, .. }));
         assert_eq!(parse_config("{}").unwrap(), Config::default());
         assert_eq!(parse_config(r#"{"importer":null,"swarm":{"network":"mainnet"}}"#).unwrap(), Config::default());
         for bad in [
             r#"{"importer":"0x12"}"#,
             r#"{"importer":5}"#,
             r#"{"other":1}"#,
-            r#"{"swarm":{"network":"dev","networkId":1337}}"#,
-            r#"{"swarm":{"network":"dev","networkId":1337,"bootnodes":[]}}"#,
+            r#"{"swarm":{"network":"dev","networkId":7}}"#,
+            r#"{"swarm":{"network":"dev","networkId":7,"bootnodes":[]}}"#,
             r#"{"swarm":{"network":"mainnet","networkId":1}}"#,
             r#"{"swarm":{"network":"testnet"}}"#,
             r#"{"swarm":{"network":"dev","networkId":1,"bootnodes":["x"],"extra":1}}"#,
@@ -482,8 +528,11 @@ mod tests {
 
     #[test]
     fn cursors_round_trip() {
-        assert_eq!(parse_cursor("26458303:256"), Some((26_458_303, 256)));
-        for bad in ["", "1", "a:1", "1:b", "1:2:3", "+5:+1", ":1", "1:"] {
+        assert_eq!(
+            parse_cursor("9:1000:5"),
+            Some(Cursor { head_update: 9, before: (1000, 5) })
+        );
+        for bad in ["", "1", "1:2", "a:1:1", "1:b:1", "1:2:c", "1:2:3:4", "+5:+1:1", ":1:1", "1:2:"] {
             assert_eq!(parse_cursor(bad), None, "{bad}");
         }
     }
@@ -502,7 +551,8 @@ mod tests {
     }
 
     /// Live, against a local Swarm network holding an index: `MYOTIS_ADDR1_DEV="<network id>
-    /// <bootnode multiaddr> <importer>"`, e.g. bee-factory's queen and the month index.
+    /// <bootnode multiaddr> <importer> <address with at least ten entries>"`. Nothing of the
+    /// setup is in the test: the same code reads any index.
     #[cfg(feature = "swarm")]
     #[test]
     #[ignore]
@@ -511,7 +561,7 @@ mod tests {
         let f: Vec<&str> = env.split_whitespace().collect();
         let cfg = format!(r#"{{"importer":"{}","swarm":{{"network":"dev","networkId":{},"bootnodes":["{}"]}}}}"#, f[2], f[0], f[1]);
         assert_eq!(set_config_json(&cfg), "{}");
-        let weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+        let weth = f[3];
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         let first: serde_json::Value = serde_json::from_str(&history_json(&rt, 1, None, weth, "", 5)).unwrap();
         assert!(first["error"].is_null(), "{first}");
@@ -530,24 +580,30 @@ mod tests {
         let read = Read {
             head_update: 73,
             page: Page {
-                entries: vec![Entry { block: 26_458_303, slot: 477, roles: role::TO | role::EMITTER }],
-                next: Some((26_458_303, 477)),
-                from_block: 26_236_928,
-                to_block: 26_458_303,
+                entries: vec![Entry { block: 127_999, slot: 477, roles: role::TO | role::EMITTER }],
+                next: Some((127_999, 477)),
+                from_block: 64_000,
+                to_block: 127_999,
                 gaps: vec![Gap { from_block: 10, to_block: 20 }],
             },
         };
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(26_458_400))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(128_100))).unwrap();
         assert_eq!(v["headUpdate"], 73);
-        assert_eq!(v["coveredFrom"], 26_236_928);
-        assert_eq!(v["headGap"]["fromBlock"], 26_458_304);
-        assert_eq!(v["headGap"]["toBlock"], 26_458_400);
+        assert_eq!(v["coveredFrom"], 64_000);
+        assert_eq!(v["headGap"]["fromBlock"], 128_000);
+        assert_eq!(v["headGap"]["toBlock"], 128_100);
         assert_eq!(v["gaps"][0]["toBlock"], 20);
         assert_eq!(v["entries"][0]["roles"], serde_json::json!(["to", "emitter"]));
         assert_eq!(v["entries"][0]["state"], "unverified");
-        assert_eq!(v["next"], "26458303:477");
+        assert_eq!(v["next"], "73:127999:477");
+        // An index that starts late names the blocks below it.
+        assert_eq!(v["tailGap"]["toBlock"], 63_999);
         // At the head: no head gap.
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(26_458_303))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(127_999))).unwrap();
         assert!(v["headGap"].is_null());
+        // No verified head yet: an open head gap, never "none".
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], None)).unwrap();
+        assert_eq!(v["headGap"]["fromBlock"], 128_000);
+        assert!(v["headGap"]["toBlock"].is_null());
     }
 }
