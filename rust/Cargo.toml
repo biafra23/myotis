@@ -66,13 +66,20 @@ exclude = ["tor-poc", "roost"]
 # ONE minimum rustc (`rust-version.workspace = true` in each member), and the
 # single source of it: the root build.gradle.kts reads this line to decide
 # whether a toolchain builds the workspace or skips it like a missing cargo.
-# The dependency graph sets it — today Arti 0.48 (the `tor` feature's
-# arti-client / tor-rtcompat tree) needs 1.92; without it, revm 43 and
-# alloy-eips 2.1 would set 1.91 — and `verifyRustVersionFloor` fails `check`
-# when a lock update pulls in a crate that needs more.
+# 1.99 for every Rust tree here, by the owner's decision of 2026-11-20, not by
+# the dependency graph, which alone needs 1.92 today (Arti 0.48, the `tor`
+# feature's arti-client / tor-rtcompat tree). 1.99 is the floor of ant
+# (https://github.com/freedom-hq/ant), the Swarm light node that the
+# feature/swarm-addr1 branch embeds for the addr1 reader (candidate source:
+# docs/ideas/swarm-read-economics.md), so linking it will raise nothing.
+# Moving the toolchain pin (rust-toolchain.toml) does not move this line.
+# The standalone crates (roost, tor-poc, the tour's workbook) state the same
+# floor by hand, and cargo-locks.yml fails when one differs from this line;
+# `verifyRustVersionFloor` fails `check` when a lock update pulls in a crate
+# that needs more than it.
 [workspace.package]
 version = "0.1.21"
-rust-version = "1.92"
+rust-version = "1.99"
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.

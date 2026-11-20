@@ -12,6 +12,16 @@
 #
 # Bumping it is a reviewed PR like any dependency bump: change this line (the
 # x.y.z form is required — the CI action refuses a channel name) and let CI build
-# every target with it.
+# every target with it. The floor does not move with it: `rust-version` in
+# rust/Cargo.toml (and its copies in the standalone crates) is a decision of its
+# own, 1.99 since 2026-11-20. The first bump past the floor's line ends what kept
+# the standalone crates' floor true for free (a dependency needing more than the
+# pin failed their build): that PR adds a check of their resolved graphs against
+# it, as verifyRustVersionFloor does for the workspace (roost and the workbook at
+# least; tor-poc is built nowhere in CI). Besides the manifests (cargo-locks.yml
+# compares those), the floor's number stands in prose in README.md (toolchain
+# table), rust/tor-poc/README.md, the tour's workbook stop (source/stops and
+# book/, with the pin's 1.99.1) and rust-clippy.yml's incompatible_msrv note:
+# moving the floor or the pin past it moves those too.
 [toolchain]
 channel = "1.99.1"
