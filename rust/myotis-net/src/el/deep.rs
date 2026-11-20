@@ -70,6 +70,12 @@ struct Linked {
     alarm: Option<String>,
     /// Set once a recorded window carried the table's top with its hash.
     top_checked: bool,
+    /// Set once the light client was re-anchored on a fresh checkpoint (STALE_ANCHOR):
+    /// an alarm then names both anchors as in doubt (the rule's last sub-bullet).
+    reanchored: bool,
+    /// The anchor's re-anchor count this state was linked under (`ExecAnchor::reanchors`,
+    /// per process).
+    reanchors_seen: u64,
 }
 
 impl DeepAnchors {
@@ -77,14 +83,7 @@ impl DeepAnchors {
     /// for that table. A table that fails its pin is logged and left out, so the reads it
     /// would serve keep today's refusal.
     pub(crate) fn for_chain(chain_id: u64, store: Option<PathBuf>) -> Self {
-        let table = match myotis_core::checkpoints::for_chain(chain_id) {
-            Some(Ok(t)) => Some(t),
-            Some(Err(e)) => {
-                tracing::error!(chain_id, error = %e, "bundled checkpoint table refused");
-                None
-            }
-            None => None,
-        };
+        let table = table_for(chain_id);
         let state = match (&table, &store) {
             (Some(t), Some(path)) => load(path, &pin_key(t)),
             _ => Linked::default(),
@@ -101,6 +100,29 @@ impl DeepAnchors {
     #[cfg(test)]
     pub(crate) fn with_table(table: CheckpointTable<'static>) -> Self {
         Self { table: Some(table), ..Self::default() }
+    }
+
+    /// The light client's re-anchor count is `reanchors` (`ExecAnchor::reanchors`). When it
+    /// moved, what was linked under the old anchor is dropped (the top's check with it), and
+    /// the state remembers the re-anchor, so a later alarm names both anchors.
+    pub(crate) fn observe_reanchors(&self, reanchors: u64) {
+        let text = {
+            let Ok(mut state) = self.state.lock() else { return };
+            if state.reanchors_seen == reanchors {
+                return;
+            }
+            tracing::warn!(reanchors, "re-anchored: the hashes linked under the old anchor are dropped");
+            state.reanchors_seen = reanchors;
+            state.hashes.clear();
+            state.top_checked = false;
+            state.reanchored = true;
+            self.table.as_ref().map(|t| render_store(&pin_key(t), &state))
+        };
+        if let (Some(text), Some(path)) = (text, &self.store) {
+            if let Err(e) = save(path, &text) {
+                tracing::warn!(path = %path.display(), error = %e, "deep anchors not saved");
+            }
+        }
     }
 
     /// The alarm's message, once raised.
@@ -174,9 +196,15 @@ impl DeepAnchors {
                 if seen == Some(top_hash) {
                     state.top_checked = true;
                 } else {
+                    let doubt = if state.reanchored {
+                        "; the light client was re-anchored on a fresh checkpoint at a stale \
+                         anchor, so either the table or that checkpoint is wrong"
+                    } else {
+                        ""
+                    };
                     let msg = format!(
                         "{ALARM_PREFIX} block {top_number}, linked from the attested finalized \
-                         block, is not the bundled table's top {}",
+                         block, is not the bundled table's top {}{doubt}",
                         hex(&top_hash)
                     );
                     tracing::error!(alarm = %msg, "deep block reads refused");
@@ -194,6 +222,38 @@ impl DeepAnchors {
     }
 }
 
+/// The bundled table for `chain_id`, parsed (its pin checked: a hash of the whole table)
+/// once per process, not on every reader start.
+fn table_for(chain_id: u64) -> Option<CheckpointTable<'static>> {
+    static MAINNET: std::sync::OnceLock<Option<CheckpointTable<'static>>> = std::sync::OnceLock::new();
+    let parse = || match myotis_core::checkpoints::for_chain(chain_id) {
+        Some(Ok(t)) => Some(t),
+        Some(Err(e)) => {
+            tracing::error!(chain_id, error = %e, "bundled checkpoint table refused");
+            None
+        }
+        None => None,
+    };
+    match chain_id {
+        1 => *MAINNET.get_or_init(parse),
+        _ => parse(),
+    }
+}
+
+/// The alarm kept in the state file at `path`, if any, whatever else the file holds: what
+/// a status reports while no reader runs (a paused handle).
+pub fn stored_alarm(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().find_map(|l| l.strip_prefix("alarm ").map(str::to_string))
+}
+
+/// The state file of a reader whose EL peer cache is `cache_path`
+/// (`peers[-net].cache` → `deep-anchors[-net].txt`, beside it).
+pub fn store_path(cache_path: &std::path::Path) -> Option<PathBuf> {
+    let suffix = cache_path.file_stem()?.to_str()?.strip_prefix("peers")?.to_string();
+    Some(cache_path.with_file_name(format!("deep-anchors{suffix}.txt")))
+}
+
 /// The key a kept state belongs to: the table's top, which a new table moves.
 fn pin_key(table: &CheckpointTable<'_>) -> String {
     let (number, hash) = table.top();
@@ -205,46 +265,68 @@ const STORE_MAGIC: &str = "myotis deep anchors v1";
 /// The state kept for the table `key` in `path`; empty when the file is missing, belongs to
 /// another table, or does not parse (it is rebuilt by the next walks).
 fn load(path: &std::path::Path, key: &str) -> Linked {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Linked::default();
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Linked::default(),
+        Err(e) => {
+            // Fail closed on the alarm: a file we cannot read may hold one.
+            tracing::error!(path = %path.display(), error = %e, "deep anchors file unreadable");
+            return Linked { alarm: Some(format!("{ALARM_PREFIX} the kept state is unreadable ({e})")), ..Default::default() };
+        }
     };
     parse_store(&text, key).unwrap_or_else(|| {
-        tracing::warn!(path = %path.display(), "deep anchors file ignored (another table or unreadable)");
+        tracing::warn!(path = %path.display(), "deep anchors file of another table: starting afresh");
         Linked::default()
     })
 }
 
+/// The state kept for the table `key`, or `None` when the file belongs to another table.
+/// Fail closed: an `alarm` line counts wherever it stands, even in a file of another table
+/// or one torn by a crash; a line that does not parse is skipped, never the whole file.
 fn parse_store(text: &str, key: &str) -> Option<Linked> {
+    let alarm = text.lines().find_map(|l| l.strip_prefix("alarm ").map(str::to_string));
     let mut lines = text.lines();
-    if lines.next()? != STORE_MAGIC || lines.next()?.strip_prefix("table ")? != key {
-        return None;
+    let ours = lines.next() == Some(STORE_MAGIC) && lines.next().and_then(|l| l.strip_prefix("table ")) == Some(key);
+    if !ours {
+        return alarm.map(|alarm| Linked { alarm: Some(alarm), ..Default::default() });
     }
-    let mut out = Linked::default();
+    let mut out = Linked { alarm, ..Default::default() };
     for line in lines {
         if line == "checked" {
             out.top_checked = true;
-        } else if let Some(msg) = line.strip_prefix("alarm ") {
-            out.alarm = Some(msg.to_string());
+        } else if line == "reanchored" {
+            out.reanchored = true;
+        } else if line.starts_with("alarm ") {
+            // taken above
+        } else if let Some((number, hash)) = parse_linked(line) {
+            out.hashes.insert(number, hash);
         } else {
-            let (number, hash) = line.split_once(' ')?;
-            let hash = hash.strip_prefix("0x")?;
-            if hash.len() != 64 {
-                return None;
-            }
-            let mut h = [0u8; 32];
-            for (i, byte) in h.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(hash.get(2 * i..2 * i + 2)?, 16).ok()?;
-            }
-            out.hashes.insert(number.parse().ok()?, h);
+            tracing::warn!(line, "deep anchors: a line that does not parse is skipped");
         }
     }
     Some(out)
+}
+
+fn parse_linked(line: &str) -> Option<(u64, [u8; 32])> {
+    let (number, hash) = line.split_once(' ')?;
+    let hash = hash.strip_prefix("0x")?;
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut h = [0u8; 32];
+    for (i, byte) in h.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hash.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some((number.parse().ok()?, h))
 }
 
 fn render_store(key: &str, state: &Linked) -> String {
     let mut out = format!("{STORE_MAGIC}\ntable {key}\n");
     if state.top_checked {
         out.push_str("checked\n");
+    }
+    if state.reanchored {
+        out.push_str("reanchored\n");
     }
     if let Some(alarm) = &state.alarm {
         out.push_str(&format!("alarm {}\n", alarm.replace('\n', " ")));
@@ -257,8 +339,12 @@ fn render_store(key: &str, state: &Linked) -> String {
 
 /// Written whole to a sibling and renamed over the file, so a crash leaves the old state.
 fn save(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
     let tmp = path.with_extension("txt.tmp");
-    std::fs::write(&tmp, text)?;
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    // Durable before it replaces the old state: an alarm must survive a power loss.
+    f.sync_all()?;
     std::fs::rename(&tmp, path)
 }
 
@@ -308,8 +394,16 @@ mod tests {
         assert_eq!(back.hashes, linked.hashes);
         assert!(back.top_checked);
         assert_eq!(back.alarm, linked.alarm);
-        assert!(parse_store(&text, "3000 0x30").is_none(), "another table's state");
+        // Another table's state starts afresh, but its alarm stands (fail closed).
+        let other = parse_store(&text, "3000 0x30").expect("its alarm");
+        assert!(other.hashes.is_empty() && other.alarm.is_some());
         assert!(parse_store("garbage", "2100 0x21").is_none());
+        // A torn file keeps what parses, and its alarm.
+        let torn = format!("{text}12 0xzz\n7");
+        let back = parse_store(&torn, "2100 0x21").unwrap();
+        assert_eq!(back.hashes, linked.hashes);
+        assert!(back.alarm.is_some());
+        assert_eq!(stored_alarm_text(&torn), back.alarm);
 
         // Through the file: an alarm raised in one run refuses in the next.
         let dir = std::env::temp_dir().join(format!("myotis-deep-{}", std::process::id()));
@@ -322,6 +416,34 @@ mod tests {
         let again = load(&path, &key);
         assert!(again.alarm.is_some());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn stored_alarm_text(text: &str) -> Option<String> {
+        text.lines().find_map(|l| l.strip_prefix("alarm ").map(str::to_string))
+    }
+
+    #[test]
+    fn a_reanchor_drops_what_was_linked_and_names_both_anchors() {
+        let d = DeepAnchors::with_table(table());
+        let fin = (6000, h(6000));
+        let window: Vec<_> = (4977..=6000).map(|n| (n, h(n))).collect();
+        d.record_window(&window);
+        assert_eq!(d.plan(5500, fin), Some(Plan::Anchor { number: 6000, hash: h(6000) }));
+        d.observe_reanchors(0); // unchanged: nothing happens
+        assert_eq!(d.state.lock().unwrap().hashes.len(), 2);
+        d.observe_reanchors(1);
+        assert!(d.state.lock().unwrap().hashes.is_empty());
+        let bad: Vec<_> = (2090..=2110).map(|n| (n, h(n))).collect();
+        let msg = d.record_window(&bad).unwrap();
+        assert!(msg.contains("re-anchored"), "{msg}");
+    }
+
+    #[test]
+    fn the_store_sits_beside_the_peer_cache() {
+        let p = std::path::Path::new("/data/peers-sepolia.cache");
+        assert_eq!(store_path(p), Some(PathBuf::from("/data/deep-anchors-sepolia.txt")));
+        assert_eq!(store_path(std::path::Path::new("/data/peers.cache")), Some(PathBuf::from("/data/deep-anchors.txt")));
+        assert_eq!(store_path(std::path::Path::new("/data/other.cache")), None);
     }
 
     #[test]

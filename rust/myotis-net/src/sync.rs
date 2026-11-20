@@ -2468,6 +2468,7 @@ async fn run_sync(
                 auto_resolve_park(&config, &client, &local_status, &mut auto_last_try).await;
                 if let Some((root, slot)) = config.ws_policy.take_fresh_anchor() {
                     checkpoint_period = reanchor(&mut config, root, slot);
+                    anchor.note_reanchor();
                     last_persisted_period = embedded_checkpoint_period;
                     anchor_period = checkpoint_period.max(snap_period);
                     continue;
@@ -2559,6 +2560,7 @@ async fn run_sync(
             auto_resolve_park(&config, &client, &local_status, &mut auto_last_try).await;
             if let Some((root, slot)) = config.ws_policy.take_fresh_anchor() {
                 checkpoint_period = reanchor(&mut config, root, slot);
+                anchor.note_reanchor();
                 last_persisted_period = embedded_checkpoint_period;
                 processor = LightClientProcessor::new(
                     LightClientStore::new(config.slots_per_period()),
