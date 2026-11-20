@@ -54,8 +54,8 @@ pub struct Check {
     pub from: Option<[u8; 20]>,
     /// `None` for a contract creation.
     pub to: Option<[u8; 20]>,
-    /// Minimal big-endian wei.
-    pub value: Vec<u8>,
+    /// Minimal big-endian wei; `None` when the transaction did not decode.
+    pub value: Option<Vec<u8>>,
     /// The first ERC-20/721 `Transfer` log the address is a party of, if any.
     pub transfer: Option<Transfer>,
 }
@@ -65,8 +65,10 @@ pub struct Transfer {
     pub token: [u8; 20],
     pub from: [u8; 20],
     pub to: [u8; 20],
-    /// The log's data: the amount (ERC-20) — empty for ERC-721, whose id is a topic.
-    pub data: Vec<u8>,
+    /// The amount (ERC-20: 32 bytes of data), or `None` for ERC-721.
+    pub amount: Option<[u8; 32]>,
+    /// The token id (ERC-721: the fourth topic), or `None` for ERC-20.
+    pub id: Option<[u8; 32]>,
 }
 
 /// keccak256("Transfer(address,address,uint256)").
@@ -181,7 +183,7 @@ pub fn check(
         tx_hash: None,
         from: None,
         to: None,
-        value: Vec::new(),
+        value: None,
         transfer: None,
     };
     let me = padded(address);
@@ -243,7 +245,7 @@ pub fn check(
     if let Some(s) = &summary {
         c.from = s.from;
         c.to = s.to;
-        c.value = s.value.clone();
+        c.value = Some(s.value.clone());
     }
     let (authorities, code) = authorizations(raw);
     // FROM: the sender (unchecked if the signature does not recover).
@@ -255,8 +257,10 @@ pub fn check(
         (None, None) => None,
     });
     mark(&mut c, role::TO, to);
-    // AUTH: an authority of the authorization list.
-    mark(&mut c, role::AUTH, Some(authorities.contains(address)));
+    // AUTH: an authority of the authorization list. Definitive only for a transaction that
+    // decoded: one this decoder does not know may carry a list it cannot read.
+    let auth = if authorities.contains(address) { Some(true) } else { summary.as_ref().map(|_| false) };
+    mark(&mut c, role::AUTH, auth);
     // BLOCK is never a transaction's role.
     mark(&mut c, role::BLOCK, Some(false));
     let logs = receipt.map(|r| r.receipt.logs.as_slice());
@@ -264,26 +268,38 @@ pub fn check(
     mark(&mut c, role::EMITTER, logs.map(|l| l.iter().any(|log| log.address.as_slice() == address.as_slice())));
     mark(&mut c, role::TOPIC, logs.map(|l| l.iter().any(|log| log.topics.iter().any(|t| t.as_slice() == me))));
     // WORD: the input's words after the selector, a 7702 code address, or a log's data word.
+    // Contradicted only when every place was read: the input of a transaction that did not
+    // decode was not, so its WORD can only be confirmed, never contradicted.
     let in_tx = summary.as_ref().is_some_and(|s| words(&s.input, 4).any(|w| *w == me)) || code.contains(address);
-    let word = if in_tx {
-        Some(true)
-    } else {
-        logs.map(|l| l.iter().any(|log| words(&log.data, 0).any(|w| *w == me)))
+    let in_logs = logs.map(|l| l.iter().any(|log| words(&log.data, 0).any(|w| *w == me)));
+    let word = match (in_tx, in_logs, summary.is_some()) {
+        (true, _, _) | (_, Some(true), _) => Some(true),
+        (false, Some(false), true) => Some(false),
+        _ => None,
     };
     mark(&mut c, role::WORD, word);
     // The token transfer the row shows, if any.
     if let Some(l) = logs {
+        // Only the two shapes the standards define: ERC-20 (3 topics, a 32-byte amount) and
+        // ERC-721 (4 topics, the id the fourth, no data). Anything else is not shown as one.
         c.transfer = l.iter().find_map(|log| {
             let (t0, t1, t2) = (log.topics.first()?, log.topics.get(1)?, log.topics.get(2)?);
             if t0.as_slice() != TRANSFER || (t1.as_slice() != me && t2.as_slice() != me) {
                 return None;
             }
+            let word = |w: &[u8]| -> Option<[u8; 32]> { w.try_into().ok() };
+            let (amount, id) = match (log.topics.len(), log.data.len()) {
+                (3, 32) => (Some(word(&log.data)?), None),
+                (4, 0) => (None, Some(word(&log.topics[3])?)),
+                _ => return None,
+            };
             let addr = |w: &[u8]| -> Option<[u8; 20]> { w.get(12..32)?.try_into().ok() };
             Some(Transfer {
                 token: log.address.as_slice().try_into().ok()?,
                 from: addr(t1)?,
                 to: addr(t2)?,
-                data: log.data.clone(),
+                amount,
+                id,
             })
         });
     }
@@ -378,7 +394,7 @@ mod tests {
         let transfer = ReceiptLog {
             address: vec![0x55; 20],
             topics: vec![TRANSFER.to_vec(), padded(&sender).to_vec(), padded(&other).to_vec()],
-            data: vec![0, 1],
+            data: [0u8; 32].to_vec(),
         };
         let receipts = vec![receipt_with(vec![transfer])];
 
@@ -403,6 +419,20 @@ mod tests {
         assert_eq!(check(&to, 1, role::TRACE, &block, None).state, State::Unverified);
         // A slot beyond the block's transactions contradicts every role.
         assert_eq!(check(&sender, 2, role::FROM, &block, None).state, State::Contradicted);
+    }
+
+    #[test]
+    fn a_transaction_that_does_not_decode_is_never_contradicted() {
+        // A typed transaction of a type this decoder does not know.
+        let block = block_with(&[vec![0x7f, 0xc0]], [0x44; 20]);
+        let receipts = vec![receipt_with(vec![])];
+        let me = [0x55u8; 20];
+        let c = check(&me, 1, role::FROM | role::TO | role::WORD | role::AUTH, &block, Some(&receipts));
+        assert_eq!((c.state, c.contradicted), (State::Unverified, 0), "{c:?}");
+        assert_eq!(c.unchecked, role::FROM | role::TO | role::WORD | role::AUTH);
+        assert_eq!((c.value.clone(), c.to), (None, None));
+        // Its logs are still read: an emitter role is checked.
+        assert_eq!(check(&me, 1, role::EMITTER, &block, Some(&receipts)).state, State::Contradicted);
     }
 
     #[test]

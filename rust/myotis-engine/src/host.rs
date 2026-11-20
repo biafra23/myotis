@@ -3316,7 +3316,8 @@ pub fn address_history_json(handle: i64, address: &str, options_json: &str) -> S
         Err(msg) => return eljson::error_json(msg),
     };
     let head = Some(reader.optimistic_block_number()).filter(|h| *h > 0);
-    crate::addrhist::history_json(&engine.rt, chain_id, head, address, options_json)
+    let trust = crate::addrhist::Trust::of(&reader);
+    crate::addrhist::history_json(&engine.rt, chain_id, head, trust, address, options_json)
 }
 
 /// `verify_address_history_json`: check entries of `address`'s history (as a page returns
