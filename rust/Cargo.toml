@@ -61,10 +61,14 @@ members = ["myotis-addr1", "myotis-bls", "myotis-consensus", "myotis-core", "myo
 # swarm (crate myotis-swarm, the embedded ant Swarm node) is excluded too: a member is
 # built by every `cargo build --workspace`, the release build included, and would pull
 # ant's libp2p features (dns, ping, upnp) into the engine. No engine crate depends on it
-# yet either: ant is a git dependency, and in this lock it would make every cold build of
-# the workspace fetch it (rust/swarm/src/lib.rs, "Not linked into the engine yet"). Its own
-# lock is rust/swarm/Cargo.lock, seeded from this one.
-exclude = ["tor-poc", "roost", "swarm"]
+# yet (rust/swarm/src/lib.rs, "Not linked into the engine yet"). Its own lock is
+# rust/swarm/Cargo.lock, seeded from this one.
+#
+# vendor holds third-party sources copied in verbatim, today ant (vendor/ant/VENDORED.md):
+# not on crates.io, and as a git dependency it would make every cold build fetch it.
+# Upstream's code with its own workspace manifest (vendor/ant/Cargo.toml), built only as a
+# path dependency, never as a member: no Myotis fmt or clippy runs over it.
+exclude = ["tor-poc", "roost", "swarm", "vendor"]
 
 # ONE version for every myotis-* release crate (`version.workspace = true` in each
 # member). The Gradle build is the source of truth for the release version

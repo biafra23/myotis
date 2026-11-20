@@ -1,0 +1,109 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/ant-chain",
+  "crates/ant-control",
+  "crates/ant-crypto",
+  "crates/ant-node",
+  "crates/ant-p2p",
+  "crates/ant-postage",
+  "crates/ant-retrieval",
+]
+
+[workspace.package]
+edition = "2021"
+# Policy, not a technical floor: ant tracks current stable Rust, and
+# `rust-version` is raised to the CI stable toolchain. CI's `msrv` job
+# builds with exactly this version, which keeps the declared floor honest.
+# freedom-mobile-ffi pins a toolchain and builds ant from source (and
+# freedom-browser-android builds that), so a bump is a deliberate policy
+# step coordinated with them: see AGENTS.md.
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/solardev-xyz/ant"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+async-trait = "0.1.89"
+axum = "0.8.9"
+clap = { version = "4.5.37", features = ["derive"] }
+hex = "0.4.3"
+hyper = "1.9.0"
+k256 = { version = "0.13.4", features = ["digest", "ecdh", "ecdsa", "sha256"] }
+libp2p = { version = "0.56.0", features = [
+  "dns",
+  "ecdsa",
+  "identify",
+  "macros",
+  "noise",
+  "ping",
+  "secp256k1",
+  "tcp",
+  "tokio",
+  "upnp",
+  "yamux",
+] }
+prost = "0.13.5"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha3 = "0.10.8"
+thiserror = "2.0.12"
+tokio = { version = "1.44.2", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time"
+] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+unsigned-varint = { version = "0.8.0", features = ["futures"] }
+
+[workspace.lints.clippy]
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+dbg_macro = "warn"
+fn_params_excessive_bools = "allow"
+items_after_statements = "allow"
+mem_forget = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+needless_pass_by_value = "allow"
+pedantic = { level = "warn", priority = -1 }
+similar_names = "allow"
+struct_excessive_bools = "allow"
+todo = "warn"
+too_many_lines = "allow"
+unimplemented = "warn"
+
+[workspace.lints.rust]
+elided_lifetimes_in_paths = "allow"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "allow"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+
+# Release profile tuned for size on the iOS slice without making
+# desktop builds noticeably slower:
+#  - `lto = "thin"` cross-crate inlining without the multi-minute link
+#    time of full `lto = true`.
+#  - `codegen-units = 1` lets thin-LTO see the whole graph as a single
+#    unit; +5–10 % link time for ~3–5 % smaller code.
+#  - `panic = "abort"` drops the unwinding tables (`__eh_frame` +
+#    `__gcc_except_tab` were 1.4 MB combined in the unstripped iOS
+#    binary). Release-profile panics terminate immediately, which is
+#    what every consumer here already wants — `antd` panics are bugs,
+#    not flow control.
+#  - `strip = "symbols"` removes the symbol table from the static
+#    libraries cargo emits; xcodebuild's own strip then has nothing
+#    left to do but the Swift glue.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

@@ -6,6 +6,12 @@
 # rust-clippy.yml do not see it. No engine crate depends on it yet; once one does
 # (behind a feature), this lane must also build that feature and its sources.
 #
+# ant is vendored in rust/vendor/ant (its VENDORED.md): this lane builds it as a
+# path dependency, and never fetches it. Cargo decides whether a path crate is
+# fresh by file mtime, which a new checkout always moves, so every run builds ant
+# again (the git dependency came out of the cache). vendored-ant.yml checks the
+# copy against upstream; cargo-locks.yml keeps git sources out of every lock.
+#
 # Path-filtered, and `push` scoped to main as in the other Rust lanes, so a push
 # to a branch with an open PR runs once (under pull_request).
 name: swarm
@@ -15,12 +21,14 @@ on:
     branches: ["main"]
     paths:
       - "rust/swarm/**"
+      - "rust/vendor/ant/**"
       - ".github/workflows/swarm.yml"
       - ".github/actions/rust-toolchain/**"
       - "rust/rust-toolchain.toml"
   pull_request:
     paths:
       - "rust/swarm/**"
+      - "rust/vendor/ant/**"
       - ".github/workflows/swarm.yml"
       - ".github/actions/rust-toolchain/**"
       - "rust/rust-toolchain.toml"

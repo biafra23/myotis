@@ -57,7 +57,6 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "ant-chain"
 version = "0.5.78"
-source = "git+https://github.com/freedom-hq/ant?rev=b138f6bc074d8c28149017d4e7b1e80db8c67d4d#b138f6bc074d8c28149017d4e7b1e80db8c67d4d"
 dependencies = [
  "ant-crypto",
  "getrandom 0.3.4",
@@ -76,7 +75,6 @@ dependencies = [
 [[package]]
 name = "ant-control"
 version = "0.5.78"
-source = "git+https://github.com/freedom-hq/ant?rev=b138f6bc074d8c28149017d4e7b1e80db8c67d4d#b138f6bc074d8c28149017d4e7b1e80db8c67d4d"
 dependencies = [
  "hex",
  "serde",
@@ -89,7 +87,6 @@ dependencies = [
 [[package]]
 name = "ant-crypto"
 version = "0.5.78"
-source = "git+https://github.com/freedom-hq/ant?rev=b138f6bc074d8c28149017d4e7b1e80db8c67d4d#b138f6bc074d8c28149017d4e7b1e80db8c67d4d"
 dependencies = [
  "getrandom 0.3.4",
  "k256",
@@ -100,7 +97,6 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.5.78"
-source = "git+https://github.com/freedom-hq/ant?rev=b138f6bc074d8c28149017d4e7b1e80db8c67d4d#b138f6bc074d8c28149017d4e7b1e80db8c67d4d"
 dependencies = [
  "ant-control",
  "ant-crypto",
@@ -121,7 +117,6 @@ dependencies = [
 [[package]]
 name = "ant-p2p"
 version = "0.5.78"
-source = "git+https://github.com/freedom-hq/ant?rev=b138f6bc074d8c28149017d4e7b1e80db8c67d4d#b138f6bc074d8c28149017d4e7b1e80db8c67d4d"
 dependencies = [
  "ant-chain",
  "ant-control",
@@ -151,7 +146,6 @@ dependencies = [
 [[package]]
 name = "ant-postage"
 version = "0.5.78"
-source = "git+https://github.com/freedom-hq/ant?rev=b138f6bc074d8c28149017d4e7b1e80db8c67d4d#b138f6bc074d8c28149017d4e7b1e80db8c67d4d"
 dependencies = [
  "ant-crypto",
  "fs4",
@@ -165,7 +159,6 @@ dependencies = [
 [[package]]
 name = "ant-retrieval"
 version = "0.5.78"
-source = "git+https://github.com/freedom-hq/ant?rev=b138f6bc074d8c28149017d4e7b1e80db8c67d4d#b138f6bc074d8c28149017d4e7b1e80db8c67d4d"
 dependencies = [
  "ant-crypto",
  "ant-postage",

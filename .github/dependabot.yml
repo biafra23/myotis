@@ -18,7 +18,8 @@
 # whose `=` pins of tokio and futures follow the workspace's by hand, the Go
 # engine's go/go.mod + go.sum, and scripts/swarm-cli/package-lock.json (the
 # swarm-cli that scripts/publish_site_swarm.mjs runs, which pulls in
-# @ethersphere/bee-js; security updates only).
+# @ethersphere/bee-js; security updates only), and rust/vendor/ant, the vendored
+# ant crates, moved only by scripts/vendor_ant.sh (rust/vendor/ant/VENDORED.md).
 # claude-review.yml is excluded (see the github-actions entry).
 #
 # Grouped, and Cargo and Gradle monthly, so the routine moves arrive as a
@@ -111,6 +112,10 @@ updates:
       - "/rust/roost"
       - "/rust/tor-poc"
       - "/rust/swarm"
+    # /rust/swarm reaches ant through path dependencies in rust/vendor/ant (third-party
+    # sources copied in verbatim, VENDORED.md there), so Dependabot needs those manifests to
+    # resolve its graph and is not told to skip them. Should a PR of its own edit one, the
+    # swarm lane's `vendor_ant.sh --check` fails it: an ant update is that script.
     schedule:
       interval: monthly
     cooldown:

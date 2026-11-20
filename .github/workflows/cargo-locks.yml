@@ -100,3 +100,20 @@ jobs:
             fi
           done
           exit $fail
+      # No lock may name a git source: every cold build would fetch that repository,
+      # and its bytes have no registry checksum (claude-review of #892). A crate that is
+      # not on crates.io is vendored under rust/vendor instead, as ant is
+      # (rust/vendor/ant/VENDORED.md, scripts/vendor_ant.sh). That answers the fetch and
+      # the checksum, not advisories: such a crate has no advisory coverage either way.
+      - name: No git sources in any lock
+        run: |
+          set -eu
+          fail=0
+          for lock in rust/Cargo.lock rust/roost/Cargo.lock rust/tor-poc/Cargo.lock \
+                      rust/swarm/Cargo.lock docs/tour/workbook/solution/Cargo.lock; do
+            if grep -n '^source = "git+' "$lock"; then
+              echo "::error file=$lock::$lock names a git source. Vendor the crate under rust/vendor instead (rust/vendor/ant/VENDORED.md)."
+              fail=1
+            fi
+          done
+          exit $fail
