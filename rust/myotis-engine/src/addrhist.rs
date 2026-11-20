@@ -324,6 +324,9 @@ fn page_json(read: &Read, importer: [u8; 20], chain_head: Option<u64>, who: (u64
 /// The most entries one verify call checks.
 pub const MAX_VERIFY: usize = 50;
 
+/// The most one verify call takes: the blocks not reached by then come back `unavailable`.
+const VERIFY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// `verify_address_history_json`: check `entries` (a JSON array of `{"block", "slot",
 /// "roles"}`, as a page returns them) of `address` against verified chain data
 /// (`myotis_net::el::addrcheck`, part 6 of #899), one verified block (and, for the log
@@ -336,9 +339,16 @@ pub const MAX_VERIFY: usize = 50;
 ///   "transfer":{"token":"0x…","from":"0x…","to":"0x…","data":"0x…"}|null,"reason":"…"}]
 /// ```
 ///
-/// `unavailable` (with its `reason`) is a block no peer served now: ask again. A final
-/// verdict (`verified` or `contradicted` in a finalized block) is kept, and later pages carry
-/// it. A refusal is the permanent `-32602`.
+/// `unavailable` (with its `reason`) is a block or its receipts no peer served now: ask
+/// again. `unverified` with a `reason` is a block this node cannot verify (outside what it
+/// can anchor, or the checkpoint table's alarm): asking again does not help. A final, complete
+/// verdict (`verified` or `contradicted` in a finalized block, every checkable role checked)
+/// is kept, and later pages carry it. A refusal is the permanent `-32602`.
+///
+/// The entries may be sent as a page returned them: the fields a page renders (`state`,
+/// `final`, `confirmed`, …) come back as they were and are not inputs, the verdict is
+/// computed (or taken from the kept one) afresh; a `state` the engine never renders is
+/// refused.
 pub fn verify_json(
     rt: &tokio::runtime::Runtime,
     reader: &std::sync::Arc<myotis_net::el::reader::ElReader>,
@@ -363,33 +373,77 @@ pub fn verify_json(
             None => blocks.entry(e.0).or_default().push(i),
         }
     }
+    use myotis_net::el::addrcheck::{check, role, State};
+    let needs_receipts = |(_, slot, roles): (u64, u32, u8)| slot > 0 && roles & role::NEEDS_RECEIPTS != 0;
+    let started = std::time::Instant::now();
     for (block, idx) in blocks {
-        let needs_receipts = idx.iter().any(|i| {
-            let (_, slot, roles) = entries[*i];
-            slot > 0 && roles & myotis_net::el::addrcheck::role::NEEDS_RECEIPTS != 0
-        });
-        let fetched = rt.block_on(reader.request(async {
-            let b = reader.get_block_by_number(Some(block), true).await?;
-            let r = match (&b, needs_receipts) {
-                (Some(_), true) => reader.get_block_receipts(Some(block)).await?,
-                _ => None,
-            };
-            Ok((b, r))
-        }));
+        if started.elapsed() > VERIFY_DEADLINE {
+            for i in idx {
+                let (_, slot, roles) = entries[i];
+                out[i] = verified::unavailable(block, slot, roles, "the call's deadline passed before this block");
+            }
+            continue;
+        }
+        let fetched = rt.block_on(reader.request(async { reader.get_block_by_number(Some(block), true).await }));
+        let b = match fetched {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                let why = format!(
+                    "the node holds no canonical block {block} now (its verified head is {})",
+                    reader.optimistic_block_number()
+                );
+                for i in idx {
+                    let (_, slot, roles) = entries[i];
+                    out[i] = verified::unavailable(block, slot, roles, &why);
+                }
+                continue;
+            }
+            Err(e) => {
+                // A lasting refusal (outside what this node can verify, the checkpoint
+                // table's alarm) is no "ask again".
+                let lasting = e.starts_with(myotis_net::el::deep::ALARM_PREFIX) || e.contains("verify window");
+                for i in idx {
+                    let (_, slot, roles) = entries[i];
+                    out[i] = if lasting {
+                        verified::not_verifiable(block, slot, roles, &e)
+                    } else {
+                        verified::unavailable(block, slot, roles, &e)
+                    };
+                }
+                continue;
+            }
+        };
+        // The receipts on their own, only when an entry needs them, and only if they are this
+        // block's (a reorg between the two reads would pair another block's logs).
+        let receipts: Result<Option<Vec<_>>, String> = if idx.iter().any(|i| needs_receipts(entries[*i])) {
+            match rt.block_on(reader.request(async { reader.get_block_receipts(Some(block)).await })) {
+                Ok(Some(r)) if r.iter().all(|x| x.block_hash == b.hash) => Ok(Some(r)),
+                Ok(Some(_)) => Err("the block's receipts came from another block (a reorg between the reads)".into()),
+                Ok(None) => Err("the block's receipts were not served".into()),
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(None)
+        };
         for i in idx {
             let (_, slot, roles) = entries[i];
-            out[i] = match &fetched {
-                Ok((Some(b), receipts)) => {
-                    let c = myotis_net::el::addrcheck::check(&address, slot, roles, b, receipts.as_deref());
-                    let v = verified::render(block, slot, roles, &c, block <= finalized);
-                    if block <= finalized && c.state != myotis_net::el::addrcheck::State::Unverified {
-                        verified::keep(chain_id, &address, block, slot, roles, &v);
-                    }
-                    v
+            let r = match (&receipts, needs_receipts(entries[i])) {
+                (Err(e), true) => {
+                    out[i] = verified::unavailable(block, slot, roles, e);
+                    continue;
                 }
-                Ok((None, _)) => verified::unavailable(block, slot, roles, "the block is above the node's verified head"),
-                Err(e) => verified::unavailable(block, slot, roles, e),
+                (Ok(r), _) => r.as_deref(),
+                (Err(_), false) => None,
             };
+            let c = check(&address, slot, roles, &b, r);
+            let v = verified::render(block, slot, roles, &c, block <= finalized);
+            // Kept only when final and complete: every role that verified data can check was
+            // checked (TRACE never is; an uncle's miner neither).
+            let complete = c.unchecked & !(role::TRACE | role::BLOCK) == 0;
+            if block <= finalized && c.state != State::Unverified && complete {
+                verified::keep(chain_id, &address, block, slot, roles, &v);
+            }
+            out[i] = v;
         }
     }
     serde_json::Value::Array(out).to_string()
@@ -408,9 +462,19 @@ fn parse_entries(json: &str) -> Result<Vec<(u64, u32, u8)>, String> {
             let o = e.as_object().ok_or("an entry must be an object")?;
             for k in o.keys() {
                 // A page's own fields are accepted back (a host may pass entries as it got
-                // them); anything else is refused.
-                if !matches!(k.as_str(), "block" | "slot" | "roles" | "state") {
+                // them); they are not inputs. Anything else is refused.
+                if !matches!(
+                    k.as_str(),
+                    "block" | "slot" | "roles" | "state" | "final" | "confirmed" | "contradicted" | "unchecked"
+                        | "txHash" | "from" | "to" | "value" | "transfer" | "reason"
+                ) {
                     return Err(format!("unknown entry field '{k}'"));
+                }
+            }
+            if let Some(state) = o.get("state") {
+                let known = ["verified", "contradicted", "unverified", "unavailable"];
+                if !state.as_str().is_some_and(|s| known.contains(&s)) {
+                    return Err(format!("unknown entry state {state}"));
                 }
             }
             let block = o.get("block").and_then(|b| b.as_u64()).ok_or("an entry needs a numeric block")?;
@@ -508,6 +572,17 @@ mod verified {
             );
         }
         v
+    }
+
+    /// A block this node cannot verify: asking again does not help.
+    pub(super) fn not_verifiable(block: u64, slot: u32, roles: u8, reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "block": block,
+            "slot": slot,
+            "roles": super::role_names(roles),
+            "state": "unverified",
+            "reason": reason,
+        })
     }
 
     pub(super) fn unavailable(block: u64, slot: u32, roles: u8, reason: &str) -> serde_json::Value {
@@ -734,6 +809,9 @@ mod tests {
     fn verify_entries_are_applied_or_refused_whole() {
         let ok = parse_entries(r#"[{"block":100,"slot":3,"roles":["from","emitter"],"state":"unverified"},{"block":101,"slot":0,"roles":["block"]}]"#).unwrap();
         assert_eq!(ok, vec![(100, 3, 0x05), (101, 0, 0x40)]);
+        // A kept verdict as a page renders it goes back in as it came.
+        let echoed = r#"[{"block":1,"slot":2,"roles":["from"],"state":"verified","final":true,"confirmed":["from"],"contradicted":[],"unchecked":[],"txHash":"0x00","from":"0x01","to":null,"value":"0x0","transfer":null}]"#;
+        assert_eq!(parse_entries(echoed).unwrap(), vec![(1, 2, 0x01)]);
         for bad in [
             "[]",
             "{}",
@@ -743,6 +821,7 @@ mod tests {
             r#"[{"block":1,"slot":1,"roles":["from"],"extra":1}]"#,
             r#"[{"block":"1","slot":1,"roles":["from"]}]"#,
             r#"[{"block":1,"slot":4294967296,"roles":["from"]}]"#,
+            r#"[{"block":1,"slot":1,"roles":["from"],"state":"trusted"}]"#,
         ] {
             assert!(parse_entries(bad).is_err(), "{bad}");
         }
