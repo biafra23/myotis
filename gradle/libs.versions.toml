@@ -42,7 +42,7 @@ discovery = "26.4.0-android.1"
 # Upstream Netty (NIO-only usage; Android-safe). Replaces the netty-kotlin
 # transpile PoC — same io.netty.* FQCNs, so this is a coordinate swap.
 netty = "4.2.20.Final"  # every netty module of a graph that holds these follows it, via netty-bom (FamilyAlignment in the root build)
-bouncycastle = "1.86"
+bouncycastle = "1.87"
 junit = "6.1.3"
 slf4j = "2.0.20"
 log4j = "2.25.3"  # matches Besu 26.4's log4j-bom; bump in lockstep with Besu
@@ -84,7 +84,7 @@ jna = "5.18.1"
 # (com.android.kotlin.multiplatform.library) for :ui and :myotis-engine. Its
 # bundled R8 and lint read Kotlin 2.4 metadata and sources, so the R8 classpath
 # pin and the lint-version override the 8.7 build needed are gone.
-agp = "9.5.1"
+agp = "9.5.2"
 # Android NATIVE toolchain, pinned exactly (#734, Part 2). The single source for
 # Gradle (ndkVersion/buildToolsVersion in :android-app, and the
 # root cargoNdkAndroid gate), for CI (.github/actions/android-native-toolchain
@@ -114,7 +114,7 @@ activity-compose = "1.9.3"
 # the project's Ktor/Compose-Multiplatform direction.
 ktor = "3.6.1"
 kotlinx-coroutines = "1.11.0"
-kotlinx-serialization = "1.12.0"
+kotlinx-serialization = "1.13.0"
 # 0.6.2 = the compatibility release for the kotlin.time.Instant the 2.1.20+ stdlib
 # introduced. The iOS (klib) compile still resolves the experimental stdlib Instant
 # in :ui's formatLogTime — see the local @OptIn there.
