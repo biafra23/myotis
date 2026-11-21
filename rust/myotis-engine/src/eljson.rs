@@ -2159,6 +2159,7 @@ mod tests {
             tx_hashes: vec![[0xa1; 32], [0xb2; 32]],
             full_transactions: None,
             raw_transactions: Default::default(),
+            withdrawals: None,
             ommers: Default::default(),
         }
     }

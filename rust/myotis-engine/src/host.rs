@@ -3316,7 +3316,25 @@ pub fn address_history_json(handle: i64, address: &str, cursor: &str, limit: i64
         Err(msg) => return eljson::error_json(msg),
     };
     let head = Some(reader.optimistic_block_number()).filter(|h| *h > 0);
-    crate::addrhist::history_json(&engine.rt, chain_id, head, address, cursor, limit)
+    let trust = crate::addrhist::Trust::of(&reader);
+    crate::addrhist::history_json(&engine.rt, chain_id, head, trust, address, cursor, limit)
+}
+
+/// `verify_address_history_json`: check entries of `address`'s history (as a page returns
+/// them) against verified chain data, for the chain of a running handle (`addrhist`).
+#[allow(dead_code)] // exported over the FFI by part 7 of #899
+pub fn verify_address_history_json(handle: i64, address: &str, entries_json: &str) -> String {
+    if let Some(refused) = crate::addrhist::early_refusal() {
+        return refused;
+    }
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, chain_id) = match snapshot_reader_evm(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    crate::addrhist::verify_json(&engine.rt, &reader, chain_id, address, entries_json)
 }
 
 /// `set_address_history_config_json`: the address history's settings (`addrhist`):

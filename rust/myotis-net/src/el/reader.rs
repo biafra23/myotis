@@ -610,6 +610,10 @@ pub struct VerifiedBlock {
     /// what `eth_getRawTransactionByBlock*AndIndex` serves (#715). Empty for a
     /// header-only read. Kept in the wire's compact list, as the body arrived.
     pub raw_transactions: crate::el::eth::messages::RawList,
+    /// The body's withdrawals as they arrived (each an RLP list `[index,
+    /// validatorIndex, address, amount]`), checked against `withdrawalsRoot`;
+    /// `None` before Shanghai and for a header-only read.
+    pub withdrawals: Option<crate::el::eth::messages::RawList>,
     /// The ommer (uncle) headers as they arrived, each an RLP list, checked against
     /// `ommersHash`: what `uncles` renders (their hashes). Empty since the Merge and for a
     /// header-only read.
@@ -8287,6 +8291,7 @@ impl ElReader {
                 top.kind()
             ))
         };
+        const _: () = assert!(BLOCK_LOOKBACK_MAX == 512, "BEYOND_FINALIZED_WINDOW names the cap");
         // Only a finalized top: a deep read above finality (a long stretch
         // without it) has no anchor a walk could start from.
         let WindowTop::Finalized { number, hash } = top else {
@@ -8560,6 +8565,7 @@ impl ElReader {
                     tx_hashes: Vec::new(),
                     full_transactions: None,
                     raw_transactions: crate::el::eth::messages::RawList::new(),
+                    withdrawals: None,
                     ommers: crate::el::eth::messages::RawList::new(),
                 });
             }
@@ -8605,6 +8611,7 @@ impl ElReader {
             tx_hashes,
             full_transactions: full,
             raw_transactions: body.transactions,
+            withdrawals: body.withdrawals,
             ommers: body.ommers,
         })
     }
@@ -10428,6 +10435,13 @@ impl ElReader {
     /// The checkpoint table's alarm (`el::deep`), once raised: a walk from an
     /// attested finalized block found another hash at the table's top, and
     /// every read resting on the table is refused. Kept across restarts.
+    /// How many times this reader's light client was re-anchored at a STALE_ANCHOR park
+    /// (`ExecAnchor::reanchors`): what was verified under an earlier count rested on an
+    /// anchor since replaced.
+    pub fn reanchors(&self) -> u64 {
+        self.anchor.reanchors()
+    }
+
     pub fn checkpoint_alarm(&self) -> Option<String> {
         self.deep.alarm()
     }
@@ -10850,6 +10864,12 @@ fn build_one_receipt(
         contract_address,
     }
 }
+
+/// The words of a block read's refusal when the block is below the window of the
+/// finalized block and no deep anchor serves it (no table for this network): lasting, no
+/// retry changes it. A read above finality more than 512 blocks below the head (a long
+/// stretch without finality) words its top "the optimistic head" instead and is transient.
+pub const BEYOND_FINALIZED_WINDOW: &str = "behind the finalized block — beyond the 512-block verify window";
 
 /// What a verified header window is anchored at — the block its top must BE —
 /// and so what serving it proves about the peer (`peer::KnownHead`).
