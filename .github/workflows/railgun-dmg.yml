@@ -181,7 +181,7 @@ jobs:
           fetch sepolia "$SEPOLIA_SEED_URL" "$SEPOLIA_SEED_SHA256_URL" "${SEPOLIA_SEED_SHA256:-}" "$SEPOLIA_SEED_ROOT" SEPOLIA_SEED_DIR
 
       - name: Set up JDK 21 (aarch64)
-        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78  # v6.2.0
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880  # v6.3.0
         with:
           java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'

@@ -157,7 +157,7 @@ jobs:
       # Installs a JDK 21 of the requested architecture and points JAVA_HOME at it. For x64 this
       # is the x86_64 Temurin build (run via Rosetta); for arm64 the native aarch64 build.
       - name: Set up JDK 21 (${{ matrix.java-arch }})
-        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78  # v6.2.0
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880  # v6.3.0
         with:
           java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
