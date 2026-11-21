@@ -2,7 +2,7 @@
 // part 1b): the handle table, lifecycle, and JSON plumbing that
 // cmd/myotis-capi exports as a c-shared library for JVM JNA consumers.
 //
-// The contract is rust/include/myotis_engine.h (ABI 59). The Go engine
+// The contract is rust/include/myotis_engine.h (ABI 60). The Go engine
 // is the READ engine of that contract: the lifecycle functions, the
 // account/storage verified reads, status, and the log drain are
 // FUNCTIONAL; every other exported symbol exists (so the host's
@@ -60,7 +60,7 @@ import (
 // fetch), the remembered stale-anchor policy (59 =
 // myotis_set_stale_anchor_policy) is APPLIED for ASK and CONTINUE and
 // refused only for its fetch-backed CHECKPOINT code.
-const MyotisABIVersion = 59
+const MyotisABIVersion = 60
 
 // ReadBudget is the wall-clock cap on one blocking verified read — the
 // same ~90 s budget the Rust twin gives its reads, so a host's JNA

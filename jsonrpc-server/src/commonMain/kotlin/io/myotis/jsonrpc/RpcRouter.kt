@@ -64,6 +64,9 @@ class RpcRouter internal constructor(
          *  request geth refuses with "too many arguments" is refused here too,
          *  never served with the extra argument ignored (#366). Keep in sync
          *  with tryVerified's cases. */
+        /** Methods only this node serves whose requests must never reach a dev proxy. */
+        private val LOCAL_ONLY = setOf("myotis_getAddressHistory", "myotis_verifyAddressHistoryEntries")
+
         private val VERIFIED_ARITY: Map<String, Int> = mapOf(
             "eth_chainId" to 0, "net_version" to 0, "eth_blockNumber" to 0,
             // transaction, block, state overrides, block overrides
@@ -86,6 +89,10 @@ class RpcRouter internal constructor(
             "debug_traceCall" to 3,
             // #716: the simulation object (geth's simOpts), block.
             "eth_simulateV1" to 2,
+            // address, options {cursor, limit, roles, fromBlock, toBlock} (#899)
+            "myotis_getAddressHistory" to 2,
+            // address, the entries a page returned (#899)
+            "myotis_verifyAddressHistoryEntries" to 2,
             // The polled filter family over the log index and the verified head (#714).
             "eth_newFilter" to 1, "eth_newBlockFilter" to 0, "eth_getFilterChanges" to 1,
             "eth_getFilterLogs" to 1, "eth_uninstallFilter" to 1,
@@ -625,8 +632,10 @@ class RpcRouter internal constructor(
             // so -32602 with the reason — -32000 is documented as retryable, and
             // a conforming client would retry it forever. A dev proxy still gets
             // its chance, as for the router's other refusals: unlike the engine
-            // refusals above, nothing was asked of the engine.
-            if (proxy == null) {
+            // refusals above, nothing was asked of the engine. Never for the address
+            // history (#899): only this node serves it, and the request names the
+            // user's address, which an upstream must not see.
+            if (proxy == null || method in LOCAL_ONLY) {
                 logger.record(method, idStr, "ERROR", elapsedMs(t0), -32602)
                 return errorEnvelope(id, -32602, e.why)
             }
@@ -644,6 +653,8 @@ class RpcRouter internal constructor(
                 else if (method == "debug_traceCall" && traceOverrideJson(root) != null) "SIMULATED"
                 // Every block it answers with is one the chain never had.
                 else if (method == "eth_simulateV1") "SIMULATED"
+                // A page of candidates from an index, not verified data (#899).
+                else if (method == "myotis_getAddressHistory") "INDEXED"
                 else "VERIFIED"
             // NB a code-3 REVERT response counts here too, deliberately: the
             // revert is a verified (or simulated) ANSWER, not a failure to
@@ -1771,6 +1782,46 @@ class RpcRouter internal constructor(
                     RpcTraceResult.Kind.REFUSED -> throw EngineRefused(outcome.detail ?: "refused")
                     RpcTraceResult.Kind.INFEASIBLE -> errorEnvelope(id, -32000, outcome.detail ?: "out of gas")
                 }
+            }
+            // An address's history from the addr1 index on Swarm (#899): candidates, each
+            // "unverified" until myotis_verifyAddressHistoryEntries checked it. The engine
+            // applies every option or refuses the request (-32602).
+            "myotis_getAddressHistory", "myotis_verifyAddressHistoryEntries" -> {
+                // Answered here whatever happens, never by a dev proxy: only this node serves
+                // the method, and the request names the user's address.
+                if (!b.supportsAddressHistory()) {
+                    // Refused at once: no reason to wake a chain for a call that can only fail.
+                    throw EngineRefused("the address history needs the Rust engine built with its Swarm reader")
+                }
+                val p = root.params()
+                val address = (p?.getOrNull(0) as? JsonPrimitive)?.takeIf { it.isString }?.content
+                    ?: return errorEnvelope(id, -32602, "invalid argument 0: expected the address (0x + 40 hex digits)")
+                val second = p.getOrNull(1)
+                val resultJson = if (method == "myotis_getAddressHistory") {
+                    val opts = when (second) {
+                        null, is JsonNull -> "{}"
+                        is JsonObject -> second.toString()
+                        else -> return errorEnvelope(id, -32602,
+                            "invalid argument 1: expected the options object {cursor, limit, roles, fromBlock, toBlock}")
+                    }
+                    withContext(rpcIoDispatcher) { b.addressHistory(address, opts) }
+                } else {
+                    val entries = second as? JsonArray
+                        ?: return errorEnvelope(id, -32602, "invalid argument 1: expected the array of entries a page returned")
+                    withContext(rpcIoDispatcher) { b.verifyAddressHistory(address, entries.toString()) }
+                }
+                val parsed = runCatching { json.parseToJsonElement(resultJson) }.getOrNull()
+                    ?: throw EngineReadUnavailable("the engine's address history answer did not parse")
+                val envelope = parsed as? JsonObject
+                val errorMessage = envelope?.get("error")
+                    ?.let { (it as? JsonPrimitive)?.contentOrNull ?: it.toString() }
+                // Thrown, not answered here, so the coverage map counts it as what it is: the
+                // permanent refusal stays -32602, anything else is the retryable -32000.
+                if (errorMessage != null) {
+                    if (envelope.permanentCode()) throw EngineRefused(errorMessage)
+                    throw EngineReadUnavailable(errorMessage)
+                }
+                resultEnvelope(id, parsed)
             }
             // eth_simulateV1 (#716): blocks of calls simulated on top of a block, as
             // geth simulates them. The simulation object goes to the engine as the

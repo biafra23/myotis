@@ -510,6 +510,39 @@ pub fn address_activity_json(handle: i64, after_block: i64) -> String {
     crate::host::address_activity_json(handle, after_block)
 }
 
+/// One page of an address's history from the addr1 index on Swarm, newest first
+/// (#899; `options_json` = `{"cursor","limit","roles","fromBlock","toBlock"}`, each
+/// optional and each applied). The page JSON, the retryable `{"error"}`, or the
+/// permanent `{"error","code":-32602}` (no Swarm reader in this build, no importer
+/// key, Tor on, a malformed option). ABI >= 60.
+#[uniffi::export]
+pub fn address_history_json(handle: i64, address: String, options_json: String) -> String {
+    crate::host::address_history_json(handle, &address, &options_json)
+}
+
+/// Check up to 50 entries of an address's history (as a page returned them) against
+/// verified chain data (#899): a JSON array, each entry with its state, or the
+/// permanent `{"error","code":-32602}`. ABI >= 60.
+#[uniffi::export]
+pub fn verify_address_history_json(handle: i64, address: String, entries_json: String) -> String {
+    crate::host::verify_address_history_json(handle, &address, &entries_json)
+}
+
+/// Whether this build serves the address history at all (#899): the Swarm reader linked
+/// (feature `swarm`), not Android or iOS. False = every history call is refused. ABI >= 60.
+#[uniffi::export]
+pub fn address_history_supported() -> bool {
+    crate::host::address_history_supported()
+}
+
+/// The address history's settings, engine-wide (#899): `{"importer": "0x…" | null,
+/// "swarm": {"network": "mainnet"} | {"network": "dev", "networkId", "bootnodes"}}`,
+/// applied whole. `{}`, or the permanent `{"error","code":-32602}`. ABI >= 60.
+#[uniffi::export]
+pub fn set_address_history_config_json(config_json: String) -> String {
+    crate::host::set_address_history_config_json(&config_json)
+}
+
 /// Read-fetch shadow-cache counters as JSON (schema 1: `account` / `storage`
 /// / `code` fetch, repeat and avoidable-cost counters plus age buckets; see
 /// docs/how-it-works/read-stats.md). `{"error":…}` when the handle has no EL reader.

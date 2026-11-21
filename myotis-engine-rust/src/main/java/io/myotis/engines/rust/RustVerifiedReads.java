@@ -697,4 +697,21 @@ final class RustVerifiedReads implements VerifiedReads {
         if (bytes == null) throw new EngineException("byte input is required");
         return io.myotis.engines.common.Hex.formatHexPrefixed(bytes);
     }
+
+    /** The address history (#899): the handle's native answer as it came (a page, the
+     *  retryable {@code {"error"}}, or the permanent {@code {"error","code":-32602}}). */
+    @Override
+    public boolean supportsAddressHistory() {
+        return RustEngineNative.nativeAddressHistorySupported();
+    }
+
+    @Override
+    public String addressHistoryJson(String address, String optionsJson) {
+        return handle.addressHistoryJson(address, optionsJson);
+    }
+
+    @Override
+    public String verifyAddressHistoryJson(String address, String entriesJson) {
+        return handle.verifyAddressHistoryJson(address, entriesJson);
+    }
 }

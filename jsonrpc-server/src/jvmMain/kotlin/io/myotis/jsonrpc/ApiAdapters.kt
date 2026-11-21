@@ -167,6 +167,14 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         }
     }
 
+    override fun supportsAddressHistory(): Boolean = v.supportsAddressHistory()
+
+    override fun addressHistory(address: String, optionsJson: String): String =
+        v.addressHistoryJson(address, optionsJson) ?: ADDRESS_HISTORY_REFUSED
+
+    override fun verifyAddressHistory(address: String, entriesJson: String): String =
+        v.verifyAddressHistoryJson(address, entriesJson) ?: ADDRESS_HISTORY_REFUSED
+
     override fun supportsSimulation(): Boolean = v.supportsSimulation()
 
     override fun simulateV1(optsJson: String, block: String): RpcSimulateResult {

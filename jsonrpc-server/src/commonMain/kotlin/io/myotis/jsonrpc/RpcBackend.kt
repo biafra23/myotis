@@ -433,6 +433,28 @@ interface RpcBackend {
     ): RpcTraceResult = RpcTraceResult.refused("this engine does not trace calls (debug_traceCall)")
 
     /**
+     * `myotis_getAddressHistory` (#899): one page of [address]'s history from the addr1
+     * index on Swarm, as the engine renders it — the page JSON, the retryable `{"error"}`,
+     * or the permanent `{"error","code":-32602}`. [optionsJson] is the request's options
+     * object as it came (every field applied by the engine, or the request refused).
+     *
+     * Default: the permanent refusal — a backend without the address history.
+     */
+    fun addressHistory(address: String, optionsJson: String): String = ADDRESS_HISTORY_REFUSED
+
+    /** Whether this backend serves the address history ([addressHistory]) at all. Consulted
+     *  BEFORE dispatch, so a backend without it refuses at once. Default: false. */
+    fun supportsAddressHistory(): Boolean = false
+
+    /**
+     * `myotis_verifyAddressHistoryEntries` (#899): [entriesJson] (an array of entries as a
+     * page returned them) checked against verified chain data; the engine's JSON as it came.
+     *
+     * Default: the permanent refusal.
+     */
+    fun verifyAddressHistory(address: String, entriesJson: String): String = ADDRESS_HISTORY_REFUSED
+
+    /**
      * Whether this backend simulates blocks of calls (`eth_simulateV1`, [simulateV1];
      * #716). Consulted BEFORE dispatch, as [supportsCallTracing].
      */
@@ -503,3 +525,8 @@ interface RpcLifecycle {
  *  reached, [lifecycle] the coarse state now in effect ("RUNNING" | "PAUSED" |
  *  "STOPPED"). Mirrors the IPC command's `{"ok":…, "lifecycle":…}` shape. */
 class RpcLifecycleResult(val ok: Boolean, val lifecycle: String)
+
+/** The permanent refusal of a backend without the address history (#899), the
+ *  `{"error","code":-32602}` envelope the engine contract's default answers too. */
+const val ADDRESS_HISTORY_REFUSED: String =
+    "{\"error\":\"the address history needs the Rust engine built with its Swarm reader\",\"code\":-32602}"

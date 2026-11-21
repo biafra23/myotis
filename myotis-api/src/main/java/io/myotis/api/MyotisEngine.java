@@ -61,4 +61,16 @@ public interface MyotisEngine {
 
     /** The metering last set by {@link #setNetworkMetering}. */
     NetworkMetering networkMetering();
+
+    /**
+     * The address history's settings, engine-wide (#899; {@link VerifiedReads#addressHistoryJson}):
+     * {@code {"importer": "0x…" | null, "swarm": {"network": "mainnet"} | {"network": "dev",
+     * "networkId": N, "bootnodes": ["/ip4/…", …]}}}. The importer key is an experimental setting:
+     * the user trusts that importer for the list's completeness. Applied whole ({@code "{}"})
+     * or refused with the permanent {@code {"error","code":-32602}}. Default: refused, no
+     * address history on this engine.
+     */
+    default String setAddressHistoryConfigJson(String configJson) {
+        return VerifiedReads.ADDRESS_HISTORY_REFUSED;
+    }
 }

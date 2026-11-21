@@ -62,7 +62,7 @@ fn main() {
         let mut cursor = before;
         for p in 0..pages {
             let t = Instant::now();
-            let page = index.page(&head, &address, cursor, limit).await.expect("page");
+            let page = index.page(&head, &address, cursor, limit, &myotis_addr1::client::Filter::default()).await.expect("page");
             println!("page {p}: {} entries, gaps {:?}, next {:?} ({:?})", page.entries.len(), page.gaps, page.next, t.elapsed());
             for e in &page.entries {
                 println!("  block {} slot {} {}", e.block, e.slot, role::names(e.roles));

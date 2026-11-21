@@ -6,6 +6,11 @@ rust-version.workspace = true
 description = "Standalone JSON-RPC daemon over the myotis-engine verified reads — no JVM"
 license = "MIT OR Apache-2.0"
 
+[features]
+# The address history from the addr1 index on Swarm (#899): the engine's Swarm reader,
+# for dev builds (`cargo build -p myotis-rpcd --features swarm`); off by default.
+swarm = ["myotis-engine/swarm"]
+
 [dependencies]
 # The engine's public `ffi` surface (plus the two `capi` entries `ffi` has no
 # wrapper for, create-with-checkpoint and set-boot-enodes). Default features:

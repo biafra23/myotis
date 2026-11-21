@@ -512,4 +512,55 @@ public interface VerifiedReads {
     default String getProof(byte[] address, String storageKeysJson, String block) {
         return null;
     }
+
+    /**
+     * The permanent refusal of an engine without the address history (#899): the
+     * {@code {"error","code":-32602}} envelope every default below answers.
+     */
+    String ADDRESS_HISTORY_REFUSED =
+            "{\"error\":\"the address history needs the Rust engine built with its Swarm reader\",\"code\":-32602}";
+
+    /**
+     * One page of {@code address}'s history from the addr1 address index on Swarm, newest
+     * first (#899; {@code .claude/agent/data-sources.md}, the carve-out for Swarm reads of the
+     * address index). {@code optionsJson}: {@code {"cursor","limit","roles","fromBlock",
+     * "toBlock"}}, each optional and each applied (the cursor is a page's {@code next};
+     * {@code limit} 1 to 500, 50 by default; {@code roles} names like {@code "from"}; the
+     * blocks as numbers or 0x quantities). The page:
+     * {@code {"importer","headUpdate","coveredFrom","coveredTo","headGap","tailGap","gaps",
+     * "fromBlock","toBlock","roles","entries":[{"block","slot","roles","state",…}],"next"}}.
+     * Every entry is a candidate: {@code "unverified"} until {@link #verifyAddressHistoryJson}
+     * checked it (a kept verdict shows here). Every range the index does not cover is named
+     * ({@code headGap}, {@code tailGap}, {@code gaps}), never a shorter list. A retryable
+     * {@code {"error"}} when Swarm did not deliver; the permanent
+     * {@code {"error","code":-32602}} for a malformed option, without an importer key, with
+     * Tor routing on, on mobile, and on an engine without the reader.
+     * Default: {@link #ADDRESS_HISTORY_REFUSED}.
+     */
+    default String addressHistoryJson(String address, String optionsJson) {
+        return ADDRESS_HISTORY_REFUSED;
+    }
+
+    /**
+     * Whether this engine serves the address history at all (#899): the Rust engine built
+     * with its Swarm reader, not on mobile. A host consults it before calling, so a call that
+     * can only be refused does not wake a paused chain. Default false.
+     */
+    default boolean supportsAddressHistory() {
+        return false;
+    }
+
+    /**
+     * Check up to 50 entries of {@code address}'s history ({@code entriesJson}: an array of
+     * {@code {"block","slot","roles"}}, as a page returned them) against verified chain data,
+     * one verified block (and its receipts where a role needs them) per block (#899). A
+     * JSON array, each entry with its {@code "state"} ({@code verified}, {@code contradicted},
+     * {@code unverified}, {@code unavailable} with a {@code reason}: ask again), {@code final},
+     * the per-role outcome and, for a transaction, its {@code txHash}, {@code from}, {@code to},
+     * {@code value} and {@code transfer}. A final, complete verdict is kept, and later pages
+     * show it. Default: {@link #ADDRESS_HISTORY_REFUSED}.
+     */
+    default String verifyAddressHistoryJson(String address, String entriesJson) {
+        return ADDRESS_HISTORY_REFUSED;
+    }
 }

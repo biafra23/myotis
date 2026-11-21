@@ -678,6 +678,10 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_address_activity_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_address_history_json(
+    ): Int
+    external fun uniffi_myotis_engine_checksum_func_address_history_supported(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_available_networks_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_canonical_network_name(
@@ -762,6 +766,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_activity_watch(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_set_address_history_config_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_set_dns_discovery(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_log_index_config(
@@ -788,6 +794,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_tor_status(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_verify_address_history_json(
+    ): Int
     external fun ffi_myotis_engine_uniffi_contract_version(
     ): Int
 
@@ -807,6 +815,10 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_myotis_engine_fn_func_address_activity_json(`handle`: Long,`afterBlock`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_address_history_json(`handle`: Long,`address`: RustBuffer.ByValue,`optionsJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_address_history_supported(uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     external fun uniffi_myotis_engine_fn_func_available_networks_json(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_canonical_network_name(`nameOrAlias`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -891,6 +903,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_set_activity_watch(`handle`: Long,`configJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    external fun uniffi_myotis_engine_fn_func_set_address_history_config_json(`configJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_set_dns_discovery(`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_log_index_config(`handle`: Long,`configJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -917,6 +931,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_myotis_engine_fn_func_tor_status(uniffi_out_err: UniffiRustCallStatus, 
     ): Int
+    external fun uniffi_myotis_engine_fn_func_verify_address_history_json(`handle`: Long,`address`: RustBuffer.ByValue,`entriesJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun ffi_myotis_engine_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_myotis_engine_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1040,6 +1056,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_address_activity_json() and 0xFFFF) != 44174) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_address_history_json() and 0xFFFF) != 9655) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_address_history_supported() and 0xFFFF) != 15604) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_available_networks_json() and 0xFFFF) != 49639) {
@@ -1168,6 +1190,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_myotis_engine_checksum_func_set_activity_watch() and 0xFFFF) != 19585) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_myotis_engine_checksum_func_set_address_history_config_json() and 0xFFFF) != 4846) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_myotis_engine_checksum_func_set_dns_discovery() and 0xFFFF) != 13006) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1205,6 +1230,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_tor_status() and 0xFFFF) != 43413) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_verify_address_history_json() and 0xFFFF) != 14679) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1483,6 +1511,40 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterLong.lower(`handle`),
         FfiConverterLong.lower(`afterBlock`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * One page of an address's history from the addr1 index on Swarm, newest first
+         * (#899; `options_json` = `{"cursor","limit","roles","fromBlock","toBlock"}`, each
+         * optional and each applied). The page JSON, the retryable `{"error"}`, or the
+         * permanent `{"error","code":-32602}` (no Swarm reader in this build, no importer
+         * key, Tor on, a malformed option). ABI >= 60.
+         */ fun `addressHistoryJson`(`handle`: kotlin.Long, `address`: kotlin.String, `optionsJson`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_address_history_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`address`),
+        FfiConverterString.lower(`optionsJson`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Whether this build serves the address history at all (#899): the Swarm reader linked
+         * (feature `swarm`), not Android or iOS. False = every history call is refused. ABI >= 60.
+         */ fun `addressHistorySupported`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_address_history_supported(
+    
+        _status)
 }
     )
     }
@@ -2226,6 +2288,22 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
+         * The address history's settings, engine-wide (#899): `{"importer": "0x…" | null,
+         * "swarm": {"network": "mainnet"} | {"network": "dev", "networkId", "bootnodes"}}`,
+         * applied whole. `{}`, or the permanent `{"error","code":-32602}`. ABI >= 60.
+         */ fun `setAddressHistoryConfigJson`(`configJson`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_set_address_history_config_json(
+    
+        
+        FfiConverterString.lower(`configJson`),_status)
+}
+    )
+    }
+    
+
+        /**
          * Allow or forbid EIP-1459 DNS discovery — the EL node lists, walked over the
          * system resolver (#539) — for every network this process runs. Off until a
          * host switches it on; never used while Tor is enabled. Returns the state now
@@ -2432,6 +2510,24 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     UniffiLib.uniffi_myotis_engine_fn_func_tor_status(
     
         _status)
+}
+    )
+    }
+    
+
+        /**
+         * Check up to 50 entries of an address's history (as a page returned them) against
+         * verified chain data (#899): a JSON array, each entry with its state, or the
+         * permanent `{"error","code":-32602}`. ABI >= 60.
+         */ fun `verifyAddressHistoryJson`(`handle`: kotlin.Long, `address`: kotlin.String, `entriesJson`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_verify_address_history_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`address`),
+        FfiConverterString.lower(`entriesJson`),_status)
 }
     )
     }

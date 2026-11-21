@@ -296,12 +296,43 @@ public final class Main {
                 System.exit(1);
             }
         }
+        applyAddressHistoryConfig(engine);
         runDaemon(engine, canonical, port);
     }
 
     // -------------------------------------------------------------------------
     // Daemon
     // -------------------------------------------------------------------------
+
+    /**
+     * -Dmyotis.addressHistory.config=&lt;file&gt; (Gradle: -PaddressHistoryConfig): the address
+     * history's settings (#899; the importer key and the Swarm network), applied once, in
+     * daemon mode only. A refusal or an unreadable file stops the daemon with a message,
+     * never a daemon running with the setting silently unapplied.
+     */
+    private static void applyAddressHistoryConfig(MyotisEngine engine) {
+        String file = System.getProperty("myotis.addressHistory.config");
+        if (file == null || file.isBlank()) return;
+        String json;
+        try {
+            json = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(file)),
+                    java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            System.err.println("-Dmyotis.addressHistory.config: cannot read " + file + ": " + e.getMessage());
+            System.exit(2);
+            return;
+        }
+        String answer = engine.setAddressHistoryConfigJson(json);
+        if (!"{}".equals(answer == null ? null : answer.trim())) {
+            System.err.println("-Dmyotis.addressHistory.config: the settings in " + file + " were refused: " + answer);
+            System.exit(2);
+        }
+        // The setting is experimental and rests on trust: say whose index it trusts.
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\"importer\"\\s*:\\s*\"(0x[0-9a-fA-F]{40})\"").matcher(json);
+        System.err.println("address history: experimental, trusting the index of importer "
+                + (m.find() ? m.group(1) : "(none: every read refused)") + " for its completeness");
+    }
 
     private static void runDaemon(MyotisEngine engine, List<String> networks, int portOverride)
             throws Exception {

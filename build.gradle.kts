@@ -1039,6 +1039,23 @@ val torEngine = project.hasProperty("torEngine") &&
 // has to load the engine library just to learn it cannot route over Tor.
 extra["torEngine"] = torEngine
 
+// Opt-in Swarm reader in the engine (#899; .claude/agent/data-sources.md, the carve-out
+// for Swarm reads of the address index): builds myotis-engine with `--features swarm`,
+// linking the embedded ant node into the HOST library (cargoBuildHost) for the daemon
+// and the desktop app, so they can serve the address history. Dev builds only, OFF by
+// default and in every shipped artifact (owner, 2026-11-20: who watches ant for security
+// fixes is settled before a release turns it on). Android and iOS refuse the history in
+// this version, so cargoNdkAndroid does not take it. Spelled like -PtorEngine.
+val swarmEngine = project.hasProperty("swarmEngine") &&
+    (project.property("swarmEngine") as? String).let {
+        when (it?.trim()?.lowercase()) {
+            null, "", "true", "1", "yes", "on" -> true
+            "false", "0", "no", "off" -> false
+            else -> throw GradleException("-PswarmEngine=$it: expected true/false (or a bare -PswarmEngine)")
+        }
+    }
+extra["swarmEngine"] = swarmEngine
+
 tasks.register<Exec>("cargoBuildHost") {
     group = "rust"
     description = "cargo build --release for the host OS (self-skips when cargo is missing)"
@@ -1048,9 +1065,13 @@ tasks.register<Exec>("cargoBuildHost") {
     commandLine(
         buildList {
             addAll(listOf(rustTool("cargo"), "build", "--locked", "--release", "--workspace"))
-            // Enable Tor only on the engine crate (package/feature form — a bare
-            // `--features tor` with `--workspace` would try every member).
-            if (torEngine) addAll(listOf("--features", "myotis-engine/tor"))
+            // Enable Tor / the Swarm reader only on the engine crate (package/feature form
+            // — a bare `--features tor` with `--workspace` would try every member).
+            val features = listOfNotNull(
+                "myotis-engine/tor".takeIf { torEngine },
+                "myotis-engine/swarm".takeIf { swarmEngine },
+            )
+            if (features.isNotEmpty()) addAll(listOf("--features", features.joinToString(",")))
             rustTargetTriple?.let { addAll(listOf("--target", it)) }
         }
     )
@@ -1059,8 +1080,9 @@ tasks.register<Exec>("cargoBuildHost") {
     // must rebuild, or stale artifacts survive UP-TO-DATE checks.
     inputs.property("cargoVersion", cargoVersion)
     inputs.property("rustTarget", rustTargetTriple ?: "host")
-    // The Tor feature flips the artifact's contents, so it must key UP-TO-DATE too.
+    // The Tor and Swarm features flip the artifact's contents, so they key UP-TO-DATE too.
     inputs.property("torEngine", torEngine)
+    inputs.property("swarmEngine", swarmEngine)
     outputs.files(hostLibNames.map { file("$rustReleaseDir/$it") })
 }
 

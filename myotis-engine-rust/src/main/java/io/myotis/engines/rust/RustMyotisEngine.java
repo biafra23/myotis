@@ -280,6 +280,13 @@ public final class RustMyotisEngine implements MyotisEngine {
         return meteringOf(RustEngineNative.nativeNetworkMetering());
     }
 
+    /** The address history's settings (#899), engine-wide: the native answer as it came
+     *  ({@code "{}"} or the permanent refusal). */
+    @Override
+    public String setAddressHistoryConfigJson(String configJson) {
+        return RustEngineNative.nativeSetAddressHistoryConfigJson(configJson);
+    }
+
     /** A native metering code (or the status JSON's name's ordinal) → the API enum;
      *  anything unknown reads as UNKNOWN (display-only). */
     static NetworkMetering meteringOf(int code) {

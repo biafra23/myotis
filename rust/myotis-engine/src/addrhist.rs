@@ -213,32 +213,31 @@ fn refusal(cfg: &Config) -> Option<String> {
 }
 
 /// `address_history_json`: one page of `address`'s history on chain `chain_id`, newest
-/// first, strictly older than `cursor` (`""`: from the newest), at most `limit` entries.
-/// `chain_head` is the node's verified head, for the head gap. The answer:
+/// first. `options_json` (`{"cursor","limit","roles","fromBlock","toBlock"}`, each optional,
+/// each applied: [`parse_options`]) picks the page; `chain_head` is the node's verified head
+/// (for the head gap); `trust` decides whether kept verdicts may show. The answer:
 ///
 /// ```json
 /// {"importer":"0x…","headUpdate":<n>,"coveredFrom":<first block>,"coveredTo":<last block>,
-///  "headGap":{"fromBlock":<last block + 1>,"toBlock":<verified head> | null} | null,
-///  "tailGap":{"fromBlock":0,"toBlock":<first block - 1>} | null,
+///  "headGap":{"fromBlock":…,"toBlock":<verified head or toBlock> | null} | null,
+///  "tailGap":{"fromBlock":<fromBlock>,"toBlock":…} | null,
 ///  "gaps":[{"fromBlock":…,"toBlock":…}],
-///  "entries":[{"block":…,"slot":…,"roles":["from","to"],"state":"unverified"} | a kept verdict],
+///  "fromBlock":<as applied>,"toBlock":<as applied> | null,"roles":[<as applied>],
+///  "entries":[{"block":…,"slot":…,"roles":[…],"state":"unverified"} | a kept verdict],
 ///  "next":"<head update>:<block>:<slot>" | null}
 /// ```
 ///
-/// Every range the index does not cover is named: the head gap above it (open, `toBlock`
-/// null, while the node has no verified head), the tail gap below an index that starts
-/// late, and the slices Swarm did not deliver.
-///
-/// A refusal is the permanent `-32602`; Swarm not delivering what the read needs is the
-/// retryable `{"error"}`.
+/// Every gap is clipped to the range asked: the head gap above the index (open while the node
+/// has no verified head), the tail gap below an index that starts late, and the slices Swarm
+/// did not deliver. A refusal is the permanent `-32602`; Swarm not delivering what the read
+/// needs is the retryable `{"error"}`.
 pub fn history_json(
     rt: &tokio::runtime::Runtime,
     chain_id: u64,
     chain_head: Option<u64>,
     trust: Trust,
     address: &str,
-    cursor: &str,
-    limit: i64,
+    options_json: &str,
 ) -> String {
     let cfg = config();
     if let Some(why) = refusal(&cfg) {
@@ -247,23 +246,117 @@ pub fn history_json(
     let Some(address) = parse_address(address) else {
         return eljson::invalid_params_json("invalid address (expected 20-byte hex)");
     };
-    let cursor = if cursor.is_empty() {
-        None
-    } else {
-        match parse_cursor(cursor) {
-            Some(c) => Some(c),
-            None => return eljson::invalid_params_json("invalid cursor (expected the 'next' of an earlier page)"),
-        }
+    let opts = match parse_options(options_json) {
+        Ok(o) => o,
+        Err(msg) => return eljson::invalid_params_json(&msg),
     };
-    if limit < 1 || limit as u64 > MAX_PAGE as u64 {
-        return eljson::invalid_params_json(&format!("invalid limit (expected 1 to {MAX_PAGE})"));
-    }
     let importer = cfg.importer.expect("refusal() checked it");
-    match reader::page(rt, &cfg, chain_id, importer, &address, cursor, limit as usize) {
-        Ok(read) => page_json(&read, importer, chain_head, (chain_id, address), trust),
+    match reader::page(rt, &cfg, chain_id, importer, &address, &opts) {
+        Ok(read) => page_json(&read, importer, chain_head, (chain_id, address), trust, &opts),
         Err(reader::Failure::Refused(msg)) => eljson::invalid_params_json(&msg),
         Err(reader::Failure::Retry(msg)) => eljson::error_json(&msg),
     }
+}
+
+/// A page request's options, every one applied (`myotis_getAddressHistory`'s second
+/// parameter): `{"cursor", "limit", "roles", "fromBlock", "toBlock"}`, all optional.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Options {
+    pub cursor: Option<Cursor>,
+    pub limit: usize,
+    /// The role bits an entry needs one of (all by default).
+    pub roles: u8,
+    pub from_block: u64,
+    pub to_block: Option<u64>,
+}
+
+/// The page size without a `limit`.
+pub const DEFAULT_PAGE: usize = 50;
+
+// Read by the Swarm half (and the tests) only.
+#[cfg_attr(not(any(feature = "swarm", test)), allow(dead_code))]
+impl Options {
+    /// Strictly older than this `(block, slot)`: the cursor's, or the block above `toBlock`.
+    pub fn before(&self) -> Option<(u64, u32)> {
+        let to = self.to_block.map(|t| (t.saturating_add(1), 0));
+        match (self.cursor.map(|c| c.before), to) {
+            (Some(c), Some(t)) => Some(c.min(t)),
+            (c, t) => c.or(t),
+        }
+    }
+
+    pub fn filter(&self) -> myotis_addr1::client::Filter {
+        myotis_addr1::client::Filter { roles: self.roles, from_block: self.from_block }
+    }
+}
+
+/// A block number as JSON-RPC carries one: a `0x` quantity, or a plain number.
+fn block_number(v: &serde_json::Value, what: &str) -> Result<u64, String> {
+    if let Some(n) = v.as_u64() {
+        return Ok(n);
+    }
+    let s = v.as_str().ok_or(format!("invalid {what} (expected a block number)"))?;
+    let h = s.strip_prefix("0x").ok_or(format!("invalid {what} (expected a 0x quantity)"))?;
+    if h.is_empty() || h.len() > 16 || !h.bytes().all(|b| b.is_ascii_hexdigit()) || (h.len() > 1 && h.starts_with('0')) {
+        return Err(format!("invalid {what} (expected a 0x quantity)"));
+    }
+    u64::from_str_radix(h, 16).map_err(|_| format!("invalid {what}"))
+}
+
+pub fn parse_options(json: &str) -> Result<Options, String> {
+    let json = if json.trim().is_empty() { "{}" } else { json };
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("invalid options JSON: {e}"))?;
+    let o = match &v {
+        serde_json::Value::Null => &serde_json::Map::new(),
+        serde_json::Value::Object(o) => o,
+        _ => return Err("options must be an object".into()),
+    };
+    for k in o.keys() {
+        if !matches!(k.as_str(), "cursor" | "limit" | "roles" | "fromBlock" | "toBlock") {
+            return Err(format!("unknown option '{k}'"));
+        }
+    }
+    let cursor = match o.get("cursor") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(c)) => {
+            Some(parse_cursor(c).ok_or("invalid cursor (expected the 'next' of an earlier page)")?)
+        }
+        Some(_) => return Err("invalid cursor (expected a string)".into()),
+    };
+    let limit = match o.get("limit") {
+        None | Some(serde_json::Value::Null) => DEFAULT_PAGE,
+        Some(l) => match l.as_u64() {
+            Some(n) if (1..=MAX_PAGE as u64).contains(&n) => n as usize,
+            _ => return Err(format!("invalid limit (expected 1 to {MAX_PAGE})")),
+        },
+    };
+    let roles = match o.get("roles") {
+        None | Some(serde_json::Value::Null) => 0xff,
+        Some(serde_json::Value::Array(names)) => {
+            let mut bits = 0u8;
+            for n in names {
+                let n = n.as_str().ok_or("a role must be a string")?;
+                bits |= ROLE_NAMES.iter().find(|(_, name)| *name == n).ok_or(format!("unknown role '{n}'"))?.0;
+            }
+            if bits == 0 {
+                return Err("roles must name at least one role".into());
+            }
+            bits
+        }
+        Some(_) => return Err("invalid roles (expected an array of role names)".into()),
+    };
+    let from_block = match o.get("fromBlock") {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(b) => block_number(b, "fromBlock")?,
+    };
+    let to_block = match o.get("toBlock") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(b) => Some(block_number(b, "toBlock")?),
+    };
+    if to_block.is_some_and(|t| t < from_block) {
+        return Err("toBlock is below fromBlock".into());
+    }
+    Ok(Options { cursor, limit, roles, from_block, to_block })
 }
 
 /// A page as read, before it is rendered.
@@ -289,16 +382,46 @@ fn role_names(bits: u8) -> Vec<&'static str> {
     ROLE_NAMES.iter().filter(|(b, _)| bits & b != 0).map(|(_, n)| *n).collect()
 }
 
-fn page_json(read: &Read, importer: [u8; 20], chain_head: Option<u64>, who: (u64, [u8; 20]), trust: Trust) -> String {
+fn page_json(
+    read: &Read,
+    importer: [u8; 20],
+    chain_head: Option<u64>,
+    who: (u64, [u8; 20]),
+    trust: Trust,
+    opts: &Options,
+) -> String {
     let p = &read.page;
     let roles = role_names;
-    let head_gap = match chain_head {
-        Some(h) if h > p.to_block => Some(serde_json::json!({"fromBlock": p.to_block + 1, "toBlock": h})),
-        Some(_) => None,
-        // No verified head yet: the gap above the index is open, never "none".
-        None => Some(serde_json::json!({"fromBlock": p.to_block + 1, "toBlock": null})),
+    // The gaps of the range asked (`fromBlock ..= toBlock`, the whole chain by default) the
+    // index does not cover: above its last block up to the head (open while the node has no
+    // verified head), and below its first block.
+    // Every gap is clipped to the range asked; one that ends up empty is not named.
+    let lo = opts.from_block;
+    let head_gap = {
+        let from = (p.to_block + 1).max(lo);
+        match (opts.to_block, chain_head) {
+            (Some(t), Some(h)) => {
+                let to = t.min(h);
+                (from <= to).then(|| serde_json::json!({"fromBlock": from, "toBlock": to}))
+            }
+            (None, Some(h)) => (from <= h).then(|| serde_json::json!({"fromBlock": from, "toBlock": h})),
+            // No verified head yet: the gap above the index is open, never "none".
+            (Some(t), None) => (from <= t).then(|| serde_json::json!({"fromBlock": from, "toBlock": t})),
+            (None, None) => Some(serde_json::json!({"fromBlock": from, "toBlock": null})),
+        }
     };
-    let tail_gap = (p.from_block > 0).then(|| serde_json::json!({"fromBlock": 0, "toBlock": p.from_block - 1}));
+    let tail_gap = {
+        let to = p.from_block.checked_sub(1).map(|t| opts.to_block.map_or(t, |hi| t.min(hi)));
+        to.filter(|to| lo <= *to).map(|to| serde_json::json!({"fromBlock": lo, "toBlock": to}))
+    };
+    let gaps: Vec<serde_json::Value> = p
+        .gaps
+        .iter()
+        .filter_map(|g| {
+            let (from, to) = (g.from_block.max(lo), opts.to_block.map_or(g.to_block, |hi| g.to_block.min(hi)));
+            (from <= to).then(|| serde_json::json!({"fromBlock": from, "toBlock": to}))
+        })
+        .collect();
     serde_json::json!({
         "importer": hex(&importer),
         "headUpdate": read.head_update,
@@ -306,7 +429,10 @@ fn page_json(read: &Read, importer: [u8; 20], chain_head: Option<u64>, who: (u64
         "coveredTo": p.to_block,
         "headGap": head_gap,
         "tailGap": tail_gap,
-        "gaps": p.gaps.iter().map(|g| serde_json::json!({"fromBlock": g.from_block, "toBlock": g.to_block})).collect::<Vec<_>>(),
+        "fromBlock": opts.from_block,
+        "toBlock": opts.to_block,
+        "roles": role_names(opts.roles),
+        "gaps": gaps,
         // Each entry with its state so far: what an earlier verify call found for it, else
         // "unverified".
         "entries": p.entries.iter().map(|e| {
@@ -514,8 +640,8 @@ fn parse_entries(json: &str) -> Result<Vec<(u64, u32, u8)>, String> {
                 // them); they are not inputs. Anything else is refused.
                 if !matches!(
                     k.as_str(),
-                    "block" | "slot" | "roles" | "state" | "final" | "confirmed" | "contradicted" | "unchecked"
-                        | "txHash" | "from" | "to" | "value" | "transfer" | "reason"
+                    "block" | "slot" | "roles" | "state" | "final" | "blockHash" | "confirmed" | "contradicted"
+                        | "unchecked" | "txHash" | "from" | "to" | "value" | "transfer" | "reason"
                 ) {
                     return Err(format!("unknown entry field '{k}'"));
                 }
@@ -793,13 +919,13 @@ mod reader {
         chain_id: u64,
         importer: [u8; 20],
         address: &[u8; 20],
-        cursor: Option<super::Cursor>,
-        limit: usize,
+        opts: &super::Options,
     ) -> Result<Read, Failure> {
         let (node, started) = node(&cfg.network)?;
-        let floor = cursor.map(|c| c.head_update).unwrap_or(0);
+        let floor = opts.cursor.map(|c| c.head_update).unwrap_or(0);
         let start = hint(chain_id, importer).max(floor);
-        let before = cursor.map(|c| c.before);
+        let before = opts.before();
+        let (limit, filter) = (opts.limit, opts.filter());
         let read = rt.block_on(async {
             let index = Index::new(node.as_ref(), chain_id, importer);
             let attempts = async {
@@ -807,7 +933,7 @@ mod reader {
                     let attempt = async {
                         let origin = index.origin().await?;
                         let (n, head) = index.head(&origin, start).await?;
-                        let page = index.page(&head, address, before, limit).await?;
+                        let page = index.page(&head, address, before, limit, &filter).await?;
                         Ok::<_, ReadError>(Read { head_update: n, page })
                     };
                     match attempt.await {
@@ -856,8 +982,7 @@ mod reader {
         _chain_id: u64,
         _importer: [u8; 20],
         _address: &[u8; 20],
-        _cursor: Option<super::Cursor>,
-        _limit: usize,
+        _opts: &super::Options,
     ) -> Result<Read, Failure> {
         Err(Failure::Refused(super::build_refusal().unwrap_or("no Swarm reader").to_string()))
     }
@@ -897,8 +1022,29 @@ mod tests {
         let ok = parse_entries(r#"[{"block":100,"slot":3,"roles":["from","emitter"],"state":"unverified"},{"block":101,"slot":0,"roles":["block"]}]"#).unwrap();
         assert_eq!(ok, vec![(100, 3, 0x05), (101, 0, 0x40)]);
         // A kept verdict as a page renders it goes back in as it came.
-        let echoed = r#"[{"block":1,"slot":2,"roles":["from"],"state":"verified","final":true,"confirmed":["from"],"contradicted":[],"unchecked":[],"txHash":"0x00","from":"0x01","to":null,"value":"0x0","transfer":null}]"#;
-        assert_eq!(parse_entries(echoed).unwrap(), vec![(1, 2, 0x01)]);
+        // A kept verdict exactly as render() writes it (and a page shows it) goes back in.
+        let c = myotis_net::el::addrcheck::Check {
+            state: myotis_net::el::addrcheck::State::Verified,
+            confirmed: 0x01,
+            contradicted: 0,
+            unchecked: 0,
+            tx_hash: Some([3; 32]),
+            from: Some([4; 20]),
+            to: None,
+            value: Some(vec![1]),
+            transfer: Some(myotis_net::el::addrcheck::Transfer {
+                token: [5; 20],
+                from: [6; 20],
+                to: [7; 20],
+                amount: Some([8; 32]),
+                id: None,
+            }),
+        };
+        let rendered = verified::render(1, 2, 0x01, &c, true, &[9; 32]);
+        let unverifiable = verified::not_verifiable(1, 3, 0x02, "outside the window");
+        let unavailable = verified::unavailable(1, 4, 0x04, "no peer");
+        let echoed = serde_json::json!([rendered, unverifiable, unavailable]).to_string();
+        assert_eq!(parse_entries(&echoed).unwrap(), vec![(1, 2, 0x01), (1, 3, 0x02), (1, 4, 0x04)]);
         for bad in [
             "[]",
             "{}",
@@ -934,21 +1080,79 @@ mod tests {
                 gaps: vec![],
             },
         };
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), who, trust)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), who, trust, &parse_options("").unwrap())).unwrap();
         assert_eq!(v["entries"][0]["state"], "verified");
         assert_eq!(v["entries"][1]["state"], "unverified");
         // Another address's page does not see it.
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), (1, [0x43; 20]), trust)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), (1, [0x43; 20]), trust, &parse_options("").unwrap())).unwrap();
         assert_eq!(v["entries"][0]["state"], "unverified");
         // After a re-anchor it no longer counts; under the alarm nothing does, and it is gone.
         let later = Trust { reanchors: 1, alarm: false };
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), who, later)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), who, later, &parse_options("").unwrap())).unwrap();
         assert_eq!(v["entries"][0]["state"], "unverified");
         verified::keep(trust, who.0, &who.1, 500, 2, role::FROM, &kept);
         let alarm = Trust { reanchors: 0, alarm: true };
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), who, alarm)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), who, alarm, &parse_options("").unwrap())).unwrap();
         assert_eq!(v["entries"][0]["state"], "unverified");
         assert!(verified::cached(trust, who.0, &who.1, 500, 2, role::FROM).is_none(), "the alarm cleared it");
+    }
+
+    #[test]
+    fn options_are_applied_or_refused_whole() {
+        let o = parse_options("").unwrap();
+        assert_eq!((o.limit, o.roles, o.from_block, o.to_block, o.cursor), (DEFAULT_PAGE, 0xff, 0, None, None));
+        let o = parse_options(r#"{"cursor":"3:900:2","limit":7,"roles":["from","to"],"fromBlock":"0x64","toBlock":1000}"#).unwrap();
+        assert_eq!((o.limit, o.roles, o.from_block, o.to_block), (7, 0x03, 100, Some(1000)));
+        // The cursor and toBlock both bound the page: the lower one wins.
+        assert_eq!(o.before(), Some((900, 2)));
+        assert_eq!(parse_options(r#"{"toBlock":500}"#).unwrap().before(), Some((501, 0)));
+        for bad in [
+            r#"{"limit":0}"#,
+            r#"{"limit":501}"#,
+            r#"{"roles":[]}"#,
+            r#"{"roles":["sender"]}"#,
+            r#"{"fromBlock":"100"}"#,
+            r#"{"fromBlock":"0x064"}"#,
+            r#"{"fromBlock":10,"toBlock":9}"#,
+            r#"{"cursor":5}"#,
+            r#"{"cursor":"1:2"}"#,
+            r#"{"page":1}"#,
+            "[]",
+        ] {
+            assert!(parse_options(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_gaps_are_those_of_the_range_asked() {
+        use myotis_addr1::client::Page;
+        let read = Read {
+            head_update: 1,
+            page: Page { entries: vec![], next: None, from_block: 64_000, to_block: 127_999, gaps: vec![] },
+        };
+        let render = |opts: &str, head| -> serde_json::Value {
+            serde_json::from_str(&page_json(&read, [0; 20], head, (1, [0x42; 20]), Trust::default(), &parse_options(opts).unwrap())).unwrap()
+        };
+        // A range inside the index: no head or tail gap.
+        let v = render(r#"{"fromBlock":70000,"toBlock":100000}"#, Some(200_000));
+        assert!(v["headGap"].is_null() && v["tailGap"].is_null(), "{v}");
+        // Reaching above it: the head gap stops at toBlock.
+        let v = render(r#"{"toBlock":150000}"#, Some(200_000));
+        assert_eq!(v["headGap"]["toBlock"], 150_000);
+        // Below it: the tail gap starts at fromBlock.
+        let v = render(r#"{"fromBlock":10000}"#, Some(200_000));
+        assert_eq!((v["tailGap"]["fromBlock"].as_u64(), v["tailGap"]["toBlock"].as_u64()), (Some(10_000), Some(63_999)));
+        // Wholly below the index: the tail gap ends at toBlock, and no head gap.
+        let v = render(r#"{"fromBlock":10,"toBlock":100}"#, Some(200_000));
+        assert_eq!(v["tailGap"]["toBlock"], 100);
+        assert!(v["headGap"].is_null(), "{v}");
+        // Wholly above it: the head gap starts at fromBlock, and no tail gap.
+        let v = render(r#"{"fromBlock":150000}"#, Some(200_000));
+        assert_eq!(v["headGap"]["fromBlock"], 150_000);
+        assert!(v["tailGap"].is_null(), "{v}");
+        // Above the head: nothing to name.
+        assert!(render(r#"{"fromBlock":300000}"#, Some(200_000))["headGap"].is_null());
+        assert_eq!(v["roles"].as_array().unwrap().len(), 8);
     }
 
     #[test]
@@ -971,7 +1175,7 @@ mod tests {
         // The arguments are checked once the reader may run; with the default settings the
         // refusal comes first, so check the shapes through parse_cursor/limit rules here.
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        assert_eq!(code(history_json(&rt, 1, None, Trust::default(), "0x00", "", 10)), serde_json::json!(eljson::INVALID_PARAMS));
+        assert_eq!(code(history_json(&rt, 1, None, Trust::default(), "0x00", "{}")), serde_json::json!(eljson::INVALID_PARAMS));
         assert_eq!(parse_address(&format!("0x{}", "+f".repeat(20))), None, "a '+' is no hex digit");
     }
 
@@ -988,11 +1192,11 @@ mod tests {
         assert_eq!(set_config_json(&cfg), "{}");
         let weth = f[3];
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-        let first: serde_json::Value = serde_json::from_str(&history_json(&rt, 1, None, Trust::default(), weth, "", 5)).unwrap();
+        let first: serde_json::Value = serde_json::from_str(&history_json(&rt, 1, None, Trust::default(), weth, r#"{"limit":5}"#)).unwrap();
         assert!(first["error"].is_null(), "{first}");
         assert_eq!(first["entries"].as_array().unwrap().len(), 5, "{first}");
         let next = first["next"].as_str().unwrap().to_string();
-        let second: serde_json::Value = serde_json::from_str(&history_json(&rt, 1, None, Trust::default(), weth, &next, 5)).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&history_json(&rt, 1, None, Trust::default(), weth, &format!(r#"{{"limit":5,"cursor":"{next}"}}"#))).unwrap();
         let (a, b) = (&first["entries"][4], &second["entries"][0]);
         assert!((a["block"].as_u64(), a["slot"].as_u64()) > (b["block"].as_u64(), b["slot"].as_u64()));
         println!("{first}\n{second}");
@@ -1012,7 +1216,7 @@ mod tests {
                 gaps: vec![Gap { from_block: 10, to_block: 20 }],
             },
         };
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(128_100), (1, [0x42; 20]), Trust::default())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(128_100), (1, [0x42; 20]), Trust::default(), &parse_options("").unwrap())).unwrap();
         assert_eq!(v["headUpdate"], 73);
         assert_eq!(v["coveredFrom"], 64_000);
         assert_eq!(v["headGap"]["fromBlock"], 128_000);
@@ -1024,10 +1228,10 @@ mod tests {
         // An index that starts late names the blocks below it.
         assert_eq!(v["tailGap"]["toBlock"], 63_999);
         // At the head: no head gap.
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(127_999), (1, [0x42; 20]), Trust::default())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], Some(127_999), (1, [0x42; 20]), Trust::default(), &parse_options("").unwrap())).unwrap();
         assert!(v["headGap"].is_null());
         // No verified head yet: an open head gap, never "none".
-        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], None, (1, [0x42; 20]), Trust::default())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0xef; 20], None, (1, [0x42; 20]), Trust::default(), &parse_options("").unwrap())).unwrap();
         assert_eq!(v["headGap"]["fromBlock"], 128_000);
         assert!(v["headGap"]["toBlock"].is_null());
     }
