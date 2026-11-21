@@ -94,6 +94,14 @@ wrong and the project is pointless** — it becomes just another unverified clie
 3. *(Designed, not yet built in the reference)* **embedded historical accumulators** —
    a pre-Merge epoch-hash accumulator and a post-Merge historical-roots accumulator — for
    verifying deep historical headers. See §10.
+4. **A bundled checkpoint table** (the Rust engine, mainnet so far; owner's decision D1,
+   2026-11-20): the hash of every 1024th block, committed and pinned by keccak256, built by
+   a `parentHash` walk down to the genesis hash. A block below the 512-block window verifies
+   by hash-linking its headers (at most 1024, one request) up to the first entry at or
+   above it. A walk from the attested finalized block that finds another hash at the
+   table's top raises an alarm that refuses every read resting on the table. The rule:
+   `.claude/agent/data-sources.md` (Trust); the design:
+   [deep-block-verification.md](../ideas/deep-block-verification.md).
 
 **Everything else is derived by verification, never trusted:**
 

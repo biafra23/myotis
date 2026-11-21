@@ -40,6 +40,7 @@ that gets built moves to `design-history/`, and its user-facing behaviour gets a
 
 ## guides/
 
+- [address-history.md](guides/address-history.md): an address's transactions from the addr1 index on Swarm, verified entry by entry (a dev build with the Swarm reader).
 - [android-library.md](guides/android-library.md): using the engine library `eth.myotis:myotis-engine` in an app.
 - [android-release-signing.md](guides/android-release-signing.md): release-signing the Android APK.
 - [bee-rpc-service.md](guides/bee-rpc-service.md): running Myotis as the RPC service for a Swarm Bee node.
