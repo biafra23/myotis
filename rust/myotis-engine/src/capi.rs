@@ -1250,6 +1250,12 @@ pub unsafe extern "C" fn myotis_verify_address_history_json(
     ))
 }
 
+/// Whether this build serves the address history (see ffi::address_history_supported).
+#[no_mangle]
+pub extern "C" fn myotis_address_history_supported() -> bool {
+    crate::host::address_history_supported()
+}
+
 /// The address history's settings (see ffi::set_address_history_config_json).
 /// Returned string must be freed with `myotis_string_free`.
 ///

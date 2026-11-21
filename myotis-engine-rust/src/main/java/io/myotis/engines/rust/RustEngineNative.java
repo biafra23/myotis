@@ -221,6 +221,11 @@ final class RustEngineNative {
         return Myotis_engineKt.setNetworkMetering(code);
     }
 
+    /** Whether this engine build serves the address history at all (ABI 60, #899). */
+    static boolean nativeAddressHistorySupported() {
+        return Myotis_engineKt.addressHistorySupported();
+    }
+
     /** A page of an address's history (ABI 60, #899). */
     static String nativeAddressHistoryJson(long handle, String address, String optionsJson) {
         return Myotis_engineKt.addressHistoryJson(handle, nz(address), nz(optionsJson));

@@ -58,7 +58,8 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     log_index_config: Option<PathBuf>,
     /// The address history's settings (engine JSON: {"importer":"0x…","swarm":{…}}, see
-    /// myotis_getAddressHistory), applied at start: the importer key and the Swarm network.
+    /// myotis_getAddressHistory), applied at start: the importer key (EXPERIMENTAL: the list's
+    /// completeness rests on that importer) and the Swarm network.
     /// A refused config stops the start. Needs an engine built with its `swarm` feature.
     #[arg(long, value_name = "FILE")]
     address_history_config: Option<PathBuf>,
@@ -178,10 +179,18 @@ fn run(args: Args) -> Result<(), String> {
     }
     if let Some(p) = &args.address_history_config {
         let s = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let importer = serde_json::from_str::<serde_json::Value>(&s)
+            .ok()
+            .and_then(|v| v.get("importer").and_then(|i| i.as_str()).map(str::to_owned));
         let answer = ffi::set_address_history_config_json(s);
         if answer.trim() != "{}" {
             return Err(format!("{}: the address history settings were refused: {answer}", p.display()));
         }
+        // The setting is experimental and rests on trust: say whose index it trusts.
+        eprintln!(
+            "address history: experimental, trusting the index of importer {} for its completeness",
+            importer.as_deref().unwrap_or("(none: every read refused)")
+        );
     }
     // EIP-1459 DNS discovery (#539): this daemon resolves through the system
     // resolver, as the JVM daemon does, so the EL pool may walk the network's

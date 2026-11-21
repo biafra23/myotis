@@ -1232,6 +1232,7 @@ class RpcRouterTest {
     @Test fun addressHistory_passesAddressAndOptionsThroughAndServesThePage() {
         var seen: Pair<String, String>? = null
         val backend = object : VerifiedReads by FakeBackend() {
+            override fun supportsAddressHistory(): Boolean = true
             override fun addressHistoryJson(address: String, optionsJson: String): String {
                 seen = address to optionsJson
                 return """{"importer":"0x${"ab".repeat(20)}","entries":[{"block":7,"slot":1,"roles":["from"],"state":"unverified"}],"next":null}"""
@@ -1257,6 +1258,7 @@ class RpcRouterTest {
         assertEquals(-32602, errorCode(refused))
         // A retryable engine error stays -32000.
         val backend = object : VerifiedReads by FakeBackend() {
+            override fun supportsAddressHistory(): Boolean = true
             override fun addressHistoryJson(address: String, optionsJson: String): String =
                 """{"error":"not delivered by Swarm: the index's origin"}"""
         }
@@ -1269,9 +1271,30 @@ class RpcRouterTest {
         assertEquals(-32602, errorCode(route(backend, """{"jsonrpc":"2.0","id":1,"method":"myotis_verifyAddressHistoryEntries","params":["$addr",{}]}""")))
     }
 
+    @Test fun addressHistory_neverReachesADevProxy() {
+        // A dev proxy pointing nowhere: a fall-through would answer its -32603, not -32602.
+        val proxy = UpstreamProxy("http://127.0.0.1:1/")
+        val backend = object : VerifiedReads by FakeBackend() {
+            override fun supportsAddressHistory(): Boolean = true
+        }
+        val addr = "0x${"11".repeat(20)}"
+        for (body in listOf(
+            // Too many arguments (checkArguments), params not an array, a bad argument.
+            """{"jsonrpc":"2.0","id":1,"method":"myotis_getAddressHistory","params":["$addr",{},null]}""",
+            """{"jsonrpc":"2.0","id":1,"method":"myotis_getAddressHistory","params":{"address":"$addr"}}""",
+            """{"jsonrpc":"2.0","id":1,"method":"myotis_verifyAddressHistoryEntries","params":["$addr",5]}""",
+        )) {
+            assertEquals(-32602, errorCode(route(backend, body, proxy)), body)
+        }
+        // A backend without the history refuses at once (the Java engine).
+        assertEquals(-32602, errorCode(route(FakeBackend(),
+            """{"jsonrpc":"2.0","id":1,"method":"myotis_getAddressHistory","params":["$addr"]}""", proxy)))
+    }
+
     @Test fun verifyAddressHistory_passesTheEntriesArrayThrough() {
         var seen: String? = null
         val backend = object : VerifiedReads by FakeBackend() {
+            override fun supportsAddressHistory(): Boolean = true
             override fun verifyAddressHistoryJson(address: String, entriesJson: String): String {
                 seen = entriesJson
                 return """[{"block":7,"slot":1,"roles":["from"],"state":"verified","final":true}]"""

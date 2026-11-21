@@ -3302,7 +3302,6 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions:
 /// `address_history_json`: one page of `address`'s history from the addr1 index on Swarm
 /// (`addrhist`), for the chain of a running handle; the handle's verified head bounds the
 /// head gap. Refused with the permanent -32602 where the carve-out says so.
-#[allow(dead_code)] // exported over the FFI by part 7 of #899
 pub fn address_history_json(handle: i64, address: &str, options_json: &str) -> String {
     // A build without the reader refuses for good, whatever the handle's state.
     if let Some(refused) = crate::addrhist::early_refusal() {
@@ -3322,7 +3321,6 @@ pub fn address_history_json(handle: i64, address: &str, options_json: &str) -> S
 
 /// `verify_address_history_json`: check entries of `address`'s history (as a page returns
 /// them) against verified chain data, for the chain of a running handle (`addrhist`).
-#[allow(dead_code)] // exported over the FFI by part 7 of #899
 pub fn verify_address_history_json(handle: i64, address: &str, entries_json: &str) -> String {
     if let Some(refused) = crate::addrhist::early_refusal() {
         return refused;
@@ -3337,10 +3335,21 @@ pub fn verify_address_history_json(handle: i64, address: &str, entries_json: &st
     crate::addrhist::verify_json(&engine.rt, &reader, chain_id, address, entries_json)
 }
 
+/// `address_history_supported`: whether this build serves the address history at all (the
+/// Swarm reader linked, not mobile). A probe hosts consult before waking a chain for a call
+/// that could only be refused.
+pub fn address_history_supported() -> bool {
+    crate::addrhist::early_refusal().is_none()
+}
+
 /// `set_address_history_config_json`: the address history's settings (`addrhist`):
 /// the importer key and the Swarm network. Applied whole or refused (-32602).
-#[allow(dead_code)] // exported over the FFI by part 7 of #899
 pub fn set_address_history_config_json(json: &str) -> String {
+    // A build without the reader refuses the settings too, as the Java and Go engines do:
+    // a daemon told to use the history must not start as if it could.
+    if let Some(refused) = crate::addrhist::early_refusal() {
+        return refused;
+    }
     crate::addrhist::set_config_json(json)
 }
 

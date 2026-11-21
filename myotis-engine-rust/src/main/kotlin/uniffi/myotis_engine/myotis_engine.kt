@@ -680,6 +680,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_address_history_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_address_history_supported(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_available_networks_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_canonical_network_name(
@@ -815,6 +817,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_address_history_json(`handle`: Long,`address`: RustBuffer.ByValue,`optionsJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_address_history_supported(uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     external fun uniffi_myotis_engine_fn_func_available_networks_json(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_canonical_network_name(`nameOrAlias`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1055,6 +1059,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_address_history_json() and 0xFFFF) != 9655) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_address_history_supported() and 0xFFFF) != 15604) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_available_networks_json() and 0xFFFF) != 49639) {
@@ -1524,6 +1531,20 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         FfiConverterLong.lower(`handle`),
         FfiConverterString.lower(`address`),
         FfiConverterString.lower(`optionsJson`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Whether this build serves the address history at all (#899): the Swarm reader linked
+         * (feature `swarm`), not Android or iOS. False = every history call is refused. ABI >= 60.
+         */ fun `addressHistorySupported`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_address_history_supported(
+    
+        _status)
 }
     )
     }

@@ -825,6 +825,11 @@ impl<E: Engine> Router<E> {
             // "unverified" until myotis_verifyAddressHistoryEntries checked it. The engine
             // applies every option or refuses (-32602).
             "myotis_getAddressHistory" | "myotis_verifyAddressHistoryEntries" => {
+                if !self.engine.address_history_supported() {
+                    return Err(Fail::Refused(
+                        "the address history needs the engine built with its Swarm reader".into(),
+                    ));
+                }
                 let Some(address) = params.first().and_then(Value::as_str) else {
                     return invalid("invalid argument 0: expected the address (0x + 40 hex digits)");
                 };

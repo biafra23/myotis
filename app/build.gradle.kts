@@ -107,7 +107,8 @@ tasks.register<JavaExec>("run") {
         systemProperty("myotis.logindex.backfillPaused", v)
     }
     // -PaddressHistoryConfig=<file> → -Dmyotis.addressHistory.config: the address history's
-    // settings (#899; {"importer":"0x…","swarm":{…}}), applied at daemon start. Needs a Rust
+    // settings (#899; {"importer":"0x…","swarm":{…}}), applied at daemon start. The importer
+    // key is EXPERIMENTAL: the list's completeness rests on that importer. Needs a Rust
     // engine built with its Swarm reader (-PswarmEngine); a refusal stops the daemon.
     (project.findProperty("addressHistoryConfig") as? String)?.takeIf { it.isNotBlank() }
         ?.let { systemProperty("myotis.addressHistory.config", rootProject.file(it).absolutePath) }

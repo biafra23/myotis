@@ -213,24 +213,24 @@ fn refusal(cfg: &Config) -> Option<String> {
 }
 
 /// `address_history_json`: one page of `address`'s history on chain `chain_id`, newest
-/// first, strictly older than `cursor` (`""`: from the newest), at most `limit` entries.
-/// `chain_head` is the node's verified head, for the head gap. The answer:
+/// first. `options_json` (`{"cursor","limit","roles","fromBlock","toBlock"}`, each optional,
+/// each applied: [`parse_options`]) picks the page; `chain_head` is the node's verified head
+/// (for the head gap); `trust` decides whether kept verdicts may show. The answer:
 ///
 /// ```json
 /// {"importer":"0x…","headUpdate":<n>,"coveredFrom":<first block>,"coveredTo":<last block>,
-///  "headGap":{"fromBlock":<last block + 1>,"toBlock":<verified head> | null} | null,
-///  "tailGap":{"fromBlock":0,"toBlock":<first block - 1>} | null,
+///  "headGap":{"fromBlock":…,"toBlock":<verified head or toBlock> | null} | null,
+///  "tailGap":{"fromBlock":<fromBlock>,"toBlock":…} | null,
 ///  "gaps":[{"fromBlock":…,"toBlock":…}],
-///  "entries":[{"block":…,"slot":…,"roles":["from","to"],"state":"unverified"} | a kept verdict],
+///  "fromBlock":<as applied>,"toBlock":<as applied> | null,"roles":[<as applied>],
+///  "entries":[{"block":…,"slot":…,"roles":[…],"state":"unverified"} | a kept verdict],
 ///  "next":"<head update>:<block>:<slot>" | null}
 /// ```
 ///
-/// Every range the index does not cover is named: the head gap above it (open, `toBlock`
-/// null, while the node has no verified head), the tail gap below an index that starts
-/// late, and the slices Swarm did not deliver.
-///
-/// A refusal is the permanent `-32602`; Swarm not delivering what the read needs is the
-/// retryable `{"error"}`.
+/// Every gap is clipped to the range asked: the head gap above the index (open while the node
+/// has no verified head), the tail gap below an index that starts late, and the slices Swarm
+/// did not deliver. A refusal is the permanent `-32602`; Swarm not delivering what the read
+/// needs is the retryable `{"error"}`.
 pub fn history_json(
     rt: &tokio::runtime::Runtime,
     chain_id: u64,
@@ -640,8 +640,8 @@ fn parse_entries(json: &str) -> Result<Vec<(u64, u32, u8)>, String> {
                 // them); they are not inputs. Anything else is refused.
                 if !matches!(
                     k.as_str(),
-                    "block" | "slot" | "roles" | "state" | "final" | "confirmed" | "contradicted" | "unchecked"
-                        | "txHash" | "from" | "to" | "value" | "transfer" | "reason"
+                    "block" | "slot" | "roles" | "state" | "final" | "blockHash" | "confirmed" | "contradicted"
+                        | "unchecked" | "txHash" | "from" | "to" | "value" | "transfer" | "reason"
                 ) {
                     return Err(format!("unknown entry field '{k}'"));
                 }
@@ -1022,8 +1022,29 @@ mod tests {
         let ok = parse_entries(r#"[{"block":100,"slot":3,"roles":["from","emitter"],"state":"unverified"},{"block":101,"slot":0,"roles":["block"]}]"#).unwrap();
         assert_eq!(ok, vec![(100, 3, 0x05), (101, 0, 0x40)]);
         // A kept verdict as a page renders it goes back in as it came.
-        let echoed = r#"[{"block":1,"slot":2,"roles":["from"],"state":"verified","final":true,"confirmed":["from"],"contradicted":[],"unchecked":[],"txHash":"0x00","from":"0x01","to":null,"value":"0x0","transfer":null}]"#;
-        assert_eq!(parse_entries(echoed).unwrap(), vec![(1, 2, 0x01)]);
+        // A kept verdict exactly as render() writes it (and a page shows it) goes back in.
+        let c = myotis_net::el::addrcheck::Check {
+            state: myotis_net::el::addrcheck::State::Verified,
+            confirmed: 0x01,
+            contradicted: 0,
+            unchecked: 0,
+            tx_hash: Some([3; 32]),
+            from: Some([4; 20]),
+            to: None,
+            value: Some(vec![1]),
+            transfer: Some(myotis_net::el::addrcheck::Transfer {
+                token: [5; 20],
+                from: [6; 20],
+                to: [7; 20],
+                amount: Some([8; 32]),
+                id: None,
+            }),
+        };
+        let rendered = verified::render(1, 2, 0x01, &c, true, &[9; 32]);
+        let unverifiable = verified::not_verifiable(1, 3, 0x02, "outside the window");
+        let unavailable = verified::unavailable(1, 4, 0x04, "no peer");
+        let echoed = serde_json::json!([rendered, unverifiable, unavailable]).to_string();
+        assert_eq!(parse_entries(&echoed).unwrap(), vec![(1, 2, 0x01), (1, 3, 0x02), (1, 4, 0x04)]);
         for bad in [
             "[]",
             "{}",

@@ -64,6 +64,9 @@ class RpcRouter internal constructor(
          *  request geth refuses with "too many arguments" is refused here too,
          *  never served with the extra argument ignored (#366). Keep in sync
          *  with tryVerified's cases. */
+        /** Methods only this node serves whose requests must never reach a dev proxy. */
+        private val LOCAL_ONLY = setOf("myotis_getAddressHistory", "myotis_verifyAddressHistoryEntries")
+
         private val VERIFIED_ARITY: Map<String, Int> = mapOf(
             "eth_chainId" to 0, "net_version" to 0, "eth_blockNumber" to 0,
             // transaction, block, state overrides, block overrides
@@ -629,8 +632,10 @@ class RpcRouter internal constructor(
             // so -32602 with the reason — -32000 is documented as retryable, and
             // a conforming client would retry it forever. A dev proxy still gets
             // its chance, as for the router's other refusals: unlike the engine
-            // refusals above, nothing was asked of the engine.
-            if (proxy == null) {
+            // refusals above, nothing was asked of the engine. Never for the address
+            // history (#899): only this node serves it, and the request names the
+            // user's address, which an upstream must not see.
+            if (proxy == null || method in LOCAL_ONLY) {
                 logger.record(method, idStr, "ERROR", elapsedMs(t0), -32602)
                 return errorEnvelope(id, -32602, e.why)
             }
@@ -1784,6 +1789,10 @@ class RpcRouter internal constructor(
             "myotis_getAddressHistory", "myotis_verifyAddressHistoryEntries" -> {
                 // Answered here whatever happens, never by a dev proxy: only this node serves
                 // the method, and the request names the user's address.
+                if (!b.supportsAddressHistory()) {
+                    // Refused at once: no reason to wake a chain for a call that can only fail.
+                    throw EngineRefused("the address history needs the Rust engine built with its Swarm reader")
+                }
                 val p = root.params()
                 val address = (p?.getOrNull(0) as? JsonPrimitive)?.takeIf { it.isString }?.content
                     ?: return errorEnvelope(id, -32602, "invalid argument 0: expected the address (0x + 40 hex digits)")

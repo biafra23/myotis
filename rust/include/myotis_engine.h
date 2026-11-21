@@ -486,8 +486,8 @@ bool myotis_set_activity_watch(int64_t handle, const char *config_json);
 char *myotis_address_activity_json(int64_t handle, int64_t after_block);
 
 /* v60: an address's history from the addr1 index on Swarm (#899; the Swarm reader is
- * linked only with the engine's `swarm` feature, else every call is the permanent
- * {"error","code":-32602}). myotis_address_history_json: one page, newest first,
+ * linked only with the engine's `swarm` feature, else every call, the settings included,
+ * is the permanent {"error","code":-32602}). myotis_address_history_json: one page, newest first,
  * options {"cursor","limit","roles","fromBlock","toBlock"} each applied; the page carries
  * the importer, the covered range, headGap/tailGap/gaps, the entries with their state
  * so far and the next cursor. myotis_verify_address_history_json: up to 50 entries
@@ -498,6 +498,9 @@ char *myotis_address_activity_json(int64_t handle, int64_t after_block);
 char *myotis_address_history_json(int64_t handle, const char *address, const char *options_json);
 char *myotis_verify_address_history_json(int64_t handle, const char *address, const char *entries_json);
 char *myotis_set_address_history_config_json(const char *config_json);
+/* Whether this build serves the address history at all (the Swarm reader linked, not
+ * mobile): false = every call above is the permanent refusal. */
+bool myotis_address_history_supported(void);
 
 /* v28: the read-fetch shadow-cache counters (docs/how-it-works/read-stats.md): how much of
  * the verified account / storage / bytecode fetch traffic a cache would have

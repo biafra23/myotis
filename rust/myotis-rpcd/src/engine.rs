@@ -59,6 +59,11 @@ pub trait Engine: Send + Sync {
     fn transaction_by_hash(&self, hash: &str) -> String;
     fn block_receipts(&self, selector: &str) -> String;
     fn get_logs(&self, filter: &str) -> String;
+    /// Whether the engine serves the address history at all (#899): false refuses at once,
+    /// with no wait for readiness.
+    fn address_history_supported(&self) -> bool {
+        true
+    }
     /// A page of an address's history (`myotis_getAddressHistory`, #899): the engine's JSON.
     fn address_history(&self, address: &str, options: &str) -> String;
     /// The per-entry check (`myotis_verifyAddressHistoryEntries`, #899): the engine's JSON.
@@ -217,6 +222,9 @@ impl Engine for FfiEngine {
     }
     fn get_logs(&self, filter: &str) -> String {
         ffi::get_logs_json(self.handle, filter.into())
+    }
+    fn address_history_supported(&self) -> bool {
+        ffi::address_history_supported()
     }
     fn address_history(&self, address: &str, options: &str) -> String {
         ffi::address_history_json(self.handle, address.into(), options.into())

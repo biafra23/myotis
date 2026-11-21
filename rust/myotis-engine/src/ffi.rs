@@ -528,6 +528,13 @@ pub fn verify_address_history_json(handle: i64, address: String, entries_json: S
     crate::host::verify_address_history_json(handle, &address, &entries_json)
 }
 
+/// Whether this build serves the address history at all (#899): the Swarm reader linked
+/// (feature `swarm`), not Android or iOS. False = every history call is refused. ABI >= 60.
+#[uniffi::export]
+pub fn address_history_supported() -> bool {
+    crate::host::address_history_supported()
+}
+
 /// The address history's settings, engine-wide (#899): `{"importer": "0x…" | null,
 /// "swarm": {"network": "mainnet"} | {"network": "dev", "networkId", "bootnodes"}}`,
 /// applied whole. `{}`, or the permanent `{"error","code":-32602}`. ABI >= 60.

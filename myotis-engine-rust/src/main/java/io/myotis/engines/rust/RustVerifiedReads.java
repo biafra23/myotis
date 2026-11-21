@@ -701,6 +701,11 @@ final class RustVerifiedReads implements VerifiedReads {
     /** The address history (#899): the handle's native answer as it came (a page, the
      *  retryable {@code {"error"}}, or the permanent {@code {"error","code":-32602}}). */
     @Override
+    public boolean supportsAddressHistory() {
+        return RustEngineNative.nativeAddressHistorySupported();
+    }
+
+    @Override
     public String addressHistoryJson(String address, String optionsJson) {
         return handle.addressHistoryJson(address, optionsJson);
     }

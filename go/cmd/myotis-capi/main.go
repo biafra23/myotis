@@ -318,6 +318,9 @@ func myotis_verify_address_history_json(h C.int64_t, address *C.cchar_t, entries
 	return cstr(capi.Unsupported("myotis_verify_address_history_json"))
 }
 
+//export myotis_address_history_supported
+func myotis_address_history_supported() C.bool { return C.bool(false) }
+
 //export myotis_set_address_history_config_json
 func myotis_set_address_history_config_json(cfg *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_set_address_history_config_json"))

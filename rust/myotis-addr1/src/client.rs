@@ -376,9 +376,16 @@ impl<'a, S: ChunkSource> Index<'a, S> {
         // record shares its key, and the filter runs after the merge.
         let in_range = |e: &Entry| key(e) < before && plan.keep(e.block) && e.block >= filter.from_block;
         let mut here: Vec<Entry> = found.entries.iter().copied().filter(|e| in_range(e)).collect();
-        let inline_keys: std::collections::HashSet<(u64, u32)> = here.iter().map(key).collect();
+        // An entry counts toward the read's limit only when it survives the merge: its roles,
+        // with those of an inline record of its key, match.
+        let mut inline_roles: std::collections::HashMap<(u64, u32), u8> = std::collections::HashMap::new();
+        for e in &here {
+            *inline_roles.entry(key(e)).or_default() |= e.roles;
+        }
         let (roles, from) = (filter.roles, filter.from_block);
-        let pick = move |e: &Entry| e.block >= from && (e.roles & roles != 0 || inline_keys.contains(&key(e)));
+        let pick = move |e: &Entry| {
+            e.block >= from && (e.roles | inline_roles.get(&key(e)).copied().unwrap_or(0)) & roles != 0
+        };
         for (reference, _count) in &found.spill_files {
             let spilled = self.spill_newest(&slice, *reference, before, want, &pick, filter.from_block).await?;
             here.extend(spilled.into_iter().filter(|e| plan.keep(e.block)));

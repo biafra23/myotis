@@ -442,6 +442,10 @@ interface RpcBackend {
      */
     fun addressHistory(address: String, optionsJson: String): String = ADDRESS_HISTORY_REFUSED
 
+    /** Whether this backend serves the address history ([addressHistory]) at all. Consulted
+     *  BEFORE dispatch, so a backend without it refuses at once. Default: false. */
+    fun supportsAddressHistory(): Boolean = false
+
     /**
      * `myotis_verifyAddressHistoryEntries` (#899): [entriesJson] (an array of entries as a
      * page returned them) checked against verified chain data; the engine's JSON as it came.

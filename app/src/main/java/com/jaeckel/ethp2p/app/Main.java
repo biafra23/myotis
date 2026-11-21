@@ -327,6 +327,11 @@ public final class Main {
             System.err.println("-Dmyotis.addressHistory.config: the settings in " + file + " were refused: " + answer);
             System.exit(2);
         }
+        // The setting is experimental and rests on trust: say whose index it trusts.
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\"importer\"\\s*:\\s*\"(0x[0-9a-fA-F]{40})\"").matcher(json);
+        System.err.println("address history: experimental, trusting the index of importer "
+                + (m.find() ? m.group(1) : "(none: every read refused)") + " for its completeness");
     }
 
     private static void runDaemon(MyotisEngine engine, List<String> networks, int portOverride)

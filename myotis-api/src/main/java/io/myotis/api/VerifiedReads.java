@@ -542,6 +542,15 @@ public interface VerifiedReads {
     }
 
     /**
+     * Whether this engine serves the address history at all (#899): the Rust engine built
+     * with its Swarm reader, not on mobile. A host consults it before calling, so a call that
+     * can only be refused does not wake a paused chain. Default false.
+     */
+    default boolean supportsAddressHistory() {
+        return false;
+    }
+
+    /**
      * Check up to 50 entries of {@code address}'s history ({@code entriesJson}: an array of
      * {@code {"block","slot","roles"}}, as a page returned them) against verified chain data,
      * one verified block (and its receipts where a role needs them) per block (#899). A
