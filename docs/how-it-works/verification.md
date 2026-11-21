@@ -349,10 +349,11 @@ transaction (`rust/myotis-net/src/el/send_check.rs`; Java: `SendCheck`).
   claim Myotis does make is narrower: the logs of watched addresses over the log index's
   walked coverage (§12).
 - **Old data.** State is served at the head and the finalized block only; blocks up to 512
-  back; the header walk under 8192 blocks. The historical accumulators that would extend
-  this (pre-Merge epoch accumulator, `historical_summaries`) are designed but **not built**
-  ([implementation-status.md](implementation-status.md)), so today every answer rests on the
-  sync-committee chain alone.
+  back, deeper on the Rust engine on mainnet through the bundled checkpoint table (a trust
+  anchor of its own: `.claude/agent/data-sources.md`, Trust); the header walk under 8192
+  blocks. The historical accumulators that would extend this further (pre-Merge epoch
+  accumulator, `historical_summaries`) are designed but **not built**
+  ([implementation-status.md](implementation-status.md)).
 - **The clock.** The weak-subjectivity gate and the `SYNCED` check read the device clock.
 - **Simplifications against the light-client spec.** Neither engine implements the spec's
   `best_valid_update` / forced update after `UPDATE_TIMEOUT`; during catch-up both stores also

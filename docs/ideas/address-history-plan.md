@@ -1,7 +1,9 @@
 # Past transactions for any address: what is missing
 
-Status: **planning basis; the tracer bullet is being built** (`feature/swarm-addr1`: the
-Swarm carve-out, an embedded `ant` node, the addr1 reader and `myotis_getAddressHistory`).
+Status: **planning basis; the tracer bullet is built** on `feature/swarm-addr1` (#899: the
+Swarm carve-out, an embedded `ant` node, the addr1 reader, deep block reads through the
+checkpoint table, the per-entry check, and `myotis_getAddressHistory` /
+`myotis_verifyAddressHistoryEntries`; how to run it: `docs/guides/address-history.md`).
 D1 is decided (owner, 2026-11-20): the bundled checkpoint table is a trust anchor, so a
 table-verified header verifies an entry. It lists everything needed for
 [Punicus](https://github.com/biafra23/punicus) to show the past transactions of any
