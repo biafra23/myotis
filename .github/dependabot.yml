@@ -114,8 +114,8 @@ updates:
       - "/rust/swarm"
     # /rust/swarm reaches ant through path dependencies in rust/vendor/ant (third-party
     # sources copied in verbatim, VENDORED.md there), so Dependabot needs those manifests to
-    # resolve its graph and is not told to skip them. Should a PR of its own edit one, the
-    # swarm lane's `vendor_ant.sh --check` fails it: an ant update is that script.
+    # resolve its graph and is not told to skip them. Should a PR of its own edit one,
+    # vendored-ant.yml's `vendor_ant.sh --check` fails it: an ant update is that script.
     schedule:
       interval: monthly
     cooldown:
