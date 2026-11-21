@@ -159,6 +159,8 @@ fixture-recorder = ["myotis-evm/fixture"]
 
 [dev-dependencies]
 myotis-wire = { path = "../myotis-wire", features = ["test-util"] }
+# CheckpointTable::parse_for_test: el::deep's tests build synthetic tables.
+myotis-core = { path = "../myotis-core", features = ["test-util"] }
 # readstats shape tests parse their own JSON output.
 serde_json = "1"
 # Tests and examples build this crate with `fixture-recorder`, so the fixture

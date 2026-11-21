@@ -22,7 +22,7 @@ against. Do not move them out of `.claude/`, and not into `.claude/rules/`
 | do any release work: tag, version, changelog, checkpoints, bootnodes, seeds, assets, bundles | `.claude/agent/releases.md` |
 | add or bump a dependency, move a toolchain pin, touch build scripts or packaging | `.claude/agent/reproducibility.md` |
 | use a JDK API newer than Java 8 in Android-consumed code, or add HTTP         | `.claude/agent/platform.md`          |
-| add a data source, or touch roost, log-index seeds, `:tx-history`, Portal     | `.claude/agent/data-sources.md`      |
+| add a data source, or touch roost, log-index seeds, `:tx-history`, Portal, the Swarm reader (`ant`, addr1) | `.claude/agent/data-sources.md` |
 | work on, or come across, a security issue that is not public yet             | `.claude/agent/security-fixes.md`    |
 
 ## Build & Run
@@ -195,12 +195,12 @@ Full text: `.claude/agent/reproducibility.md`.
 Read `.claude/agent/releases.md` in full before any release work. In outline:
 **ask three questions first** (1. refresh the trust checkpoints? 2. re-sync the
 mainnet bootnodes? 3. run the cold-start checks?), then the mandatory steps
-(4. move the version pins, 5. refresh the PoC log-index seeds, 6. turn
-`[Unreleased]` in `CHANGELOG.md` into the entry of the exact tag to come;
-every `v*` tag gets a PR for it), all in ONE release PR. Ask too whether a
+(4. move the version pins, 5. refresh the PoC log-index seeds, 6. extend the
+checkpoint tables, 7. turn `[Unreleased]` in `CHANGELOG.md` into the entry of
+the exact tag to come; every `v*` tag gets a PR for it), all in ONE release PR. Ask too whether a
 merge since the last tag is an embargoed security fix: its release PR, notes
 and changelog entry then stay neutral. The tag is the owner's action. After
-the tag (7.), a release is done only when `verify release` and `reproducible
+the tag (8.), a release is done only when `verify release` and `reproducible
 builds` are green — check and report them. Every release asset goes through
 `.github/release-assets.sh`, never a bare `gh release upload`.
 
@@ -255,13 +255,29 @@ Full text, including the complete minSdk 29 JDK-API budget: `.claude/agent/platf
 ## Trust
 
 - Peer trusted is never an option everything has to be cryptographically verified
-- The only trust anchors are sync committee signatures and  the embedded pre-Merge historical hashes accumulator and the Bellatrix-era historical roots accumulator
+- The only trust anchors are sync committee signatures, the embedded pre-Merge historical hashes accumulator, the Bellatrix-era historical roots accumulator and the bundled checkpoint table
+- The bundled checkpoint table (owner's decision D1, 2026-11-20), Rust engine:
+  per network the hash of every 1024th block, pinned by keccak256, built by a
+  `parentHash` walk down to the genesis hash; a block at or below its top is
+  canonical when its headers hash-link up to the first entry at or above it
+  (until a walk has checked the top, on the build's cross-check alone). Above
+  the top, today's window or a walk up to a hash the node linked from an
+  attested finalized block; a walk that finds another hash at the top raises
+  an alarm, kept across restarts, that refuses every table read (`-32602`); the
+  table changes only in a release PR, never by a running node. Scope and
+  limits: `.claude/agent/data-sources.md`.
 - One bounded exception (owner's decision, 2026-09-25): a seeded log history of
   a root-committing protocol is served on its publisher's word. Scope and
   limits: `.claude/agent/data-sources.md`.
 - One more (owner's request, 2026-11-10): only at a `STALE_ANCHOR` park and
   only on the user's request (explicit or remembered), a fresh checkpoint that
   every answering checkpoint-sync server names. Scope and limits:
+  `.claude/agent/data-sources.md`.
+- And one more (owner's decision, 2026-11-19): an address's history read from
+  the addr1 index on Swarm is a list of candidates, each shown verified only
+  after a check against verified chain data (contradicted if the check fails);
+  its completeness and its `TRACE` entries
+  rest on the importer key the user configured. Scope and limits:
   `.claude/agent/data-sources.md`.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** When refusing, use a PERMANENT error code
@@ -270,15 +286,18 @@ Full text, including the complete minSdk 29 JDK-API budget: `.claude/agent/platf
 
 ## Data sources
 
-Full text of the rule, both carve-outs and their boundaries: `.claude/agent/data-sources.md`.
+Full text of the rule, the carve-outs and their boundaries: `.claude/agent/data-sources.md`.
 
 - the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production
-- Three bounded carve-outs exist, each an owner's decision: `roost` may relay
+- Four bounded carve-outs exist, each an owner's decision: `roost` may relay
   *self-verifying* consensus objects from a local beacon node, the log index
-  may serve a seeded history of a root-committing protocol, and at a
+  may serve a seeded history of a root-committing protocol, at a
   `STALE_ANCHOR` park the user may re-anchor on a fresh checkpoint that every
-  answering checkpoint-sync server names. None widens by analogy — anything
-  outside their stated boundaries needs its own decision.
+  answering checkpoint-sync server names, and the Rust engine may read the
+  addr1 address index from Swarm through an embedded light node (`ant`, over
+  libp2p; in production never a Swarm HTTP API, and never a gateway), every
+  chunk checked and every entry a candidate until verified. None widens by analogy — anything outside
+  their stated boundaries needs its own decision.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled**; the
   `:tx-history` scan is debug-only and misses recent history. If you find
   evidence publishing has resumed, flag it to the user.

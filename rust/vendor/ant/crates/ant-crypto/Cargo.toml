@@ -1,0 +1,20 @@
+[package]
+name = "ant-crypto"
+version = "0.5.78"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+getrandom = "0.3.2"
+k256.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+k256.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

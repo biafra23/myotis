@@ -16,6 +16,7 @@
 // Public: the plain C ABI doubles as the in-process seam for Rust hosts (the
 // napi-rs Node binding in `myotis-node` calls these by Rust path — linking the
 // rlib does not reliably resolve `extern "C"` imports of no_mangle symbols).
+mod addrhist;
 pub mod capi;
 pub mod catalog;
 mod eljson;
@@ -420,7 +421,15 @@ uniffi::setup_scaffolding!();
 ///      STALE_ANCHOR park, applied by the sync loop itself, so it works with no
 ///      UI open. An additive function — bumped so a host that pushes it is never
 ///      paired with an engine that would not apply it.
-pub const ABI_VERSION: i32 = 59;
+/// v60: `address_history_json`, `verify_address_history_json` and
+///      `set_address_history_config_json`, and the probe `address_history_supported`
+///      (UniFFI and the C ABI: `myotis_address_history_json`,
+///      `myotis_verify_address_history_json`, `myotis_set_address_history_config_json`,
+///      `myotis_address_history_supported`): an address's history from the
+///      addr1 index on Swarm and its per-entry check (#899). Additive functions —
+///      bumped so a host that offers the history is never paired with an engine
+///      that lacks it. A build without the `swarm` feature refuses them (-32602).
+pub const ABI_VERSION: i32 = 60;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

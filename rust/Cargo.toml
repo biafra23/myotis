@@ -22,6 +22,10 @@
 #                      discovery, RLPx/eth/snap sessions, libp2p eth2 req/resp,
 #                      and the sync loop driving myotis-consensus. Depends on
 #                      myotis-consensus; never the other way around.
+#   myotis-addr1     — the addr1 address index's reader (pure Rust lib, sans-I/O like
+#                      myotis-consensus): its records, the cover math and the checks of
+#                      what Swarm delivered (SOC signatures, chunk and file addresses).
+#                      Depends on myotis-core only; the fetching is rust/swarm's.
 #   myotis-evm       — the EVM: eth_call / gas-estimation over SNAP-proof-verified
 #                      state (revm behind a SnapStateOracle trait; sans-I/O). THE
 #                      one heavy EL dep (revm) is gated to this crate. Grows through
@@ -42,7 +46,7 @@
 
 [workspace]
 resolver = "2"
-members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-wire", "myotis-evm", "myotis-engine", "myotis-net", "myotis-node", "myotis-rpcd", "uniffi-bindgen"]
+members = ["myotis-addr1", "myotis-bls", "myotis-consensus", "myotis-core", "myotis-wire", "myotis-evm", "myotis-engine", "myotis-net", "myotis-node", "myotis-rpcd", "uniffi-bindgen"]
 # tor-poc (docs/how-it-works/privacy-and-tor.md §3 proof-of-concept) is a STANDALONE crate,
 # excluded on purpose: it pulls the whole Arti dependency tree, which must never
 # burden the pure-engine build or CI. It depends on myotis-net/myotis-core by
@@ -53,7 +57,19 @@ members = ["myotis-bls", "myotis-consensus", "myotis-core", "myotis-wire", "myot
 # in a process holding 1000+ wallet connections that turns one panic into an
 # outage for all of them. Excluded, it carries its own profile with
 # `panic = "unwind"`. It also pulls an HTTP stack no engine target links.
-exclude = ["tor-poc", "roost"]
+#
+# swarm (crate myotis-swarm, the embedded ant Swarm node) is excluded too: a member is
+# built by every `cargo build --workspace`, the release build included, and would pull
+# ant's libp2p features (dns, ping, upnp) into the engine. myotis-engine links it only
+# behind its off-by-default `swarm` feature (dev builds; rust/swarm/src/lib.rs, "Not ready
+# for a release build"), so this lock records its graph and no shipped build compiles it.
+# Its own lock, rust/swarm/Cargo.lock, is for building it on its own (tests, the example).
+#
+# vendor holds third-party sources copied in verbatim, today ant (vendor/ant/VENDORED.md):
+# not on crates.io, and as a git dependency it would make every cold build fetch it.
+# Upstream's code with its own workspace manifest (vendor/ant/Cargo.toml), built only as a
+# path dependency, never as a member: no Myotis fmt or clippy runs over it.
+exclude = ["tor-poc", "roost", "swarm", "vendor"]
 
 # ONE version for every myotis-* release crate (`version.workspace = true` in each
 # member). The Gradle build is the source of truth for the release version

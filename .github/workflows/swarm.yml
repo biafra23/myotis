@@ -1,0 +1,83 @@
+# swarm — the embedded ant Swarm node (rust/swarm, crate myotis-swarm), the reader
+# of the addr1 address index (.claude/agent/data-sources.md, the Swarm carve-out).
+#
+# Its own workflow for the same reason as roost.yml: it is deliberately NOT a
+# workspace member (rust/Cargo.toml `exclude`), so `cargo test --workspace` and
+# rust-clippy.yml do not see it. myotis-engine links it behind its off-by-default
+# `swarm` feature, which no other lane enables: this lane also builds and tests the
+# engine with that feature (addrhist, the Swarm reader's only caller) and lints it at
+# rust-clippy.yml's level, and runs on changes to the crates that feature builds.
+#
+# ant is vendored in rust/vendor/ant (its VENDORED.md): this lane builds it as a
+# path dependency, and never fetches it. Cargo decides whether a path crate is
+# fresh by file mtime, which a new checkout always moves, so every run builds ant
+# again (the git dependency came out of the cache). vendored-ant.yml checks the
+# copy against upstream; cargo-locks.yml keeps git sources out of every lock.
+#
+# Path-filtered, and `push` scoped to main as in the other Rust lanes, so a push
+# to a branch with an open PR runs once (under pull_request).
+name: swarm
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "rust/swarm/**"
+      - "rust/vendor/ant/**"
+      - "rust/myotis-addr1/**"
+      - "rust/myotis-engine/**"
+      # The path crates the engine builds with `swarm` on: addrhist, tested only here,
+      # calls into myotis-net (addrcheck, ElReader) and myotis-core.
+      - "rust/myotis-net/**"
+      - "rust/myotis-core/**"
+      - "rust/myotis-wire/**"
+      - "rust/myotis-consensus/**"
+      - "rust/myotis-evm/**"
+      - "rust/Cargo.lock"
+      - ".github/workflows/swarm.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
+  pull_request:
+    paths:
+      - "rust/swarm/**"
+      - "rust/vendor/ant/**"
+      - "rust/myotis-addr1/**"
+      - "rust/myotis-engine/**"
+      # The path crates the engine builds with `swarm` on: addrhist, tested only here,
+      # calls into myotis-net (addrcheck, ElReader) and myotis-core.
+      - "rust/myotis-net/**"
+      - "rust/myotis-core/**"
+      - "rust/myotis-wire/**"
+      - "rust/myotis-consensus/**"
+      - "rust/myotis-evm/**"
+      - "rust/Cargo.lock"
+      - ".github/workflows/swarm.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
+
+jobs:
+  test:
+    name: myotis-swarm tests and clippy
+    runs-on: ubuntu-26.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: |
+            rust/swarm
+            rust
+      - name: Tests
+        run: cargo test --manifest-path rust/swarm/Cargo.toml --locked
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path rust/swarm/Cargo.toml --all-targets -- -D warnings
+      # The engine with the reader linked: the only build of addrhist's Swarm half.
+      - name: Engine with `swarm` (tests)
+        run: cargo test --locked --manifest-path rust/Cargo.toml -p myotis-engine --features swarm --lib addrhist
+      - name: Engine with `swarm` (clippy, rust-clippy.yml's level)
+        run: cargo clippy --locked --manifest-path rust/Cargo.toml -p myotis-engine --features swarm --all-targets --keep-going -- -D clippy::incompatible_msrv

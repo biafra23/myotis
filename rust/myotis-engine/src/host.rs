@@ -239,6 +239,10 @@ pub fn set_tor_enabled(on: bool) -> bool {
     #[cfg(feature = "tor")]
     {
         myotis_net::el::tor::set_enabled(on);
+        if on {
+            // The Swarm reader does not route through Tor: it stops at the switch.
+            crate::addrhist::tor_switched_on();
+        }
         true
     }
     #[cfg(not(feature = "tor"))]
@@ -560,6 +564,13 @@ fn handle_using(engine: &EngineState, snapshot_path: Option<&std::path::Path>) -
             cfg.snapshot_path.as_deref() == Some(target)
         })
         .map(|(id, _)| *id)
+}
+
+/// The handle's deep-anchor state file (`myotis_net::el::deep`): beside its EL peer cache,
+/// under the host's dataDir, suffixed like it. `None` without a dataDir.
+fn deep_store_path(config: &ChainConfig) -> Option<std::path::PathBuf> {
+    let dir = config.snapshot_path.as_deref()?.parent()?;
+    Some(dir.join(format!("deep-anchors{}.txt", persistence_suffix(config))))
 }
 
 /// `""` for mainnet, `-<net>` otherwise — the per-network file-name suffix
@@ -1030,10 +1041,19 @@ pub fn status_json(handle: i64) -> String {
         Paused(&'static str, SyncStatus, u64),
         Unknown,
     }
+    // Where the handle's deep-anchor state is kept: the checkpoint table's alarm is read
+    // from it while no reader runs (a paused handle), so it does not come and go.
+    let mut deep_store: Option<std::path::PathBuf> = None;
     let snap = {
         let map = match engine.handles.lock() {
             Ok(m) => m,
             Err(_) => return "{}".to_string(),
+        };
+        deep_store = match map.get(&handle) {
+            Some(ChainEntry::Created(c)) | Some(ChainEntry::Running(c, _, _)) | Some(ChainEntry::Paused(c, _, _)) => {
+                deep_store_path(c)
+            }
+            None => None,
         };
         match map.get(&handle) {
             Some(ChainEntry::Created(config)) => {
@@ -1067,6 +1087,7 @@ pub fn status_json(handle: i64) -> String {
         .and_then(|m| m.get(&handle).cloned())
         .and_then(|w| w.advisory());
     let upgrade_advisory = cl_fork_watch::merge_advisories(el_advisory, cl_advisory);
+    let stored_alarm = deep_store.as_deref().and_then(myotis_net::el::deep::stored_alarm);
     // Data usage in every lifecycle state: the day's figures outlive a pause.
     let usage = usage_ledger(engine, handle).map(|l| l.tick(false));
     let metering = crate::usage::metering();
@@ -1076,7 +1097,7 @@ pub fn status_json(handle: i64) -> String {
             network,
             None,
             wall,
-            ElCounts { upgrade_advisory, usage, metering, ..ElCounts::default() },
+            ElCounts { upgrade_advisory, usage, metering, checkpoint_alarm: stored_alarm.clone(), ..ElCounts::default() },
         ),
         Snap::Running(network, status, wall, reader) => {
             let el = match reader {
@@ -1102,12 +1123,13 @@ pub fn status_json(handle: i64) -> String {
                             body_requests_served: b_served,
                             el_hunting: r.el_hunting(),
                             upgrade_advisory,
+                            checkpoint_alarm: r.checkpoint_alarm().or_else(|| stored_alarm.clone()),
                             usage,
                             metering,
                         }
                     }
                 }),
-                None => ElCounts { upgrade_advisory, usage, metering, ..ElCounts::default() },
+                None => ElCounts { upgrade_advisory, usage, metering, checkpoint_alarm: stored_alarm.clone(), ..ElCounts::default() },
             };
             status_object(Lifecycle::Running, network, Some(status), wall, el)
         }
@@ -1118,7 +1140,7 @@ pub fn status_json(handle: i64) -> String {
             network,
             Some(frozen),
             wall,
-            ElCounts { upgrade_advisory, usage, metering, ..ElCounts::default() },
+            ElCounts { upgrade_advisory, usage, metering, checkpoint_alarm: stored_alarm.clone(), ..ElCounts::default() },
         ),
         Snap::Unknown => "{}".to_string(),
     }
@@ -1164,6 +1186,9 @@ struct ElCounts {
     /// Peers announce (or already activated) a network upgrade this build does
     /// not support — EL-derived like the counts, but NOT zeroed while paused.
     upgrade_advisory: Option<fork_watch::Advisory>,
+    /// The checkpoint table's alarm (`ElReader::checkpoint_alarm`), once raised:
+    /// every deep read resting on the table is refused. Kept across restarts.
+    checkpoint_alarm: Option<String>,
     /// The handle's data usage (both layers; not zeroed while paused). None
     /// only where no ledger exists, which no live handle lacks.
     usage: Option<UsageSnapshot>,
@@ -3274,6 +3299,60 @@ pub fn get_block_by_number_json(handle: i64, block_tag: &str, full_transactions:
     }
 }
 
+/// `address_history_json`: one page of `address`'s history from the addr1 index on Swarm
+/// (`addrhist`), for the chain of a running handle; the handle's verified head bounds the
+/// head gap. Refused with the permanent -32602 where the carve-out says so.
+pub fn address_history_json(handle: i64, address: &str, options_json: &str) -> String {
+    // A build without the reader refuses for good, whatever the handle's state.
+    if let Some(refused) = crate::addrhist::early_refusal() {
+        return refused;
+    }
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, chain_id) = match snapshot_reader_evm(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let head = Some(reader.optimistic_block_number()).filter(|h| *h > 0);
+    let trust = crate::addrhist::Trust::of(&reader);
+    crate::addrhist::history_json(&engine.rt, chain_id, head, trust, address, options_json)
+}
+
+/// `verify_address_history_json`: check entries of `address`'s history (as a page returns
+/// them) against verified chain data, for the chain of a running handle (`addrhist`).
+pub fn verify_address_history_json(handle: i64, address: &str, entries_json: &str) -> String {
+    if let Some(refused) = crate::addrhist::early_refusal() {
+        return refused;
+    }
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, chain_id) = match snapshot_reader_evm(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    crate::addrhist::verify_json(&engine.rt, &reader, chain_id, address, entries_json)
+}
+
+/// `address_history_supported`: whether this build serves the address history at all (the
+/// Swarm reader linked, not mobile). A probe hosts consult before waking a chain for a call
+/// that could only be refused.
+pub fn address_history_supported() -> bool {
+    crate::addrhist::early_refusal().is_none()
+}
+
+/// `set_address_history_config_json`: the address history's settings (`addrhist`):
+/// the importer key and the Swarm network. Applied whole or refused (-32602).
+pub fn set_address_history_config_json(json: &str) -> String {
+    // A build without the reader refuses the settings too, as the Java and Go engines do:
+    // a daemon told to use the history must not start as if it could.
+    if let Some(refused) = crate::addrhist::early_refusal() {
+        return refused;
+    }
+    crate::addrhist::set_config_json(json)
+}
+
 /// `nativeGetTransactionReceiptJson`: verified `eth_getTransactionReceipt` for a
 /// running handle. `tx_hash_hex` is the 0x-hex 32-byte tx hash. Returns the
 /// receipt JSON when the tx is found+verified in the scanned window, the literal
@@ -4175,6 +4254,14 @@ fn status_object(
             None => serde_json::Value::Null,
         },
     );
+    // The checkpoint table's alarm: null, or why every read resting on the
+    // bundled table is refused (.claude/agent/data-sources.md, Trust). The
+    // wrappers carry it to the API's StatusSnapshot.checkpointAlarm, which every
+    // host shows (the readiness ladder's ANCHOR_ALARM), and to myotis_status.
+    obj.insert(
+        "checkpointAlarm".into(),
+        el.checkpoint_alarm.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+    );
     // Data usage (docs/how-it-works/data-usage.md): this handle's bytes since it was
     // created, by layer, and the local day's figures with their metered part.
     obj.insert(
@@ -4219,7 +4306,7 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
     r#""finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,"#,
     r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
-    r#""peerBodyRequests":0,"peerBodyRequestsServed":0,"upgradeAdvisory":null,"#,
+    r#""peerBodyRequests":0,"peerBodyRequestsServed":0,"upgradeAdvisory":null,"checkpointAlarm":null,"#,
     r#""dataUsage":null,"networkMetering":"UNKNOWN"}"#,
 );
 
@@ -4961,6 +5048,7 @@ mod tests {
             body_requests_served: 0,
             el_hunting: false,
             upgrade_advisory: None,
+            checkpoint_alarm: None,
             usage: Some(UsageSnapshot {
                 session: myotis_net::traffic::TrafficSnapshot { el_rx: 10, el_tx: 2, cl_rx: 30, cl_tx: 4 },
                 day: "2026-10-20".to_string(),

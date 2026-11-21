@@ -1,0 +1,36 @@
+[package]
+name = "ant-postage"
+version = "0.5.78"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ant-crypto = { path = "../ant-crypto" }
+# Store lock (`acquire_store_lock`): `flock(2)` via rustix. std's
+# `File::try_lock` returns "try_lock() not supported" on Android with
+# older toolchains (reproduced on 1.94; issue #95), which made every
+# batch registration fail there.
+fs4 = "1.0.2"
+hex = { workspace = true }
+k256 = { workspace = true }
+# `bee-recover` only: read bee's `stamperstore` (a LevelDB) and msgpack-
+# decode the persisted stamp-issuer bucket counters. Pure-Rust LevelDB
+# reader so we don't pull in a C toolchain; off by default so embedders
+# (ant-ffi / iOS) that never touch a bee data-dir stay lean.
+rmp-serde = { version = "1.3.1", optional = true }
+# `fs` (the default) gives the on-disk env we need to read a bee
+# data-dir; we drop the rest (async runtimes) to stay lean.
+rusty-leveldb = { version = "4.0.1", optional = true, default-features = false, features = ["fs"] }
+serde = { workspace = true, optional = true }
+sha3 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+# Recover stamp-issuer bucket counters from a bee `stamperstore` when
+# adopting a batch rediscovered on-chain (PLAN.md recovery, option a).
+bee-recover = ["dep:rusty-leveldb", "dep:rmp-serde", "dep:serde"]
+
+[lints]
+workspace = true

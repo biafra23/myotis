@@ -382,4 +382,12 @@ public final class SelectorEngine implements MyotisEngine {
     public NetworkMetering networkMetering() {
         return java.networkMetering();
     }
+
+    /** The address history's settings (#899): to the engine this selector serves chains
+     *  with now ({@link #resolve()}), so a Java or Go choice gets that engine's refusal,
+     *  never a Rust engine that serves nothing accepting them. */
+    @Override
+    public String setAddressHistoryConfigJson(String configJson) {
+        return resolve().setAddressHistoryConfigJson(configJson);
+    }
 }

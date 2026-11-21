@@ -8,8 +8,10 @@
 //! against Java-generated conformance corpora under `rust/testdata/el/`.
 
 pub mod activity;
+pub mod addrcheck;
 pub mod anchor;
 pub mod discv4;
+pub mod deep;
 pub mod dnsdisco;
 pub mod enrfilter;
 pub mod eth;

@@ -96,6 +96,23 @@ public class DaemonClient {
                 if (args.length < 2) throw new IllegalArgumentException("Usage: get-account <0xAddress>");
                 yield "{\"cmd\":\"get-account\",\"address\":\"" + esc(args[1]) + "\"}";
             }
+            // The address history (#899): the options and the entries go as raw JSON values.
+            case "get-address-history" -> {
+                if (args.length < 2) throw new IllegalArgumentException(
+                        "Usage: get-address-history <0xAddress> ['{\"cursor\":…,\"limit\":…,\"roles\":[…],\"fromBlock\":…,\"toBlock\":…}']");
+                // One JSON-Lines request: a pretty-printed argument's line breaks become spaces
+                // (a raw line break is not valid inside a JSON string anyway).
+                String opts = args.length > 2 ? args[2].replaceAll("[\\r\\n]+", " ").trim() : "{}";
+                if (!opts.startsWith("{")) throw new IllegalArgumentException("the options must be a JSON object");
+                yield "{\"cmd\":\"get-address-history\",\"address\":\"" + esc(args[1]) + "\",\"options\":" + opts + "}";
+            }
+            case "verify-address-history" -> {
+                if (args.length < 3) throw new IllegalArgumentException(
+                        "Usage: verify-address-history <0xAddress> '[{\"block\":…,\"slot\":…,\"roles\":[…]}]'");
+                String entries = args[2].replaceAll("[\\r\\n]+", " ").trim();
+                if (!entries.startsWith("[")) throw new IllegalArgumentException("the entries must be a JSON array");
+                yield "{\"cmd\":\"verify-address-history\",\"address\":\"" + esc(args[1]) + "\",\"entries\":" + entries + "}";
+            }
             case "get-storage" -> {
                 if (args.length < 3) throw new IllegalArgumentException(
                     "Usage: get-storage <contractAddress> <slot> [holderAddress]");

@@ -18,7 +18,8 @@
 # whose `=` pins of tokio and futures follow the workspace's by hand, the Go
 # engine's go/go.mod + go.sum, and scripts/swarm-cli/package-lock.json (the
 # swarm-cli that scripts/publish_site_swarm.mjs runs, which pulls in
-# @ethersphere/bee-js; security updates only).
+# @ethersphere/bee-js; security updates only), and rust/vendor/ant, the vendored
+# ant crates, moved only by scripts/vendor_ant.sh (rust/vendor/ant/VENDORED.md).
 # claude-review.yml is excluded (see the github-actions entry).
 #
 # Grouped, and Cargo and Gradle monthly, so the routine moves arrive as a
@@ -26,9 +27,9 @@
 # Gradle one the pin regeneration), and, moving a pin, needs a dispatched
 # `reproducible builds` run before it merges — per dependency, that cost
 # multiplied by every crate and library in the tree. A group without
-# `group-by` is ONE PR across all directories of its entry, so the three
-# Cargo workspaces, which share myotis-net by path, move together and their
-# three locks with them.
+# `group-by` is ONE PR across all directories of its entry, so the four
+# Cargo workspaces (three of which share myotis-net by path) move together and
+# their four locks with them.
 #
 # One routine group per ecosystem holds what should not break; every update
 # that may break comes as a PR of its own (owner's decision, 2026-11-12), so
@@ -43,8 +44,8 @@
 #   0.x minor (0.11 -> 0.12) as breaking, and most of this tree's `=` pins
 #   are 0.x (libp2p, discv5, k256, sha2, sha3, aes, hmac, Arti ...). 1.x
 #   minors come one by one with them. `group-by: dependency-name` makes each
-#   one PR across the three workspaces; left ungrouped, a crate would move
-#   in three PRs, each regenerating one lock of three.
+#   one PR across the four workspaces; left ungrouped, a crate would move
+#   in four PRs, each regenerating one lock of four.
 #
 # The actions stay weekly and in one group: GitHub raises no Dependabot
 # alerts for actions pinned by SHA, which every action here is, so this run
@@ -110,6 +111,11 @@ updates:
       - "/rust"
       - "/rust/roost"
       - "/rust/tor-poc"
+      - "/rust/swarm"
+    # /rust/swarm reaches ant through path dependencies in rust/vendor/ant (third-party
+    # sources copied in verbatim, VENDORED.md there), so Dependabot needs those manifests to
+    # resolve its graph and is not told to skip them. Should a PR of its own edit one,
+    # vendored-ant.yml's `vendor_ant.sh --check` fails it: an ant update is that script.
     schedule:
       interval: monthly
     cooldown:

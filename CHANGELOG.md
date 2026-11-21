@@ -6,7 +6,7 @@ Every release of Myotis, newest first. The format follows
 libraries and checksums are on its
 [GitHub release](https://github.com/biafra23/myotis/releases); every release so
 far is a pre-release. The release PR adds its entry here
-(`.claude/agent/releases.md`, step 6); numbers in parentheses are pull requests
+(`.claude/agent/releases.md`, step 7); numbers in parentheses are pull requests
 and issues of this repository.
 
 A release candidate's entry lists what it adds over the release before it; the
@@ -30,9 +30,33 @@ its trust anchors and release checks.
 - Docs: verifying deep blocks, an analysis of reads beyond the 512-block
   window with a measured survey of which peers still serve old blocks
   (#882).
+- Rust engine, mainnet: blocks below the 512-block window verify through a
+  bundled checkpoint table, the hash of every 1024th block up to 26,457,537,
+  pinned by keccak256 (rule D1, a new trust anchor). Above the table's top, a
+  block verifies by a walk down from an attested finalized block. Deep bodies
+  and receipts come from the peers whose eth/69 `earliestBlock` covers the
+  block. If a walk finds another hash at the table's top, an alarm refuses
+  every read resting on the table (`-32602`), is kept across restarts, and
+  every host shows it as "Trust anchors disagree" (#900–#904, #908).
+- Address history, in development builds only (`-PswarmEngine`, `myotis-rpcd
+  --features swarm`): `myotis_getAddressHistory` reads an address's entries
+  from the addr1 index on Swarm through an embedded `ant` light node, and
+  `myotis_verifyAddressHistoryEntries` checks each against verified chain data.
+  Also on the daemon's IPC. Every shipped build refuses both with `-32602`.
+  Guide: `docs/guides/address-history.md` (#891–#907).
+- API: `StatusSnapshot.checkpointAlarm`; `VerifiedReads` gains the address
+  history calls and `MyotisEngine.setAddressHistoryConfigJson`, refusing by
+  default. The engine's ABI is 60 (#906, #908).
 
 ### Changed
 
+- `StatusSnapshot` (`:myotis-api`) has a new last component,
+  `checkpointAlarm`: a consumer that constructs it passes one more argument
+  (#908).
+- Block bodies: the Rust engine checks `ommersHash` and `withdrawalsRoot`
+  too, and refuses a body with more than 2 ommers or 16 withdrawals (#904).
+- Releases: a new step 6 extends the checkpoint tables with `ethswarm
+  --extend` (`.claude/agent/releases.md`, #901).
 - Rust: the minimum version is 1.99, for the engine workspace and every
   standalone crate (roost, tor-poc, the tour's workbook); the pinned toolchain
   is 1.99.1 (#897).

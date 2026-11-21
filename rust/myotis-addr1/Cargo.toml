@@ -1,0 +1,14 @@
+[package]
+name = "myotis-addr1"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "The addr1 address index (eth2swarm docs/address-index.md): record decoding, the cover math and the checks of what Swarm delivered (sans-I/O)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# keccak-256.
+myotis-core = { path = "../myotis-core" }
+# secp256k1 recovery of a SOC's owner signature, with low-S normalization (`swarm.rs`;
+# myotis-core's pin, no new crate).
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa"] }

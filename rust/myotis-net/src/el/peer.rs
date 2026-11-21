@@ -342,7 +342,14 @@ pub struct ManagedPeer {
     /// Status, refreshed by every BlockRangeUpdate the read loop decodes and
     /// by every anchored window it serves.
     head: SharedKnownHead,
+    /// The oldest block the peer says it can serve (eth/69 `earliestBlock`):
+    /// seeded from its Status, refreshed by every BlockRangeUpdate.
+    /// [`EARLIEST_UNKNOWN`] for an eth/68 peer, which announces no range.
+    earliest: Arc<AtomicU64>,
 }
+
+/// [`ManagedPeer::earliest_block`]'s "not announced" (an eth/68 peer).
+const EARLIEST_UNKNOWN: u64 = u64::MAX;
 
 impl ManagedPeer {
     /// Invalidate snapshots too: active oracle Arcs must not keep reads alive.
@@ -427,6 +434,13 @@ impl ManagedPeer {
             },
         )));
 
+        // The same meaning as a BlockRangeUpdate's: u64::MAX reads as pruned, not as "not
+        // announced", and a range that cannot be true (earliest above latest) is not taken.
+        let announced = match (peer_status.earliest_block, peer_status.latest_block) {
+            (Some(e), Some(l)) if e > l => None,
+            (e, _) => e,
+        };
+        let earliest = Arc::new(AtomicU64::new(announced.map_or(EARLIEST_UNKNOWN, |e| e.min(EARLIEST_UNKNOWN - 1))));
         let last_response: SharedLastResponse = Arc::new(std::sync::Mutex::new(None));
         let reader_task = tokio::spawn(read_loop(
             reader,
@@ -440,6 +454,7 @@ impl ManagedPeer {
             tx_watch,
             eth_version,
             Arc::clone(&head),
+            Arc::clone(&earliest),
             anchor,
         ));
 
@@ -462,6 +477,18 @@ impl ManagedPeer {
             snap_codes,
             serve,
             head,
+            earliest,
+        }
+    }
+
+    /// The oldest block the peer says it can serve bodies and receipts for
+    /// (eth/69 `earliestBlock`, as last announced), or `None` for an eth/68
+    /// peer, which announces no range. Deep reads ask peers at or below the
+    /// block first (part 4 of #899).
+    pub fn earliest_block(&self) -> Option<u64> {
+        match self.earliest.load(Ordering::Relaxed) {
+            EARLIEST_UNKNOWN => None,
+            n => Some(n),
         }
     }
 
@@ -1120,6 +1147,7 @@ async fn read_loop(
     tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
     eth_version: u64,
     head: SharedKnownHead,
+    earliest: Arc<AtomicU64>,
     anchor: Option<AnchorSource>,
 ) {
     loop {
@@ -1190,6 +1218,7 @@ async fn read_loop(
                         seen_at: tokio::time::Instant::now(),
                     };
                     *head.lock().unwrap_or_else(|e| e.into_inner()) = Some(observation);
+                    earliest.store(u.earliest.min(EARLIEST_UNKNOWN - 1), Ordering::Relaxed);
                 }
                 Err(e) => tracing::debug!(error = %e.0, "ignoring a malformed BlockRangeUpdate"),
             }

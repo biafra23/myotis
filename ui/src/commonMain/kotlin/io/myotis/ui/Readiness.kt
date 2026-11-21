@@ -25,6 +25,8 @@ internal enum class ReadinessLevel {
     OFFLINE,
     /** No stack registered for this network. */
     STOPPED,
+    /** The checkpoint table and the beacon chain disagree (rule D1): one of the anchors is wrong. */
+    ANCHOR_ALARM,
     /** Peers report a network upgrade this build can't follow, and the node agrees it stopped verifying. */
     UPDATE_REQUIRED,
     /** Parked in STALE_ANCHOR, waiting for the user's consent. */
@@ -94,6 +96,16 @@ internal fun readinessOf(
         if (s == null) "Start the node to verify balances and answer wallet requests."
         else "Starting or stopping — give it a moment.",
         "Node readiness: not running",
+    )
+    // The node's own finding that two trust anchors disagree outranks everything a
+    // running node can show: an update fixes it if the table is wrong, and nothing the
+    // user can decide here does.
+    s.checkpointAlarm != null -> Readiness(
+        ReadinessLevel.ANCHOR_ALARM,
+        "Trust anchors disagree",
+        "The bundled checkpoint table and the beacon chain name different blocks, so one of " +
+            "them is wrong. Reads of old blocks are refused. Update the app, and report it.",
+        "Node readiness: alarm — the checkpoint table and the beacon chain disagree; old blocks are refused",
     )
     // An unsupported upgrade the node's own state corroborates outranks a stale-anchor
     // park: updating the app fixes both (a new build ships a fresh checkpoint too),

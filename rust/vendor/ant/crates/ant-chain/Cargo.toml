@@ -1,0 +1,61 @@
+[package]
+name = "ant-chain"
+version = "0.5.78"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[example]]
+name = "dry_run_wallet"
+path = "examples/dry_run_wallet.rs"
+required-features = ["chain-rpc"]
+
+[dependencies]
+ant-crypto = { path = "../ant-crypto" }
+# OS RNG for CREATE2 salts when deploying a chequebook through
+# the factory. Same version `ant-crypto` pulls so we stay on a
+# single getrandom across the workspace.
+getrandom = "0.3.2"
+hex.workspace = true
+# Used for ECDSA signing keys via the `Wallet` helper. Already a
+# transitive dep through ant-crypto, brought in directly here so the
+# module's signing path stays explicit.
+k256 = { version = "0.13.4", default-features = false, features = ["ecdsa"] }
+# Big-int math for amount-per-chunk × 2^depth and BZZ approval values
+# that overflow u128 (a 17-decimal BZZ token + 24-bit depth combo
+# routinely lands in u256 territory).
+primitive-types = { version = "0.14.0", default-features = false }
+reqwest = { version = "0.12.23", default-features = false, features = [
+  "json",
+  "rustls-tls"
+], optional = true }
+# RLP encoding for raw transactions; tiny no_std-friendly crate so we
+# don't pull in the whole alloy / ethers stack just for one struct.
+rlp = "0.6.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# secp256k1 transaction signing. Bee uses go-ethereum's `crypto.Sign`,
+# which produces a 65-byte (r ‖ s ‖ v) signature with `v ∈ {0, 1}` —
+# the same shape `ant_crypto::sign_handshake_data` already emits, so we
+# don't need a second dependency.
+sha3 = "0.11.0"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+primitive-types = { version = "0.14.0", default-features = false }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+# `chain-rpc` brings in `reqwest` and the `ChainClient` / `Wallet` async
+# methods that drive a JSON-RPC node. Off-by-default for embedders that
+# only need the local-compute helpers (EIP-712 cheque signing,
+# transaction RLP, calldata builders) — `ant-ffi` is the canonical such
+# embedder, since the iOS smoke-test app only downloads chunks and
+# never publishes a tx.
+[features]
+default = ["chain-rpc"]
+chain-rpc = ["dep:reqwest"]
+
+[lints]
+workspace = true

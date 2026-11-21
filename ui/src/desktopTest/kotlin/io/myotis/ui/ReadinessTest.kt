@@ -60,6 +60,20 @@ class ReadinessTest {
     }
 
     @Test
+    fun theCheckpointTableAlarmOutranksEveryRunningState() {
+        val alarm = "checkpoint table alarm: block 26457537 is not the table's top"
+        for (s in listOf(
+            synced(),
+            synced().copy(beaconState = "STALE_ANCHOR", upgrade = scheduledUpgrade().copy(phase = "ACTIVE")),
+        )) {
+            val r = readinessOf(s.copy(checkpointAlarm = alarm), 1)
+            assertEquals(ReadinessLevel.ANCHOR_ALARM, r.level)
+            assertEquals("Trust anchors disagree", r.headline)
+        }
+        assertTrue(readinessOf(synced(), 1).level != ReadinessLevel.ANCHOR_ALARM)
+    }
+
+    @Test
     fun anActiveUpgradeTheNodeCorroboratesOutranksTheStaleAnchor() {
         val r = readinessOf(
             synced().copy(beaconState = "STALE_ANCHOR", upgrade = scheduledUpgrade().copy(phase = "ACTIVE")),

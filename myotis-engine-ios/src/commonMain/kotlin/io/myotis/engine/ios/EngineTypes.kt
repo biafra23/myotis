@@ -160,6 +160,9 @@ data class StatusSnapshot(
     val upgradeAdvisory: UpgradeAdvisory?,
     val dataUsage: DataUsage,
     val networkMetering: NetworkMetering,
+    /** The bundled checkpoint table's alarm (rule D1): every read resting on the table is
+     *  refused, and the host shows why. null = none raised. */
+    val checkpointAlarm: String? = null,
 )
 
 /**

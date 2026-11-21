@@ -69,10 +69,11 @@ class MethodLogger(
         val error: Long = 0,
         val local: Long = 0,
         val simulated: Long = 0,
+        val indexed: Long = 0,
     )
 
     /** Buckets that mean "answered" — anything else counts as an error. */
-    private val ANSWERED = setOf("VERIFIED", "SIMULATED", "PROXY", "LOCAL")
+    private val ANSWERED = setOf("VERIFIED", "SIMULATED", "INDEXED", "PROXY", "LOCAL")
 
     private val mutex = Mutex()
 
@@ -89,7 +90,8 @@ class MethodLogger(
      *   SIMULATED is a call answered over verified state but under CALLER-SUPPLIED
      *   overrides — the state underneath was proven, the answer is not a chain
      *   fact, and lumping it in with VERIFIED would overstate what this node
-     *   proved.
+     *   proved. INDEXED is a page of an index's candidates (`myotis_getAddressHistory`,
+     *   #899): answered, but not verified data.
      * @param latencyMs handling latency in millis (0 when not meaningfully measurable)
      * @param code   the JSON-RPC error code for ERROR outcomes (e.g. -32000), else null
      */
@@ -100,6 +102,7 @@ class MethodLogger(
                 count = s.count + 1,
                 verified = s.verified + if (path == "VERIFIED") 1 else 0,
                 simulated = s.simulated + if (path == "SIMULATED") 1 else 0,
+                indexed = s.indexed + if (path == "INDEXED") 1 else 0,
                 proxied = s.proxied + if (path == "PROXY") 1 else 0,
                 local = s.local + if (path == "LOCAL") 1 else 0,
                 error = s.error + if (path !in ANSWERED) 1 else 0,
@@ -110,13 +113,14 @@ class MethodLogger(
     }
 
     /** Coverage map as a JSON object:
-     *  method -> {count, verified, simulated, proxied, error, local}. */
+     *  method -> {count, verified, simulated, indexed, proxied, error, local}. */
     fun coverage(): JsonObject = buildJsonObject {
         byMethod.entries.sortedBy { it.key }.forEach { (method, s) ->
             put(method, buildJsonObject {
                 put("count", s.count)
                 put("verified", s.verified)
                 put("simulated", s.simulated)
+                put("indexed", s.indexed)
                 put("proxied", s.proxied)
                 put("error", s.error)
                 put("local", s.local)

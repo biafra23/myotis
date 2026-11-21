@@ -165,6 +165,12 @@ impl Engine for Fake {
     fn get_logs(&self, f: &str) -> String {
         self.get("logs", f.into())
     }
+    fn address_history(&self, a: &str, o: &str) -> String {
+        self.get("address_history", format!("{a} {o}"))
+    }
+    fn verify_address_history(&self, a: &str, e: &str) -> String {
+        self.get("verify_address_history", format!("{a} {e}"))
+    }
 }
 
 fn call(r: &Router<Fake>, method: &str, params: Value) -> Value {
@@ -931,6 +937,37 @@ fn get_logs() {
     ));
     assert_eq!(error(&r, "eth_getLogs", json!([filter])).0, -32602);
     assert_eq!(error(&r, "eth_getLogs", json!([])).0, -32602);
+}
+
+#[test]
+fn address_history() {
+    let page = json!({"importer": "0xab", "entries": [{"block": 7, "slot": 1, "roles": ["from"], "state": "unverified"}], "next": null});
+    let r = Router::new(Fake::new().reply("address_history", &page.to_string()));
+    let addr = format!("0x{}", "11".repeat(20));
+    assert_eq!(result(&r, "myotis_getAddressHistory", json!([addr, {"limit": 5}]))["entries"][0]["block"], 7);
+    // The options object reaches the engine as it came; none is an empty one.
+    let seen = calls(&r);
+    assert!(seen.iter().any(|c| c.contains(r#"{"limit":5}"#)), "{seen:?}");
+    let r = Router::new(Fake::new().reply("address_history", &page.to_string()));
+    result(&r, "myotis_getAddressHistory", json!([addr]));
+    assert!(calls(&r).iter().any(|c| c.ends_with(" {})")), "{:?}", calls(&r));
+    // The engine's refusals keep their codes.
+    let r = Router::new(Fake::new().reply("address_history", &json!({"error": "no importer", "code": -32602}).to_string()));
+    assert_eq!(error(&r, "myotis_getAddressHistory", json!([addr])).0, -32602);
+    let r = Router::new(Fake::new().reply("address_history", &json!({"error": "not delivered"}).to_string()));
+    assert_eq!(error(&r, "myotis_getAddressHistory", json!([addr])).0, -32000);
+    // Malformed arguments never reach the engine.
+    assert_eq!(error(&r, "myotis_getAddressHistory", json!([5])).0, -32602);
+    assert_eq!(error(&r, "myotis_getAddressHistory", json!([addr, "x"])).0, -32602);
+    assert_eq!(error(&r, "myotis_getAddressHistory", json!([addr, {}, 1])).0, -32602);
+    assert_eq!(error(&r, "myotis_verifyAddressHistoryEntries", json!([addr, {}])).0, -32602);
+    // The verify call passes the entries array through.
+    let verdicts = json!([{"block": 7, "slot": 1, "roles": ["from"], "state": "verified"}]);
+    let r = Router::new(Fake::new().reply("verify_address_history", &verdicts.to_string()));
+    assert_eq!(
+        result(&r, "myotis_verifyAddressHistoryEntries", json!([addr, [{"block": 7, "slot": 1, "roles": ["from"]}]]))[0]["state"],
+        "verified"
+    );
 }
 
 /// The EIP-155 spec transaction (chainId 1, nonce 9): bytes the send gate

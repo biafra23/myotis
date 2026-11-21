@@ -599,7 +599,8 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
                 rpcServing(),
                 s.upgradeAdvisory(),
                 s.dataUsage(),
-                s.networkMetering());
+                s.networkMetering(),
+                null); // no checkpoint table on this engine
     }
 
     /** A verified read can be served NOW on this engine: SYNCED, a published

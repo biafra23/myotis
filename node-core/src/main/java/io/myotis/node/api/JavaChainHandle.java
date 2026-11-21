@@ -213,7 +213,8 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 // RLPx, discv4 and libp2p bytes; discv5's are not counted on this
                 // engine (docs/how-it-works/data-usage.md).
                 stack.dataUsage(false),
-                io.myotis.engines.common.DataUsageLedger.metering());
+                io.myotis.engines.common.DataUsageLedger.metering(),
+                null); // no checkpoint table on this engine
     }
 
     /** The fork watches' current advisory as the API shape — the EL and CL detectors'

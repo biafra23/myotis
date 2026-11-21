@@ -76,6 +76,11 @@ internal object StatusJson {
             put("todayMeteredBytesOut", u.todayMeteredBytesOut())
         })
         put("networkMetering", s.networkMetering().name)
+        // The checkpoint table's alarm (rule D1): the node's own verified finding that
+        // every read resting on the table is refused, so a wallet sees why. Same position
+        // as the IPC shape's.
+        val alarm = s.checkpointAlarm()
+        if (alarm == null) put("checkpointAlarm", JsonNull) else put("checkpointAlarm", alarm)
     }
 
     /** Mirrors CommandHandler.handleBeaconStatus, incl. its STALE_ANCHOR and

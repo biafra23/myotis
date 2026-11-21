@@ -772,6 +772,7 @@ class IosNodeController(
                 )
             },
             networkMetering = (o["networkMetering"] as? JsonPrimitive)?.takeIf { it.isString }?.content,
+            checkpointAlarm = (o["checkpointAlarm"] as? JsonPrimitive)?.takeIf { it.isString }?.content,
         )
     }
 }

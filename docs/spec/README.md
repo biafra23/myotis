@@ -94,6 +94,18 @@ wrong and the project is pointless** — it becomes just another unverified clie
 3. *(Designed, not yet built in the reference)* **embedded historical accumulators** —
    a pre-Merge epoch-hash accumulator and a post-Merge historical-roots accumulator — for
    verifying deep historical headers. See §10.
+4. **A bundled checkpoint table** (the Rust engine, mainnet so far; owner's decision D1,
+   2026-11-20): the hash of every 1024th block, committed and pinned by keccak256, built by
+   a `parentHash` walk down to the genesis hash. A block at or below the table's top, and
+   below the 512-block window, verifies by hash-linking its headers (at most 1024) up to
+   the first entry at or above it. Until a walk from an attested finalized block has
+   reached the top and found its hash there, such a read rests on the build's cross-check
+   alone. Above the top, a block verifies the same way, but up to a hash the node linked
+   down from an attested finalized block: through anchors 1 and 2, not the table. A walk
+   that finds another hash at the table's top raises an alarm, kept across restarts, that
+   refuses every read resting on the table. The rule:
+   `.claude/agent/data-sources.md` (Trust); the design:
+   [deep-block-verification.md](../ideas/deep-block-verification.md).
 
 **Everything else is derived by verification, never trusted:**
 
@@ -696,7 +708,9 @@ built. A re-implementation should know what's load-bearing vs aspirational.
 - **Historical verification** is limited to a **header-chain walk ≤ 8192 blocks** down from a
   beacon-attested block — the optimistic head for state reads (whose block must also sit above
   finality), the finalized block or the optimistic head for `get-block` — and the JSON-RPC
-  block reads look back at most 512 blocks. The designed-but-unbuilt pieces are:
+  block reads look back at most 512 blocks, except on the Rust engine on mainnet, where a
+  deeper block verifies through the bundled checkpoint table (§2, anchor 4). The
+  designed-but-unbuilt pieces are:
   `historical_summaries`/`historical_roots` lookups from beacon state (to remove the 8192 limit)
   and the **pre-Merge epoch-hash
   accumulator** (`premergeacc.bin`). Pre-Merge blocks currently return `failReason:"preMergeBlock"`.

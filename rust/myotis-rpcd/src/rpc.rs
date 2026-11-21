@@ -117,6 +117,8 @@ fn arity(method: &str) -> Option<usize> {
         "eth_getProof" => 3,
         // transaction, block, state overrides, block overrides
         "eth_call" | "eth_estimateGas" => 4,
+        // address, options / the entries a page returned (#899)
+        "myotis_getAddressHistory" | "myotis_verifyAddressHistoryEntries" => 2,
         _ => return None,
     })
 }
@@ -818,6 +820,44 @@ impl<E: Engine> Router<E> {
                     .filter(|h| h.len() == 32)
                     .ok_or(Fail::Unavailable(None))?;
                 Ok(json_str(&hex_data(&hash)))
+            }
+            // An address's history from the addr1 index on Swarm (#899): candidates, each
+            // "unverified" until myotis_verifyAddressHistoryEntries checked it. The engine
+            // applies every option or refuses (-32602).
+            "myotis_getAddressHistory" | "myotis_verifyAddressHistoryEntries" => {
+                if !self.engine.address_history_supported() {
+                    return Err(Fail::Refused(
+                        "the address history needs the engine built with its Swarm reader".into(),
+                    ));
+                }
+                let Some(address) = params.first().and_then(Value::as_str) else {
+                    return invalid("invalid argument 0: expected the address (0x + 40 hex digits)");
+                };
+                let engine = self.engine_ready(g)?;
+                let out = if method == "myotis_getAddressHistory" {
+                    let opts = match params.get(1) {
+                        None | Some(Value::Null) => "{}".to_string(),
+                        Some(o) if o.is_object() => o.to_string(),
+                        Some(_) => {
+                            return invalid(
+                                "invalid argument 1: expected the options object {cursor, limit, roles, fromBlock, toBlock}",
+                            )
+                        }
+                    };
+                    engine.address_history(address, &opts)
+                } else {
+                    let Some(entries) = params.get(1).filter(|e| e.is_array()) else {
+                        return invalid("invalid argument 1: expected the array of entries a page returned");
+                    };
+                    engine.verify_address_history(address, &entries.to_string())
+                };
+                let parsed: Value = serde_json::from_str(out.trim()).map_err(|_| Fail::Unavailable(None))?;
+                if let Some(err) = parsed.as_object().and_then(|o| o.get("error")) {
+                    let msg = err.as_str().map(str::to_owned).unwrap_or_else(|| err.to_string());
+                    let code = if permanent_code(&parsed) { -32602 } else { -32000 };
+                    return Err(Fail::Rpc { code, message: msg, data: None });
+                }
+                Ok(out.trim().to_string())
             }
             "eth_getLogs" => {
                 // A missing/non-object param is PERMANENTLY malformed.

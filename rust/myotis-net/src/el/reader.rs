@@ -610,6 +610,21 @@ pub struct VerifiedBlock {
     /// what `eth_getRawTransactionByBlock*AndIndex` serves (#715). Empty for a
     /// header-only read. Kept in the wire's compact list, as the body arrived.
     pub raw_transactions: crate::el::eth::messages::RawList,
+    /// The body's withdrawals as they arrived (each an RLP list `[index,
+    /// validatorIndex, address, amount]`), checked against `withdrawalsRoot`;
+    /// `None` before Shanghai and for a header-only read.
+    pub withdrawals: Option<crate::el::eth::messages::RawList>,
+    /// The ommer (uncle) headers as they arrived, each an RLP list, checked against
+    /// `ommersHash`: what `uncles` renders (their hashes). Empty since the Merge and for a
+    /// header-only read.
+    pub ommers: crate::el::eth::messages::RawList,
+}
+
+impl VerifiedBlock {
+    /// The hashes of the block's ommer headers (`uncles`), in body order.
+    pub fn ommer_hashes(&self) -> Vec<[u8; 32]> {
+        self.ommers.iter().map(keccak256).collect()
+    }
 }
 
 /// What a verified block read fetches beyond its anchored header window.
@@ -2172,6 +2187,10 @@ pub struct ElReader {
     /// The chain's id: `ElConfig::network_id`, which equals it on every
     /// network served. A send signed for another chain is refused (#665).
     chain_id: u64,
+    /// Where a by-number read below the 512-block window verifies: the bundled
+    /// checkpoint table and the hashes linked above its top (`el::deep`). Shared with the
+    /// anchor's re-anchor hook, which drops what was linked under the old anchor.
+    deep: Arc<super::deep::DeepAnchors>,
     /// Cross-call EVM caches, shared across every `eth_call` on this reader. Both
     /// hold `stateRoot`-keyed / content-addressed cryptographic facts, so reuse is
     /// sound. Because a call pins to the CURRENT head (whose root advances ~every
@@ -2510,6 +2529,20 @@ impl ElReader {
             Some(path) => crate::el::peercache::ElPeerCache::load(path.clone()),
             None => crate::el::peercache::ElPeerCache::disabled(),
         };
+        // The deep anchors' state sits beside the peer cache, suffixed like it
+        // (`peers-sepolia.cache` → `deep-anchors-sepolia.txt`).
+        let deep_store = cfg.cache_path.as_deref().and_then(super::deep::store_path);
+        let deep = Arc::new(super::deep::DeepAnchors::for_chain(cfg.network_id, deep_store));
+        {
+            // Dropped when the light client is re-anchored, not at the next deep read: that
+            // read may come only after a restart, whose fresh anchor counts from 0 again.
+            let deep = Arc::downgrade(&deep);
+            anchor.on_reanchor(move |count| {
+                if let Some(deep) = deep.upgrade() {
+                    deep.observe_reanchors(count);
+                }
+            });
+        }
         let local_pubkey = key.public_key_bytes();
         let sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch = Arc::new(
             std::sync::Mutex::new(crate::el::sent_tx::SentTxTracker::new()),
@@ -2558,6 +2591,7 @@ impl ElReader {
             min_suggested_tip_wei: cfg.min_suggested_tip_wei,
             block_time: cfg.block_time,
             chain_id: cfg.network_id,
+            deep,
             evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
             evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
             read_stats,
@@ -8240,12 +8274,157 @@ impl ElReader {
         from: u64,
         (head_num, head_hash): (u64, [u8; 32]),
     ) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, PoolReadError> {
-        let top = WindowTop::Head { number: head_num, hash: head_hash };
-        let span = head_num.saturating_sub(from);
+        self.anchored_header_window(from, WindowTop::Head { number: head_num, hash: head_hash })
+            .await
+    }
+
+    /// The top a by-number read at `target_num` verifies against, and the
+    /// window's span: `top` itself within [`BLOCK_LOOKBACK_MAX`]; deeper, for a
+    /// block at or below the finalized block, a deep anchor (`el::deep`): the
+    /// bundled checkpoint table's at or below its top, else a hash linked from
+    /// finality, walking the gap down first (one window of at most 1024
+    /// headers per step) when no linked hash is close enough. Without a table
+    /// for this network, today's refusal. The alarm (a walk that found another
+    /// hash at the table's top) refuses for good, with [`super::deep::ALARM_PREFIX`].
+    async fn deep_window_top(
+        &self,
+        target_num: u64,
+        top: WindowTop,
+    ) -> Result<(WindowTop, u64), PoolReadError> {
+        use super::deep::Plan;
+        let span = top.number() - target_num;
+        if span < BLOCK_LOOKBACK_MAX {
+            return Ok((top, span));
+        }
+        let beyond = || {
+            PoolReadError::Fatal(format!(
+                "block {target_num} is {span} behind {} — beyond the {BLOCK_LOOKBACK_MAX}-block \
+                 verify window",
+                top.kind()
+            ))
+        };
+        const _: () = assert!(BLOCK_LOOKBACK_MAX == 512, "BEYOND_FINALIZED_WINDOW names the cap");
+        // Only a finalized top: a deep read above finality (a long stretch
+        // without it) has no anchor a walk could start from.
+        let WindowTop::Finalized { .. } = top else {
+            return Err(beyond());
+        };
+        // A re-anchor (STALE_ANCHOR) voids what was linked under the old anchor. The hook
+        // drops it when the anchor moves; this catches a reader built after one.
+        let under = self.anchor.reanchors();
+        self.deep.observe_reanchors(under);
+        // The walk starts from the finality as it stands AFTER the count was read, never
+        // from `top`, read before it: a re-anchor drops the old finality before it moves
+        // the count, so a finality read now is the anchor's that `under` names, and a
+        // re-anchor after this line fails the walk's record (`Recorded::Reanchored`).
+        let Some(fin) = self.anchor.finalized_execution() else {
+            return Err(PoolReadError::Fatal(format!(
+                "block {target_num}: no finalized block yet (the light client was re-anchored, \
+                 and its new finality is not known yet); ask again"
+            )));
+        };
+        let (number, hash) = (fin.block_number, fin.block_hash);
+        if number < target_num {
+            return Err(beyond());
+        }
+        loop {
+            match self.deep.plan(target_num, (number, hash)) {
+                None => return Err(beyond()),
+                Some(Plan::Refused) => {
+                    let alarm = self.deep.alarm().unwrap_or_else(|| {
+                        format!("{} raised", super::deep::ALARM_PREFIX)
+                    });
+                    return Err(PoolReadError::Fatal(alarm));
+                }
+                Some(Plan::Anchor { number: a, hash: h }) => {
+                    return Ok((WindowTop::Deep { number: a, hash: h }, a - target_num));
+                }
+                Some(Plan::Walk { from, top: (walk_num, walk_hash) }) => {
+                    // Held on a metered network, as the log-index backfill is
+                    // (docs/ideas/deep-block-verification.md, "What a running
+                    // node adds"): a gap walk can cost megabytes. Retryable:
+                    // it serves once the network is not metered.
+                    if device_metered() {
+                        return Err(PoolReadError::Fatal(format!(
+                            "block {target_num} is above the checkpoint table's top and \
+                             below the {BLOCK_LOOKBACK_MAX}-block window: the walk that \
+                             verifies it is held on a metered network"
+                        )));
+                    }
+                    // One walk at a time: concurrent deep reads in the same
+                    // gap wait for it and then plan again from what it linked.
+                    let _walk = self.deep.walk_lock.lock().await;
+                    if self.deep.plan(target_num, (number, hash))
+                        != Some(Plan::Walk { from, top: (walk_num, walk_hash) })
+                    {
+                        continue;
+                    }
+                    let window = self
+                        .anchored_header_window(
+                            from,
+                            WindowTop::Deep { number: walk_num, hash: walk_hash },
+                        )
+                        .await?;
+                    let linked: Vec<(u64, [u8; 32])> =
+                        window.iter().map(|vh| (vh.header.number, vh.hash)).collect();
+                    match self.deep.record_window_under(&linked, under) {
+                        super::deep::Recorded::Linked => {}
+                        super::deep::Recorded::Alarm(alarm) => return Err(PoolReadError::Fatal(alarm)),
+                        // Linked under the old anchor: nothing kept. Retryable: the
+                        // next read walks under the new one.
+                        super::deep::Recorded::Reanchored => {
+                            return Err(PoolReadError::Fatal(format!(
+                                "block {target_num}: the light client was re-anchored during \
+                                 the walk that verifies it; ask again"
+                            )))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The snap pool's peers a read of block `target` anchored at `top` asks:
+    /// all of them in the pool's order, except at a deep anchor (`el::deep`),
+    /// where [`deep_read_peers`] orders them by what they announce and, for a
+    /// read that fetches bodies or receipts (`bodies`), leaves out the peers
+    /// whose eth/69 `earliestBlock` is above the block. None left fails this
+    /// read (`Fatal`, not retried here); the host answers it with the
+    /// retryable -32000, since a peer holding the block may join the pool.
+    async fn read_peers_for(
+        &self,
+        target: u64,
+        top: WindowTop,
+        bodies: bool,
+    ) -> Result<Vec<std::sync::Arc<ManagedPeer>>, PoolReadError> {
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err(PoolReadError::Fatal("no snap peer available".to_string()));
         }
+        if !matches!(top, WindowTop::Deep { .. }) {
+            return Ok(peers);
+        }
+        let total = peers.len();
+        let peers = deep_read_peers(peers, target, !bodies, |p| p.earliest_block());
+        if peers.is_empty() {
+            return Err(PoolReadError::Fatal(format!(
+                "none of the {total} snap peer(s) announces block {target} \
+                 (eth/69 earliestBlock above it): no archive peer in the pool yet"
+            )));
+        }
+        Ok(peers)
+    }
+
+    /// The verified header window `[from ..= top]` — header only, raced across
+    /// the snap pool as the block reads are and settled the same way
+    /// ([`Self::settle_pool_race`]).
+    async fn anchored_header_window(
+        &self,
+        from: u64,
+        top: WindowTop,
+    ) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, PoolReadError> {
+        let span = top.number().saturating_sub(from);
+        let peers = self.read_peers_for(from, top, false).await?;
         let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
         let out = hedged_race(
             &peers,
@@ -8256,13 +8435,14 @@ impl ElReader {
             |_: &Vec<crate::el::eth::messages::VerifiedHeader>| true,
         )
         .await;
+        let out = excuse_deep_misses(out, top);
         let window = self
             .settle_pool_race(
                 &peers,
                 &coverage,
                 out,
                 (from, span),
-                true,
+                top.is_head(),
                 "a verifiable header window",
                 "verified header window fetch failed against every snap peer",
             )
@@ -8329,23 +8509,16 @@ impl ElReader {
         };
         // The cap bounds the ONE-request window, so it is measured to the
         // window's own top: a finalized read during a long non-finality
-        // stretch is one header, not "far behind the head".
-        let span = top.number() - target_num;
-        if span >= BLOCK_LOOKBACK_MAX {
-            return Err(PoolReadError::Fatal(format!(
-                "block {target_num} is {span} behind {} — beyond the {BLOCK_LOOKBACK_MAX}-block \
-                 verify window",
-                top.kind()
-            )));
-        }
+        // stretch is one header, not "far behind the head". Deeper, a deep
+        // anchor (the checkpoint table, or a hash linked above its top).
+        let (top, span) = self.deep_window_top(target_num, top).await?;
         // Serve over the snap pool (the peer set the reader maintains); a block
         // serve is eth-only (headers + bodies), so this is a superset of what's
         // needed. If eth peers exist but none negotiated snap, this fails closed
         // (Err → -32000), never a false "null". Reputation reuses the snap sinks.
-        let peers = self.pool.snap_peers().await;
-        if peers.is_empty() {
-            return Err(PoolReadError::Fatal("no snap peer available".to_string()));
-        }
+        let peers = self
+            .read_peers_for(target_num, top, matches!(depth, BlockDepth::Body { .. }))
+            .await?;
         // Each peer's coverage of the anchored head, sampled before the race
         // (see pool_race_verdict; consulted only for a head-anchored window).
         let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
@@ -8370,6 +8543,7 @@ impl ElReader {
             |_: &BlockAttempt| true,
         )
         .await;
+        let out = excuse_deep_misses(out, top);
         match self
             .settle_pool_race(
                 &peers,
@@ -8406,13 +8580,14 @@ impl ElReader {
         top: WindowTop,
         depth: BlockDepth,
     ) -> Result<VerifiedBlock, BlockFromError> {
-        // The contiguous forward window [target .. top], in one request. The
-        // caller's BLOCK_LOOKBACK_MAX (512) check bounds this to ~300 KB, within
-        // the eth response soft limit; a peer that caps its response below the
-        // window fails the anchored-window length check and is skipped (fails
-        // closed — the caller tries the next peer), so deep pins carry a slightly
-        // higher liveness risk than a batched fetch would. The common case
-        // (latest / a few blocks back) is one small response.
+        // The contiguous forward window [target .. top]. Anchored at the head or
+        // the finalized block it is one request, bounded by the caller's
+        // BLOCK_LOOKBACK_MAX (512) to ~300 KB, within the eth response soft
+        // limit; a peer that caps its response below it fails the length check
+        // and is skipped (fails closed — the caller tries the next peer). At a
+        // deep anchor (el::deep) it is up to 1024 headers (~0.66 MB), and
+        // fetch_anchored_window asks the same peer again past a response cap.
+        // The common case (latest / a few blocks back) is one small response.
         let window =
             fetch_anchored_window(peer, target_num, top).await.map_err(BlockFromError::Peer)?;
         let vh = &window[0];
@@ -8427,6 +8602,8 @@ impl ElReader {
                     tx_hashes: Vec::new(),
                     full_transactions: None,
                     raw_transactions: crate::el::eth::messages::RawList::new(),
+                    withdrawals: None,
+                    ommers: crate::el::eth::messages::RawList::new(),
                 });
             }
             BlockDepth::Body { full_transactions } => full_transactions,
@@ -8471,6 +8648,8 @@ impl ElReader {
             tx_hashes,
             full_transactions: full,
             raw_transactions: body.transactions,
+            withdrawals: body.withdrawals,
+            ommers: body.ommers,
         })
     }
 
@@ -10184,18 +10363,8 @@ impl ElReader {
         let Some(top) = self.window_top(target_num, (head_num, head_hash)) else {
             return Ok(None); // above the head, not final: future/unknown → eth null
         };
-        let span = top.number() - target_num;
-        if span >= BLOCK_LOOKBACK_MAX {
-            return Err(PoolReadError::Fatal(format!(
-                "block {target_num} is {span} behind {} — beyond the {BLOCK_LOOKBACK_MAX}-block \
-                 verify window",
-                top.kind()
-            )));
-        }
-        let peers = self.pool.snap_peers().await;
-        if peers.is_empty() {
-            return Err(PoolReadError::Fatal("no snap peer available".to_string()));
-        }
+        let (top, span) = self.deep_window_top(target_num, top).await?;
+        let peers = self.read_peers_for(target_num, top, true).await?;
         let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
         // Hedged like get_block_by_number_inner, on the same span-scaled delay
         // and the same deferred-strike settle. It matters at least as much here:
@@ -10211,6 +10380,7 @@ impl ElReader {
             |_: &([u8; 32], Vec<VerifiedReceipt>)| true,
         )
         .await;
+        let out = excuse_deep_misses(out, top);
         self.settle_pool_race(
             &peers,
             &coverage,
@@ -10297,6 +10467,27 @@ impl ElReader {
     fn window_top(&self, target_num: u64, head: (u64, [u8; 32])) -> Option<WindowTop> {
         let fin = self.anchor.finalized_execution().map(|f| (f.block_number, f.block_hash));
         choose_window_top(target_num, head, fin)
+    }
+
+    /// How many times this reader's light client was re-anchored at a STALE_ANCHOR park
+    /// (`ExecAnchor::reanchors`): what was verified under an earlier count rested on an
+    /// anchor since replaced.
+    pub fn reanchors(&self) -> u64 {
+        self.anchor.reanchors()
+    }
+
+    /// What a result verified now rests on (`ExecAnchor::epoch`): unique in the process,
+    /// renewed by every re-anchor and by every sync start. An in-memory cache of verdicts
+    /// keys by it.
+    pub fn anchor_epoch(&self) -> u64 {
+        self.anchor.epoch()
+    }
+
+    /// The checkpoint table's alarm (`el::deep`), once raised: a walk from an
+    /// attested finalized block found another hash at the table's top, and
+    /// every read resting on the table is refused. Kept across restarts.
+    pub fn checkpoint_alarm(&self) -> Option<String> {
+        self.deep.alarm()
     }
 
     /// The beacon-anchored optimistic head `(number, hash)`, or the standard
@@ -10718,6 +10909,12 @@ fn build_one_receipt(
     }
 }
 
+/// The words of a block read's refusal when the block is below the window of the
+/// finalized block and no deep anchor serves it (no table for this network): lasting, no
+/// retry changes it. A read above finality more than 512 blocks below the head (a long
+/// stretch without finality) words its top "the optimistic head" instead and is transient.
+pub const BEYOND_FINALIZED_WINDOW: &str = "behind the finalized block — beyond the 512-block verify window";
+
 /// What a verified header window is anchored at — the block its top must BE —
 /// and so what serving it proves about the peer (`peer::KnownHead`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10732,18 +10929,26 @@ enum WindowTop {
     /// head observation is left alone; and a whole-pool miss on it is a
     /// pruned or lagging pool, never the one-slot race `latest` can lose.
     Finalized { number: u64, hash: [u8; 32] },
+    /// A deep anchor (`el::deep`): a bundled checkpoint table entry or its top,
+    /// or a hash this node linked from a finalized block. As canonical as
+    /// finality; serving it proves only that the peer holds an old block.
+    Deep { number: u64, hash: [u8; 32] },
 }
 
 impl WindowTop {
     fn number(&self) -> u64 {
         match self {
-            WindowTop::Head { number, .. } | WindowTop::Finalized { number, .. } => *number,
+            WindowTop::Head { number, .. }
+            | WindowTop::Finalized { number, .. }
+            | WindowTop::Deep { number, .. } => *number,
         }
     }
 
     fn hash(&self) -> &[u8; 32] {
         match self {
-            WindowTop::Head { hash, .. } | WindowTop::Finalized { hash, .. } => hash,
+            WindowTop::Head { hash, .. }
+            | WindowTop::Finalized { hash, .. }
+            | WindowTop::Deep { hash, .. } => hash,
         }
     }
 
@@ -10754,10 +10959,10 @@ impl WindowTop {
     }
 
     fn kind(&self) -> &'static str {
-        if self.is_head() {
-            "the optimistic head"
-        } else {
-            "the finalized block"
+        match self {
+            WindowTop::Head { .. } => "the optimistic head",
+            WindowTop::Finalized { .. } => "the finalized block",
+            WindowTop::Deep { .. } => "a deep anchor",
         }
     }
 }
@@ -10791,6 +10996,69 @@ fn choose_window_top(
     }
 }
 
+/// Pure: the peers a deep read of `target` asks, in order: the peers that
+/// announce the block (eth/69 `earliestBlock` at or below it) first, then
+/// eth/68 peers, which announce no range, then (only when `keep_pruned`) the
+/// peers that announce a later `earliestBlock`. Within each group the pool's
+/// own ladder order stays (proven servers before unproven, benched last).
+/// `earliestBlock` is about bodies and receipts, so a body or receipts read
+/// leaves the pruned peers out, while a header read (`keep_pruned`) only asks
+/// them last: a pruned peer may still serve old headers. Archive peers are a
+/// minority of the pool (7 of 18 in the survey of
+/// docs/ideas/deep-block-verification.md), so this is what makes a deep body
+/// a matter of asking the right peer.
+fn deep_read_peers<T>(
+    peers: Vec<T>,
+    target: u64,
+    keep_pruned: bool,
+    earliest: impl Fn(&T) -> Option<u64>,
+) -> Vec<T> {
+    let (mut announcing, mut silent, mut pruned) = (Vec::new(), Vec::new(), Vec::new());
+    for p in peers {
+        match earliest(&p) {
+            Some(e) if e <= target => announcing.push(p),
+            None => silent.push(p),
+            Some(_) => pruned.push(p),
+        }
+    }
+    announcing.append(&mut silent);
+    if keep_pruned {
+        announcing.append(&mut pruned);
+    }
+    announcing
+}
+
+/// Pure: whether a deep read's failure is the peer not holding the block (it pruned the
+/// history), not a fault: a short header window, no body, no receipts.
+fn deep_unavailable(error: &str) -> bool {
+    error.contains("headers, expected")
+        || error.contains("peer returned no block body")
+        || error.contains("peer returned no receipts")
+}
+
+/// A deep read's race with its availability misses excused (`deep_unavailable`): for a
+/// block below the window a miss is the normal answer of a peer that pruned history, not a
+/// lagging or lying one, so it earns no strike, bench or eviction. Proof failures (not
+/// hash-linked, over-served, a root mismatch) and silent peers keep theirs. Other tops
+/// pass through unchanged.
+fn excuse_deep_misses<T>(mut out: RaceOutcome<T>, top: WindowTop) -> RaceOutcome<T> {
+    if !matches!(top, WindowTop::Deep { .. }) {
+        return out;
+    }
+    let excused = |i: &usize| {
+        let mut errors = out.errors.iter().filter(|(j, _)| j == i).peekable();
+        errors.peek().is_some() && errors.all(|(_, e)| deep_unavailable(e))
+    };
+    let missed: Vec<usize> = out.missed.iter().copied().filter(|i| !excused(i)).collect();
+    out.missed = missed;
+    out
+}
+
+/// How many more requests a deep window may take from one peer after its
+/// first answer stopped short (a 512-header cap needs one; three covers a
+/// 256-header cap on a 1024-header window).
+const DEEP_WINDOW_EXTRA_REQUESTS: usize = 3;
+
 /// Fetch the contiguous header window `[from ..= top]` from one peer and run
 /// the trust gate every anchored read shares: exact length, the right starting
 /// number, the window top IS the beacon-anchored hash (`top`), and every
@@ -10807,7 +11075,25 @@ async fn fetch_anchored_window(
     let Some(count) = top.number().checked_sub(from).map(|span| span + 1) else {
         return Err(format!("window start {from} is above its anchor {}", top.number()));
     };
-    let window = peer.get_block_headers_by_number(from, count, 0, false).await?;
+    let mut window = peer.get_block_headers_by_number(from, count, 0, false).await?;
+    // A deep window (up to 1024 headers) can meet a peer's response cap: some
+    // clients serve at most 512 headers per request. Ask the same peer for the
+    // rest, from where its answer stopped; the checks below cover the seam
+    // (every header must hash-link to the next). Head and finalized windows
+    // stay one request, so a short one keeps its tip-lag meaning.
+    if matches!(top, WindowTop::Deep { .. }) {
+        for _ in 0..DEEP_WINDOW_EXTRA_REQUESTS {
+            let have = window.len() as u64;
+            if have == 0 || have >= count {
+                break;
+            }
+            let more = peer.get_block_headers_by_number(from + have, count - have, 0, false).await?;
+            if more.is_empty() {
+                break;
+            }
+            window.extend(more);
+        }
+    }
     // Distinct messages on purpose: a SHORT window is tip-lag-shaped (the peer
     // may simply not have imported up to our anchor yet — all_tip_lag matches
     // "headers, expected"), while returning MORE than asked is a protocol
@@ -10924,7 +11210,9 @@ fn build_block_receipts(
 const MIN_GAS_PER_TX: u64 = 1_000;
 
 /// The body half of the per-block trust gate: the fetched transactions must
-/// rebuild the (already anchored) header's `transactionsRoot`. One
+/// rebuild the (already anchored) header's `transactionsRoot`, the ommers list
+/// must hash to its `ommersHash`, and from Shanghai on the withdrawals must
+/// rebuild its `withdrawalsRoot` (the body's shape must match the header's). One
 /// implementation for every consumer (block serve, fee estimate, tx scan,
 /// fee history), so a hardening never has to be applied in four places.
 /// A body with more transactions than the header's gas can pay for fails
@@ -10947,6 +11235,32 @@ fn verify_body_transactions(
             "block {} body does not match the header transactionsRoot",
             header.number
         ));
+    }
+    // The rest of the body is committed to as well (part 4 of #899): the
+    // ommers list by `ommersHash` (empty after the Merge, but checked on every
+    // block), the withdrawals by `withdrawalsRoot` from Shanghai on. A body
+    // whose withdrawals field does not match the header's shape is a mismatch.
+    if body.ommers_hash != header.ommers_hash {
+        return Err(format!(
+            "block {} body does not match the header ommersHash",
+            header.number
+        ));
+    }
+    match (&header.withdrawals_root, &body.withdrawals) {
+        (Some(root), Some(withdrawals)) if triehash::verify(withdrawals.iter(), root) => {}
+        (None, None) => {}
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "block {} body does not match the header withdrawalsRoot",
+                header.number
+            ))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(format!(
+                "block {} body's withdrawals do not match the header's (one has them, the other not)",
+                header.number
+            ))
+        }
     }
     Ok(())
 }
@@ -12117,6 +12431,29 @@ fn decode_ccip_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deep_miss_for_pruned_history_earns_no_strike() {
+        let out = || RaceOutcome::<()> {
+            accepted: None,
+            fallback: None,
+            missed: vec![0, 1, 2, 3],
+            outpaced: vec![],
+            errors: vec![
+                (0, "peer returned 0 headers, expected 449".to_string()),
+                (1, "peer returned no block body".to_string()),
+                (2, "header window is not hash-linked".to_string()),
+                (3, "peer returned no receipts".to_string()),
+                (3, "request timed out".to_string()),
+            ],
+        };
+        let deep = WindowTop::Deep { number: 2048, hash: [1; 32] };
+        // Pruned history is excused; a proof failure and a timeout keep their strikes.
+        assert_eq!(excuse_deep_misses(out(), deep).missed, vec![2, 3]);
+        // Any other top: unchanged.
+        let fin = WindowTop::Finalized { number: 2048, hash: [1; 32] };
+        assert_eq!(excuse_deep_misses(out(), fin).missed, vec![0, 1, 2, 3]);
+    }
     #[test]
     fn backfill_yields_only_while_head_follow_can_close_the_gap() {
         use super::{backfill_should_yield, BACKFILL_YIELD_MAX_TICKS};
@@ -13051,7 +13388,7 @@ mod tests {
         }
 
         fn empty_block(with_body: bool) -> Fetched {
-            let body = BlockBody { transactions: RawList::new(), uncle_count: 0, withdrawal_count: 0 };
+            let body = BlockBody { transactions: RawList::new(), uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() };
             (with_body.then(|| Ok(vec![body])), Ok(Vec::new()))
         }
 
@@ -13103,7 +13440,7 @@ mod tests {
                 ..Default::default()
             };
             let vh = VerifiedHeader { hash: keccak256(&number.to_be_bytes()), raw_rlp: Vec::new(), header };
-            (vh, BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 }, BlockReceipts::Canonical(receipts))
+            (vh, BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() }, BlockReceipts::Canonical(receipts))
         }
 
         fn serve(number: u64, tip: u128, with_body: bool) -> Fetched {
@@ -13425,7 +13762,7 @@ mod tests {
             // not rebuild it is the peer's.
             let mut transactions = RawList::new();
             transactions.push(&[0x7f, 0xc0]);
-            let body = BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 };
+            let body = BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() };
             let mut header = BlockHeader { number: 10, gas_used: 21_000, ..Default::default() };
             header.transactions_root = triehash::ordered_trie_root(body.transactions.iter());
             let err = strict_body_tips(&header, vec![body.clone()]).unwrap_err();
@@ -13502,7 +13839,7 @@ mod tests {
                         Serve::After(delay) => {
                             tokio::time::sleep(delay).await;
                             // `Default` builds the empty list whatever type holds it.
-                            let empty = BlockBody { transactions: Default::default(), uncle_count: 0, withdrawal_count: 0 };
+                            let empty = BlockBody { transactions: Default::default(), uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() };
                             Ok(vec![empty])
                         }
                         Serve::NoBody => Ok(Vec::new()),
@@ -14010,6 +14347,57 @@ mod tests {
     }
 
     #[test]
+    fn deep_reads_ask_the_peers_that_hold_the_block() {
+        // In the pool's ladder order: the pruned peer is its best-ranked one.
+        let peers = vec![("pruned", Some(25_000_000)), ("eth68", None), ("merge", Some(15_537_394)), ("archive", Some(0))];
+        let order = |target, keep_pruned| -> Vec<&str> {
+            deep_read_peers(peers.clone(), target, keep_pruned, |p| p.1).into_iter().map(|p| p.0).collect()
+        };
+        // Bodies: only the peers that announce the block, in ladder order, then eth/68.
+        assert_eq!(order(1_000_000, false), vec!["archive", "eth68"]);
+        assert_eq!(order(20_000_000, false), vec!["merge", "archive", "eth68"]);
+        assert_eq!(order(26_000_000, false), vec!["pruned", "merge", "archive", "eth68"]);
+        // Headers: everyone, the pruned peers last.
+        assert_eq!(order(1_000_000, true), vec!["archive", "eth68", "pruned", "merge"]);
+        let one = |p: &(&str, Option<u64>)| p.1;
+        assert!(deep_read_peers(vec![("pruned", Some(5))], 4, false, one).is_empty());
+        assert_eq!(deep_read_peers(vec![("pruned", Some(5))], 4, true, one).len(), 1);
+    }
+
+    #[test]
+    fn a_body_is_checked_against_ommers_hash_and_withdrawals_root() {
+        use crate::el::eth::messages::{BlockBody, RawList, EMPTY_OMMERS_HASH};
+        let mut withdrawals = RawList::new();
+        withdrawals.push(&[0xc4, 0x01, 0x02, 0x03, 0x04]);
+        let root = triehash::ordered_trie_root(withdrawals.iter());
+        let header = BlockHeader {
+            number: 9,
+            transactions_root: EMPTY_TRIE_ROOT,
+            ommers_hash: EMPTY_OMMERS_HASH,
+            withdrawals_root: Some(root),
+            ..Default::default()
+        };
+        let body = |ommers_hash, withdrawals| BlockBody {
+            transactions: RawList::new(),
+            uncle_count: 0,
+            withdrawal_count: 0,
+            ommers_hash,
+            withdrawals,
+            ommers: Default::default(),
+        };
+        assert!(verify_body_transactions(&header, &body(EMPTY_OMMERS_HASH, Some(withdrawals.clone()))).is_ok());
+        let err = verify_body_transactions(&header, &body([7; 32], Some(withdrawals.clone()))).unwrap_err();
+        assert!(err.contains("ommersHash"), "{err}");
+        let err = verify_body_transactions(&header, &body(EMPTY_OMMERS_HASH, Some(RawList::new()))).unwrap_err();
+        assert!(err.contains("withdrawalsRoot"), "{err}");
+        let err = verify_body_transactions(&header, &body(EMPTY_OMMERS_HASH, None)).unwrap_err();
+        assert!(err.contains("withdrawals"), "{err}");
+        let pre_shanghai = BlockHeader { withdrawals_root: None, ..header.clone() };
+        assert!(verify_body_transactions(&pre_shanghai, &body(EMPTY_OMMERS_HASH, None)).is_ok());
+        assert!(verify_body_transactions(&pre_shanghai, &body(EMPTY_OMMERS_HASH, Some(withdrawals))).is_err());
+    }
+
+    #[test]
     fn a_body_with_more_transactions_than_its_gas_pays_for_fails_before_the_trie() {
         use crate::el::eth::messages::{BlockBody, RawList};
         let body = |n: usize| {
@@ -14017,7 +14405,7 @@ mod tests {
             for _ in 0..n {
                 transactions.push(&[0x01]);
             }
-            BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 }
+            BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() }
         };
         let mut header = BlockHeader { number: 7, gas_used: 3 * MIN_GAS_PER_TX, ..Default::default() };
         header.transactions_root = triehash::ordered_trie_root(body(3).transactions.iter());
@@ -16426,7 +16814,7 @@ mod candidate_chunk_tests {
         Block {
             vh: VerifiedHeader { hash: [number as u8; 32], raw_rlp: Vec::new(), header },
             receipts: BlockReceipts::Canonical(receipts),
-            body: BlockBody { transactions, uncle_count: 0, withdrawal_count: 0 },
+            body: BlockBody { transactions, uncle_count: 0, withdrawal_count: 0, ommers_hash: BlockHeader::default().ommers_hash, withdrawals: None, ommers: Default::default() },
         }
     }
 

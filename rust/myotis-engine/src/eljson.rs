@@ -27,6 +27,11 @@ const MAX_HEADER_CHAIN_GAP: i64 = 8192;
 /// side turns into an `EngineException` (distinct from a verification failure,
 /// which is a full result with `failReason` set).
 pub fn error_json(message: &str) -> String {
+    // The checkpoint table's alarm refuses for good (.claude/agent/data-sources.md,
+    // Trust): whichever read it reaches through, it is the permanent envelope.
+    if message.starts_with(myotis_net::el::deep::ALARM_PREFIX) {
+        return invalid_params_json(message);
+    }
     let mut obj = serde_json::Map::new();
     obj.insert("error".into(), message.into());
     serde_json::Value::Object(obj).to_string()
@@ -199,7 +204,7 @@ pub fn code_json(
 }
 
 /// Serialize a verified block to the `eth_getBlockByNumber` JSON — transactions as
-/// hashes, `uncles` always empty (a verified header serve). Mirrors the Java
+/// hashes, `uncles` the hashes of the verified ommer headers. Mirrors the Java
 /// `VerifiedRpcBackend.buildBlockJson` field set and QUANTITY encoding exactly.
 /// Hand-built (not serde) so the shape is the pinned cross-language contract.
 pub fn block_json(b: &VerifiedBlock) -> String {
@@ -288,7 +293,18 @@ pub fn block_json(b: &VerifiedBlock) -> String {
             }
         }
     }
-    s.push_str("],\"uncles\":[]}");
+    // The ommers' hashes, from the body verified against `sha3Uncles` (empty since the
+    // Merge, and for a header-only serve).
+    s.push_str("],\"uncles\":[");
+    for (i, hash) in b.ommer_hashes().iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('"');
+        s.push_str(&hex0x(hash));
+        s.push('"');
+    }
+    s.push_str("]}");
     s
 }
 
@@ -1651,6 +1667,11 @@ mod tests {
     fn error_json_shape() {
         let v: serde_json::Value = serde_json::from_str(&error_json("no snap peer")).unwrap();
         assert_eq!(v["error"], "no snap peer");
+        assert!(v.get("code").is_none(), "retryable: no code");
+        // The checkpoint table's alarm is permanent, whichever read it reaches through.
+        let alarm = format!("{} block 1 is not the top", myotis_net::el::deep::ALARM_PREFIX);
+        let v: serde_json::Value = serde_json::from_str(&error_json(&alarm)).unwrap();
+        assert_eq!(v["code"], INVALID_PARAMS);
     }
 
     #[test]
@@ -2138,6 +2159,8 @@ mod tests {
             tx_hashes: vec![[0xa1; 32], [0xb2; 32]],
             full_transactions: None,
             raw_transactions: Default::default(),
+            withdrawals: None,
+            ommers: Default::default(),
         }
     }
 
@@ -2289,6 +2312,12 @@ mod tests {
         assert_eq!(v["transactions"][0], hex0x(&[0xa1; 32]));
         assert_eq!(v["transactions"][1], hex0x(&[0xb2; 32]));
         assert!(v["uncles"].as_array().unwrap().is_empty());
+        // A pre-Merge block with an ommer lists its hash.
+        let mut b = sample_block();
+        let ommer = vec![0xc3, 0x01, 0x02, 0x03];
+        b.ommers.push(&ommer);
+        let v: serde_json::Value = serde_json::from_str(&block_json(&b)).unwrap();
+        assert_eq!(v["uncles"], serde_json::json!([hex0x(&myotis_core::keccak::keccak256(&ommer))]));
     }
 
     #[test]

@@ -8,8 +8,17 @@ rust/testdata/**/*.txt text eol=lf
 rust/testdata/**/*.bin binary
 rust/testdata/**/*.rlp binary
 rust/testdata/**/*.ssz binary
+rust/testdata/**/*.export binary
 
 # Shell scripts are run by bash on every platform, Git Bash on Windows
 # included (rust/repro-env.sh is sourced by the Windows legs; Gradle runs
 # rust/build-android.sh), and bash does not read `then\r` as a keyword (#734).
 *.sh text eol=lf
+
+# Vendored third-party sources (rust/vendor/ant/VENDORED.md) stay byte for byte upstream's
+# on every platform: no line-ending conversion, so scripts/vendor_ant.sh --check compares
+# like with like and include_str! embeds the same bytes everywhere. linguist-vendored keeps
+# them out of the repository's language statistics.
+rust/vendor/** -text linguist-vendored
+rust/myotis-core/checkpoints/*.hashes binary
+rust/myotis-core/checkpoints/*.json text eol=lf

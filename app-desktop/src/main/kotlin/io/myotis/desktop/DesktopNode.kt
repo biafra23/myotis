@@ -966,6 +966,7 @@ class DesktopNodeController(
                 )
             },
             networkMetering = s.networkMetering().name,
+            checkpointAlarm = s.checkpointAlarm(),
         )
     }
 

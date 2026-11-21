@@ -1,10 +1,13 @@
 # Cargo.lock freshness for every lock in the tree.
 #
-# Three locks exist under rust/ because tor-poc and roost are deliberately NOT
-# workspace members (rust/Cargo.toml `exclude`), so each resolves its own graph:
-#   rust/Cargo.lock          the engine workspace
-#   rust/roost/Cargo.lock    the light-client server
-#   rust/tor-poc/Cargo.lock  the Tor proof-of-concept
+# Four locks exist under rust/ because tor-poc, roost and swarm are
+# deliberately NOT workspace members (rust/Cargo.toml `exclude`), so each
+# resolves its own graph:
+#   rust/Cargo.lock               the engine workspace
+#   rust/roost/Cargo.lock         the light-client server
+#   rust/tor-poc/Cargo.lock       the Tor proof-of-concept
+#   rust/swarm/Cargo.lock         the embedded Swarm node (crate myotis-swarm),
+#                                 seeded from rust/Cargo.lock
 # plus the Rust tour's workbook (docs/tour/workbook), a standalone crate whose
 # solution/Cargo.lock is checked here and whose starter/ is generated from
 # solution/ by make_starter.py — `--check` fails if the two differ, lock
@@ -22,12 +25,12 @@
 # "the lock file … needs to be updated but --locked was passed" for a missing
 # edge, a missing package or a wrong version. (`cargo metadata --locked` would
 # do the same check but has to read every dependency's manifest, i.e. download
-# and unpack the whole graph — ~1 GB across the three, mostly tor-poc's Arti
+# and unpack the whole graph — ~1 GB across the four, mostly tor-poc's Arti
 # tree, which rust/Cargo.toml says must never burden CI.)
 #
 # Trigger shape as the other workflows: push scoped to main + release tags so a
 # branch push with an open PR runs once (under pull_request), and tags so a
-# release's three locks are checked together, tor-poc's included.
+# release's four locks are checked together, tor-poc's included.
 name: cargo locks
 
 on:
@@ -68,7 +71,7 @@ jobs:
         run: |
           set -eu
           for manifest in rust/Cargo.toml rust/roost/Cargo.toml rust/tor-poc/Cargo.toml \
-                          docs/tour/workbook/solution/Cargo.toml; do
+                          rust/swarm/Cargo.toml docs/tour/workbook/solution/Cargo.toml; do
             echo "== $manifest"
             cargo update --workspace --locked --manifest-path "$manifest"
           done
@@ -112,12 +115,29 @@ jobs:
         run: |
           set -eu
           fail=0
-          for lock in rust/Cargo.lock rust/roost/Cargo.lock rust/tor-poc/Cargo.lock; do
+          for lock in rust/Cargo.lock rust/roost/Cargo.lock rust/tor-poc/Cargo.lock rust/swarm/Cargo.lock; do
             versions=$(awk '/^\[\[package\]\]/{n=""} /^name = /{n=$3} /^version = /{if (n=="\"k256\"") print $3}' "$lock" | tr -d '"' | sort -u)
             count=$(printf '%s\n' "$versions" | grep -c . || true)
             echo "$lock: k256 $(echo ${versions:-none})"
             if [ "$count" -gt 1 ]; then
               echo "::error file=$lock::$lock holds $count k256 versions ($(echo $versions)). An upstream crate moved to a new k256 line: lift the k256 AND libp2p holds in .github/dependabot.yml together, and move myotis-core's pin, discv5 and libp2p to that line, so there is one copy again."
+              fail=1
+            fi
+          done
+          exit $fail
+      # No lock may name a git source: every cold build would fetch that repository,
+      # and its bytes have no registry checksum (claude-review of #892). A crate that is
+      # not on crates.io is vendored under rust/vendor instead, as ant is
+      # (rust/vendor/ant/VENDORED.md, scripts/vendor_ant.sh). That answers the fetch and
+      # the checksum, not advisories: such a crate has no advisory coverage either way.
+      - name: No git sources in any lock
+        run: |
+          set -eu
+          fail=0
+          for lock in rust/Cargo.lock rust/roost/Cargo.lock rust/tor-poc/Cargo.lock \
+                      rust/swarm/Cargo.lock docs/tour/workbook/solution/Cargo.lock; do
+            if grep -n '^source = "git+' "$lock"; then
+              echo "::error file=$lock::$lock names a git source. Vendor the crate under rust/vendor instead (rust/vendor/ant/VENDORED.md)."
               fail=1
             fi
           done

@@ -478,7 +478,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
             long wsBoundPeriods,
             UpgradeAdvisory upgradeAdvisory,
             DataUsage dataUsage,
-            NetworkMetering networkMetering) {
+            NetworkMetering networkMetering,
+            String checkpointAlarm) {
 
         /** {@code beaconState} tolerant of a NEWER .so than this wrapper: an
          *  unrecognized value maps to STARTING (not-ready, fail closed) instead of
@@ -539,7 +540,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                         // advisory: absent or malformed → NONE / UNKNOWN, never
                         // a "malformed status" failure.
                         parseDataUsage(o.get("dataUsage")),
-                        meteringOf(o.get("networkMetering")));
+                        meteringOf(o.get("networkMetering")),
+                        // ABI >= 60: the checkpoint table's alarm, a string or null.
+                        // Anything else is no alarm the engine raised: null.
+                        alarmOf(o.get("checkpointAlarm")));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -549,7 +553,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
                     0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L, null,
-                    DataUsage.NONE, NetworkMetering.UNKNOWN);
+                    DataUsage.NONE, NetworkMetering.UNKNOWN, null);
+        }
+
+        /** The status JSON's {@code checkpointAlarm}: its text, or null when absent, null
+         *  or not a string. */
+        static String alarmOf(JsonValue v) {
+            return v != null && v.isString() ? v.asString() : null;
         }
 
         /** The nested {@code dataUsage} object → the API record; absent, null or
@@ -715,7 +725,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 rpcServing(),
                 s.upgradeAdvisory(),
                 s.dataUsage(),
-                s.networkMetering());
+                s.networkMetering(),
+                s.checkpointAlarm());
     }
 
     @Override
@@ -1591,6 +1602,20 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return RustEngineNative.nativeAddressActivityJson(handle, afterBlock);
     }
 
+    /** The address history (#899): the native answer as it came — a page, the retryable
+     *  {@code {"error"}}, or the permanent {@code {"error","code":-32602}} — after the wake
+     *  gate (a page reads the chain's verified head, a verify reads blocks). */
+    String addressHistoryJson(String address, String optionsJson) {
+        // A build without the reader refuses at once: no wake for a call that can only fail.
+        if (!RustEngineNative.nativeAddressHistorySupported()) return io.myotis.api.VerifiedReads.ADDRESS_HISTORY_REFUSED;
+        return gated(() -> RustEngineNative.nativeAddressHistoryJson(handle, address, optionsJson));
+    }
+
+    String verifyAddressHistoryJson(String address, String entriesJson) {
+        if (!RustEngineNative.nativeAddressHistorySupported()) return io.myotis.api.VerifiedReads.ADDRESS_HISTORY_REFUSED;
+        return gated(() -> RustEngineNative.nativeVerifyAddressHistoryJson(handle, address, entriesJson));
+    }
+
     /** Read-fetch shadow-cache counters ({"error":...} when the gate is down).
      *  NOT gated(), for the same status-probe reasons as logIndexStatusJson. */
     @Override
@@ -1640,6 +1665,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                     "malformed blockReceipts JSON from the Rust engine: " + e.getMessage(), e);
         }
         if (v.isArray()) return json; // the verified receipts array
+        if (v.isObject() && permanentRefusal(v.asObject())) return json; // for the router
         if (v.isObject()) {
             var error = v.asObject().get("error");
             if (error != null && !error.isNull()) {
@@ -1649,9 +1675,21 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         throw new EngineException("blockReceipts JSON is neither an array nor an error object");
     }
 
-    /** Package-private test seam: native block payload → block JSON | "null" | throw. */
+    /** Package-private test seam: native block payload → block JSON | "null" | the
+     *  permanent {@code {"error","code":-32602}} envelope (passed through for the router,
+     *  as {@link #rawTransactionByBlockJson}'s is: the checkpoint table's alarm, #899) |
+     *  throw. */
     static String blockJsonOrThrow(String json) {
-        return jsonObjectOrThrow(json, "block");
+        return jsonObjectOrThrow(json, "block", true);
+    }
+
+    /** Whether {@code o} is the engine's permanent refusal {@code {"error","code":-32602}},
+     *  which the router answers with -32602 instead of the retryable -32000. */
+    private static boolean permanentRefusal(JsonObject o) {
+        var error = o.get("error");
+        var code = o.get("code");
+        return o.size() == 2 && error != null && !error.isNull()
+                && code != null && code.isNumber() && code.asInt() == -32602;
     }
 
     /** Package-private test seam: native tx payload → tx JSON | "null" | throw. */
@@ -1668,6 +1706,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      *  {@code "null"} literal (a VERIFIED eth-null) passes through, an {@code error}
      *  object / blank / malformed payload throws {@link EngineException}. */
     private static String jsonObjectOrThrow(String json, String what) {
+        return jsonObjectOrThrow(json, what, false);
+    }
+
+    /** {@link #jsonObjectOrThrow(String, String)}, passing the permanent refusal
+     *  envelope through when {@code passRefusal}. */
+    private static String jsonObjectOrThrow(String json, String what, boolean passRefusal) {
         if (json == null || json.isBlank()) {
             throw new EngineException(
                     "blank " + what + " JSON from the Rust engine (native failure?)");
@@ -1682,6 +1726,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
             throw new EngineException(
                     "malformed " + what + " JSON from the Rust engine: " + e.getMessage(), e);
         }
+        if (passRefusal && permanentRefusal(o)) return json;
         var error = o.get("error");
         if (error != null && !error.isNull()) {
             throw new EngineException(error.isString() ? error.asString() : error.toString());
