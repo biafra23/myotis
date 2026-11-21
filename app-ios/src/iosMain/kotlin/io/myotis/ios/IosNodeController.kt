@@ -3,6 +3,8 @@ package io.myotis.ios
 import io.myotis.engine.ios.RustEngine
 import io.myotis.jsonrpc.MyotisRpcServer
 import io.myotis.ui.AccountResult
+import io.myotis.ui.BlockLookupResult
+import io.myotis.ui.blockLookupFromRpcJson
 import io.myotis.ui.CacheFileStats
 import io.myotis.ui.DataUsageRow
 import io.myotis.ui.ENS_CONTENTHASH_KEY
@@ -610,6 +612,20 @@ class IosNodeController(
             IosRpcBackend(chainId = 0L) { handle }.callDetailed(null, toBytes, dataBytes, null, "latest", null)
         }
         return EthCallResult.of(r.kind.name, r.data, r.detail)
+    }
+
+    override val supportsBlockLookup: Boolean get() = true
+
+    // The Query tab's block lookup by height. The Rust engine has no fetch-at-any-height
+    // operator query (getBlockVerified is a Java-engine one), so this is its verified
+    // eth_getBlockByNumber read through IosRpcBackend, as JSON-RPC serves it — near-head
+    // blocks only (BlockLookup.kt).
+    override suspend fun requestBlock(network: String, number: Long): BlockLookupResult {
+        val handle = handleOrThrow(network)
+        val json = withContext(Dispatchers.IO) {
+            IosRpcBackend(chainId = 0L) { handle }.getBlockByNumber("0x" + number.toString(16), false)
+        }
+        return blockLookupFromRpcJson(number, json)
     }
 
     private fun canonical(name: String): String = RustEngine.canonicalNetworkName(name) ?: name

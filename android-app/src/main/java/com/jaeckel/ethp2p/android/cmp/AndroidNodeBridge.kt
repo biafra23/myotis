@@ -7,7 +7,13 @@ import android.net.NetworkCapabilities
 import com.jaeckel.ethp2p.android.AndroidQueryHistory
 import com.jaeckel.ethp2p.android.BalanceWatchRunner
 import com.jaeckel.ethp2p.android.NodeService
+import io.myotis.api.BlockResult
+import io.myotis.api.EngineException
 import io.myotis.ui.AccountResult
+import io.myotis.ui.BLOCK_PATH_VERIFIED_FETCH
+import io.myotis.ui.BlockLookupResult
+import io.myotis.ui.blockLookupFromRpcJson
+import io.myotis.ui.isOperatorQueryRefusal
 import io.myotis.ui.DataUsageRow
 import io.myotis.ui.EnsOwnership
 import io.myotis.ui.EnsProfile
@@ -259,6 +265,24 @@ class AndroidNodeController(
         val r = withContext(NonCancellable) { future.await() }
         currentCoroutineContext().ensureActive()
         return EthCallResult.of(r.status().name, r.data(), r.detail(), r.blockNumber())
+    }
+
+    override val supportsBlockLookup: Boolean get() = true
+
+    // The Query tab's block lookup by height: the Java engine fetches the block at any height
+    // and verifies it; the Rust engine refuses that operator query (EngineException), so fall
+    // back to its verified eth_getBlockByNumber read, which answers near the head only
+    // (BlockLookup.kt). await() rethrows the engine's own exception, not a CompletionException.
+    override suspend fun requestBlock(network: String, number: Long): BlockLookupResult {
+        val svc = serviceProvider() ?: throw IllegalStateException("Node is not running")
+        return try {
+            svc.getBlockVerified(network, number).await().toLookup(number)
+        } catch (e: EngineException) {
+            // Only the Rust engine's "not available" refusal falls back; a Java engine
+            // that is not running or did not wake reports that, not an RPC-path miss.
+            if (!isOperatorQueryRefusal(e.message)) throw e
+            blockLookupFromRpcJson(number, svc.getBlockByNumberJson(network, number).await())
+        }
     }
 
     // TrueBlocks transaction history (Query tab add-on). The service builds the scan at
@@ -527,3 +551,20 @@ class AndroidQueryHistoryAdapter(ctx: Context) : QueryHistory {
     override fun add(input: String, label: String) = impl.add(input, label)
     override fun clear() = impl.clear()
 }
+
+/**
+ * The engine API's verified block fetch of block [requested] as the Query tab's block
+ * lookup. A failed fetch zeroes every record field, its number too — hence [requested].
+ */
+private fun BlockResult.toLookup(requested: Long): BlockLookupResult =
+    if (error() != null) {
+        BlockLookupResult.failed(requested, BLOCK_PATH_VERIFIED_FETCH, error())
+    } else {
+        BlockLookupResult(
+            number(), hashHex(), parentHashHex(), stateRootHex(), transactionsRootHex(), receiptsRootHex(),
+            timestamp(), gasUsed(), gasLimit(), baseFeePerGasWei(),
+            transactionCount(), uncleCount(), withdrawalCount(),
+            verified = beaconChainVerified(), blsVerified = blsVerified(), matchedBeaconSlot = matchedBeaconSlot(),
+            verifyMethod = verifyMethod(), failReason = failReason(), error = null, path = BLOCK_PATH_VERIFIED_FETCH,
+        )
+    }
