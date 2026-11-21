@@ -24,10 +24,11 @@ Comparison of the [architecture document](architecture-doc.md) against what is a
 
 - Header-chain verification up to 8,192 blocks from the beacon-attested block (walk parent hashes) — both engines (`verify.rs`, `VerifiedAccountQuery`).
 - Block verification against the beacon `ExecutionPayloadHeader.block_hash` works.
+- The Rust engine on mainnet verifies a block below the 512-block window through the bundled checkpoint table (the hash of every 1024th block, `rust/myotis-core/checkpoints/`; #899): its headers hash-link up to the next entry, or above the table's top up to a hash the node linked from finality. Deep bodies and receipts come from the peers whose eth/69 `earliestBlock` covers the block.
 - The Rust log index walks parent hashes **without** a depth limit for its own purposes — the backfill descends from a beacon-anchored trust cursor to a contract's deployment block, and its head-gap bridge spans up to 500,000 blocks — but that anchors logs, not arbitrary block reads (§11).
 
 **Not implemented:**
-- `historical_summaries` / `historical_roots` lookup from beacon state (would remove the 8,192-block header-chain bound; note the JSON-RPC block reads are capped at 512 blocks below the head before that bound is ever reached).
+- `historical_summaries` / `historical_roots` lookup from beacon state (would remove the 8,192-block header-chain bound; note the JSON-RPC block reads are capped at 512 blocks below the head before that bound is ever reached, except through the checkpoint table above).
 - The pre-Merge epoch-hash accumulator — the README's trust-model section still lists it as a designed anchor; no code uses it.
 - Pre-merge blocks return `failReason: "preMergeBlock"` with no verification path.
 

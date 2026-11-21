@@ -17,9 +17,11 @@ The rule this rests on is the carve-out for Swarm reads of the address index in
   checks. Swarm is transport only. Each entry is still a *candidate*, `"unverified"`.
 - **Each entry verified on request.** `myotis_verifyAddressHistoryEntries` checks the entries a
   host shows, by role, against a verified block and its verified receipts, fetched over devp2p.
-  Deep blocks verify through the bundled checkpoint table (the D1 rule). The answer per entry
+  Deep blocks verify through the bundled checkpoint table (the D1 rule), which covers mainnet
+  only so far. The answer per entry
   is `verified`, `contradicted`, `unverified` or `unavailable`. A verified transaction entry
-  carries its hash, sender, recipient and value. A final verdict is kept, and later pages show
+  carries its hash, sender, recipient and value. A final verdict is kept in the node's memory
+  (up to 50,000, dropped on a restart, a re-anchor or the table's alarm), and later pages show
   it.
 - **What stays on the importer's word.** The list's *completeness* (an entry left out) and its
   `TRACE` entries. The answer names the importer key it rests on, and every block range the
@@ -28,7 +30,8 @@ The rule this rests on is the carve-out for Swarm reads of the address index in
 ## Building with the reader
 
 ```bash
-# The daemon and the desktop app: link ant into the host library.
+# The JVM daemon: link ant into the host library (the desktop app gets it too, but has no
+# way to take the settings yet).
 ./gradlew :app:run -PswarmEngine -Pengine=rust -PaddressHistoryConfig=<settings file>
 
 # The Rust JSON-RPC daemon.
@@ -93,11 +96,15 @@ index plus one. A page is never read at an older head than its cursor's.
 
 ### `myotis_verifyAddressHistoryEntries(address, entries)`
 
-Up to 50 entries, as a page returned them. Each comes back with its `state`, `final`, the block
-hash it was checked in, the roles `confirmed` / `contradicted` / `unchecked`, and for a
-transaction its `txHash`, `from`, `to`, `value` and the first ERC-20/721 `transfer` the
-address is a party of. `unavailable` comes with a `reason`: ask again. A call takes at most
-90 s, newest blocks first.
+Up to 50 entries, as a page returned them. A checked entry comes back with its `state`,
+`final`, the block hash it was checked in, the roles `confirmed` / `contradicted` /
+`unchecked`, and for a transaction its `txHash`, `from`, `to`, `value` and the first
+ERC-20/721 `transfer` the address is a party of. An entry that could not be checked carries
+only its `state` and a `reason`: `unavailable` when the block or its receipts could not be
+read now (ask again), `unverified` when the node cannot anchor the block or the checkpoint
+table's alarm is raised (asking again does not help). The table covers mainnet only: on the
+other networks an entry below the 512-block window comes back `unverified` this way. A call
+takes at most 90 s, newest blocks first.
 
 ### The daemon's IPC
 
@@ -106,6 +113,9 @@ address is a party of. `unavailable` comes with a `reason`: ask again. A call ta
 ./gradlew :app:run -Pargs='verify-address-history 0x<address> [{"block":…,"slot":…,"roles":["from"]}]'
 ```
 
+`-Pargs` is split on whitespace, so the JSON must have none: send entries back with only
+`block`, `slot` and `roles` (an `unavailable` entry's `reason` has spaces).
+
 ## Checking it end to end
 
 With an index on a Swarm network the node can reach (a local bee-factory holding an export, or
@@ -113,8 +123,10 @@ Swarm mainnet):
 
 1. Start a reader build with the settings: `myotis-rpcd … --address-history-config <file>`, or
    the daemon with `-PswarmEngine -PaddressHistoryConfig=<file>`.
-2. Wait for `beacon-status` `"SYNCED"` (the head gap and the verify call need a verified head).
+2. Wait for the beacon to be `SYNCED` (`beacon-status` on the daemon, `GET /` →
+   `beacon=SYNCED` on `myotis-rpcd`): the head gap and the verify call need a verified head.
 3. Read a busy address's newest page, and one with a `toBlock` deep below the head.
 4. Pass each page's `entries` to the verify call. Entries of finalized blocks should come back
-   `verified` and `final`, each with its `txHash`. Deep ones verify through the checkpoint
+   `verified` and `final`, each with its `txHash` (an entry whose only role is `trace` stays
+   `unverified`: that role rests on the importer). Deep ones verify through the checkpoint
    table, which takes about a second or a few per block.

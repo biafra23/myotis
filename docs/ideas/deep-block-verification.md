@@ -1,6 +1,10 @@
 # Verifying any historical block: a checkpoint table and a header walk
 
-Status: **analysis and measurements — nothing here is built.** The measurements
+Status: **built on `feature/swarm-addr1`** (#899): the mainnet table
+(`rust/myotis-core/checkpoints/`), deep block and receipt reads through it and the gap
+walk above its top (`rust/myotis-net/src/el/deep.rs`), archive peers by `earliestBlock`;
+the rule is `.claude/agent/data-sources.md` (Trust). What follows is the analysis it was
+built from, and "Today" below describes the state before it. The measurements
 were taken on 2026-11-16 against mainnet with `myotis-rpcd`; the deep-block
 probe behind §[Are deep blocks available?](#are-deep-blocks-available) was a
 local, unverified throwaway build that was never committed. Whether a bundled
