@@ -198,6 +198,9 @@ public class CommandHandler {
                 + ",\"lastWakeReason\":" + wakeReason
                 + ",\"dataUsage\":" + buildDataUsageJson(s.dataUsage())
                 + ",\"networkMetering\":\"" + s.networkMetering() + "\""
+                // The checkpoint table's alarm (rule D1), or null: mirrored by myotis_status.
+                + ",\"checkpointAlarm\":" + (s.checkpointAlarm() == null ? "null"
+                        : "\"" + escapeJson(s.checkpointAlarm()) + "\"")
                 + ",\"upgradeAdvisory\":" + buildUpgradeAdvisoryJson(s.upgradeAdvisory()) + "}";
     }
 

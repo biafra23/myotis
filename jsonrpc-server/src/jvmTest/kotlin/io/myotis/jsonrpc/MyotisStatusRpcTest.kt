@@ -83,6 +83,7 @@ class MyotisStatusRpcTest {
         /* upgradeAdvisory */ UpgradeAdvisory(UpgradePhase.ACTIVE, 1_791_294_816L, "0x6c1d9423", 3),
         /* dataUsage */ DataUsage(40, 6, 10, 2, 30, 4, "2026-10-20", 400, 60, 100, 9),
         /* networkMetering */ NetworkMetering.METERED,
+        /* checkpointAlarm */ "checkpoint table alarm: \"x\"",
     )
 
     private fun beaconStatus(
@@ -123,7 +124,8 @@ class MyotisStatusRpcTest {
                 """"lastPauseEpochMs":111,"lastResumeEpochMs":222,"lastWakeReason":"REQUEST",""" +
                 """"dataUsage":{"bytesIn":40,"bytesOut":6,"elBytesIn":10,"elBytesOut":2,"clBytesIn":30,""" +
                 """"clBytesOut":4,"day":"2026-10-20","todayBytesIn":400,"todayBytesOut":60,""" +
-                """"todayMeteredBytesIn":100,"todayMeteredBytesOut":9},"networkMetering":"METERED"}""",
+                """"todayMeteredBytesIn":100,"todayMeteredBytesOut":9},"networkMetering":"METERED",""" +
+                """"checkpointAlarm":"checkpoint table alarm: \"x\""}""",
             encode(StatusJson.status(statusSnapshot(), 42L)),
         )
     }

@@ -233,8 +233,11 @@ pub fn check(
     }
     let index = slot as usize - 1;
     let Some(raw) = block.raw_transactions.iter().nth(index) else {
-        // No such transaction in the verified body: every role is contradicted.
-        for bit in [role::FROM, role::TO, role::EMITTER, role::TOPIC, role::WORD, role::AUTH, role::BLOCK] {
+        // No such transaction in the verified body: every role is contradicted, TRACE too
+        // (a slot above 0 is a transaction's index + 1; block-level traces sit at slot 0),
+        // so the answer names the importer key a wrong entry came from.
+        c.unchecked &= !role::TRACE;
+        for bit in [role::FROM, role::TO, role::EMITTER, role::TOPIC, role::WORD, role::AUTH, role::BLOCK, role::TRACE] {
             mark(&mut c, bit, Some(false));
         }
         return finish(c);
@@ -417,8 +420,10 @@ mod tests {
         // A wrong sender is contradicted; TRACE alone is unverified.
         assert_eq!(check(&to, 1, role::FROM, &block, None).state, State::Contradicted);
         assert_eq!(check(&to, 1, role::TRACE, &block, None).state, State::Unverified);
-        // A slot beyond the block's transactions contradicts every role.
+        // A slot beyond the block's transactions contradicts every role, TRACE too.
         assert_eq!(check(&sender, 2, role::FROM, &block, None).state, State::Contradicted);
+        let c = check(&sender, 2, role::TRACE, &block, None);
+        assert_eq!((c.state, c.contradicted, c.unchecked), (State::Contradicted, role::TRACE, 0));
     }
 
     #[test]

@@ -795,6 +795,11 @@ data class NodeSnapshot(
     // NetworkMetering name: METERED / UNMETERED / UNKNOWN), Status "Connection"
     // row — a debugging aid. null = the host doesn't report it.
     val networkMetering: String? = null,
+    // The bundled checkpoint table's alarm (the API's StatusSnapshot.checkpointAlarm, rule
+    // D1): a walk from an attested finalized block found another hash at the table's top,
+    // so the table or the beacon anchor is wrong, and every read resting on the table is
+    // refused. Kept across restarts. null = none raised.
+    val checkpointAlarm: String? = null,
 )
 
 /** One network's data usage, as the hosts map it from the engine API's `DataUsage`. */

@@ -203,7 +203,15 @@ impl ExecAnchor {
     /// here, in the sync loop, so what rested on the old anchor is dropped when it moves,
     /// not at the next read that would notice: that read may come only after a restart,
     /// whose fresh anchor counts from 0 again.
+    ///
+    /// Fails closed: the finality, the heads and the roots the old anchor fed are dropped
+    /// FIRST, before the count and the epoch move, so a reader that sees the new count or
+    /// epoch never sees the old anchor's finality. Reads answer "not synced" until the
+    /// bootstrap from the fresh root feeds new ones.
     pub fn note_reanchor(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            *inner = Inner::default();
+        }
         let count = self.reanchors.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         self.epoch.store(next_epoch(), std::sync::atomic::Ordering::SeqCst);
         if let Ok(hooks) = self.reanchor_hooks.lock() {
@@ -748,10 +756,16 @@ mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let s = std::sync::Arc::clone(&seen);
         a.on_reanchor(move |n| s.lock().unwrap().push(n));
+        // A finality and a head the old anchor fed: dropped with it, before the count moves.
+        a.update_finalized(64, [3; 32], 10, [1; 32], 1_000);
+        a.update_optimistic(96, 11, [4; 32], [1; 32], [5; 32], 1_012);
+        assert!(a.finalized_execution().is_some() && a.optimistic_head().is_some());
         let first = a.epoch();
         a.note_reanchor();
         a.note_reanchor();
         assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+        assert_eq!(a.optimistic_head(), None);
+        assert!(a.finalized_execution().is_none());
         assert_eq!(a.reanchors(), 2);
         assert_ne!(a.epoch(), first);
         // A fresh anchor (a later sync start) counts from 0 again, but never repeats an epoch.

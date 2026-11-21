@@ -24,6 +24,7 @@ internal object StatusColors {
         ReadinessLevel.SLEEPING -> Grey
         ReadinessLevel.OFFLINE,
         ReadinessLevel.STOPPED,
+        ReadinessLevel.ANCHOR_ALARM,
         ReadinessLevel.UPDATE_REQUIRED,
         ReadinessLevel.NEEDS_DECISION,
         ReadinessLevel.SYNCING -> Red

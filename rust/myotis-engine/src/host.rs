@@ -4255,8 +4255,9 @@ fn status_object(
         },
     );
     // The checkpoint table's alarm: null, or why every read resting on the
-    // bundled table is refused (.claude/agent/data-sources.md, Trust). Older
-    // wrappers ignore the unknown key.
+    // bundled table is refused (.claude/agent/data-sources.md, Trust). The
+    // wrappers carry it to the API's StatusSnapshot.checkpointAlarm, which every
+    // host shows (the readiness ladder's ANCHOR_ALARM), and to myotis_status.
     obj.insert(
         "checkpointAlarm".into(),
         el.checkpoint_alarm.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),

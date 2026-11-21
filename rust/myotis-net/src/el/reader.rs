@@ -8306,13 +8306,27 @@ impl ElReader {
         const _: () = assert!(BLOCK_LOOKBACK_MAX == 512, "BEYOND_FINALIZED_WINDOW names the cap");
         // Only a finalized top: a deep read above finality (a long stretch
         // without it) has no anchor a walk could start from.
-        let WindowTop::Finalized { number, hash } = top else {
+        let WindowTop::Finalized { .. } = top else {
             return Err(beyond());
         };
         // A re-anchor (STALE_ANCHOR) voids what was linked under the old anchor. The hook
         // drops it when the anchor moves; this catches a reader built after one.
         let under = self.anchor.reanchors();
         self.deep.observe_reanchors(under);
+        // The walk starts from the finality as it stands AFTER the count was read, never
+        // from `top`, read before it: a re-anchor drops the old finality before it moves
+        // the count, so a finality read now is the anchor's that `under` names, and a
+        // re-anchor after this line fails the walk's record (`Recorded::Reanchored`).
+        let Some(fin) = self.anchor.finalized_execution() else {
+            return Err(PoolReadError::Fatal(format!(
+                "block {target_num}: no finalized block yet (the light client was re-anchored, \
+                 and its new finality is not known yet); ask again"
+            )));
+        };
+        let (number, hash) = (fin.block_number, fin.block_hash);
+        if number < target_num {
+            return Err(beyond());
+        }
         loop {
             match self.deep.plan(target_num, (number, hash)) {
                 None => return Err(beyond()),

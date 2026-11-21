@@ -478,7 +478,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
             long wsBoundPeriods,
             UpgradeAdvisory upgradeAdvisory,
             DataUsage dataUsage,
-            NetworkMetering networkMetering) {
+            NetworkMetering networkMetering,
+            String checkpointAlarm) {
 
         /** {@code beaconState} tolerant of a NEWER .so than this wrapper: an
          *  unrecognized value maps to STARTING (not-ready, fail closed) instead of
@@ -539,7 +540,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                         // advisory: absent or malformed → NONE / UNKNOWN, never
                         // a "malformed status" failure.
                         parseDataUsage(o.get("dataUsage")),
-                        meteringOf(o.get("networkMetering")));
+                        meteringOf(o.get("networkMetering")),
+                        // ABI >= 60: the checkpoint table's alarm, a string or null.
+                        // Anything else is no alarm the engine raised: null.
+                        alarmOf(o.get("checkpointAlarm")));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -549,7 +553,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
                     0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L, null,
-                    DataUsage.NONE, NetworkMetering.UNKNOWN);
+                    DataUsage.NONE, NetworkMetering.UNKNOWN, null);
+        }
+
+        /** The status JSON's {@code checkpointAlarm}: its text, or null when absent, null
+         *  or not a string. */
+        static String alarmOf(JsonValue v) {
+            return v != null && v.isString() ? v.asString() : null;
         }
 
         /** The nested {@code dataUsage} object → the API record; absent, null or
@@ -715,7 +725,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 rpcServing(),
                 s.upgradeAdvisory(),
                 s.dataUsage(),
-                s.networkMetering());
+                s.networkMetering(),
+                s.checkpointAlarm());
     }
 
     @Override

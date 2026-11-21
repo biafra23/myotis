@@ -72,6 +72,14 @@ import java.util.List;
  * @param networkMetering       the device network's metering as the host last reported
  *                              it ({@link MyotisEngine#setNetworkMetering}); engine-wide,
  *                              shown for debugging. Never null
+ * @param checkpointAlarm       the bundled checkpoint table's alarm (rule D1,
+ *                              {@code .claude/agent/data-sources.md}): a walk from an
+ *                              attested finalized block found another hash at the table's
+ *                              top, so the table or the beacon anchor is wrong, and every
+ *                              read resting on the table is refused ({@code -32602}).
+ *                              Kept across restarts; hosts show it. The node's own
+ *                              verified finding, not peer data. null = none raised, or an
+ *                              engine without the table (Java, Go)
  */
 public record StatusSnapshot(
         boolean running,
@@ -115,5 +123,6 @@ public record StatusSnapshot(
         boolean rpcServing,
         UpgradeAdvisory upgradeAdvisory,
         DataUsage dataUsage,
-        NetworkMetering networkMetering) {
+        NetworkMetering networkMetering,
+        String checkpointAlarm) {
 }

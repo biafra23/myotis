@@ -447,6 +447,7 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     },
     dataUsage = dataUsage().toRow(),
     networkMetering = networkMetering().name,
+    checkpointAlarm = checkpointAlarm(),
 )
 
 /** The API's [io.myotis.api.DataUsage] as the Status rows' [DataUsageRow]. */

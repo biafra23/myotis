@@ -92,6 +92,8 @@ internal object EngineDecoding {
         val upgradeAdvisory: UpgradeAdvisory?,
         val dataUsage: DataUsage,
         val networkMetering: NetworkMetering,
+        /** The checkpoint table's alarm (rule D1), or null: ABI >= 60. */
+        val checkpointAlarm: String? = null,
     ) {
         /** A verified read can be served now: SYNCED, an anchored optimistic head, and a
          *  pooled snap peer that can answer at it ([snapServingPeers], never the pooled
@@ -146,6 +148,8 @@ internal object EngineDecoding {
                 // NONE / UNKNOWN, never a failed status read.
                 dataUsage = dataUsage(o["dataUsage"]),
                 networkMetering = metering(o["networkMetering"]),
+                // ABI >= 60: a string, or no alarm the engine raised.
+                checkpointAlarm = (o["checkpointAlarm"] as? JsonPrimitive)?.takeIf { it.isString }?.content,
             )
         }
     }
@@ -200,6 +204,7 @@ internal object EngineDecoding {
             upgradeAdvisory = s.upgradeAdvisory,
             dataUsage = s.dataUsage,
             networkMetering = s.networkMetering,
+            checkpointAlarm = s.checkpointAlarm,
         )
     }
 

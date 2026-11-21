@@ -122,7 +122,10 @@ impl DeepAnchors {
     pub(crate) fn observe_reanchors(&self, reanchors: u64) {
         let text = {
             let Ok(mut state) = self.state.lock() else { return };
-            if state.reanchors_seen == reanchors {
+            // One reader's count only grows (it and its anchor are paired in
+            // `ElReader::start`): a count not above the one held is a late call, which must
+            // not reopen what the hook closed.
+            if reanchors <= state.reanchors_seen {
                 return;
             }
             tracing::warn!(reanchors, "re-anchored: the hashes linked under the old anchor are dropped");
