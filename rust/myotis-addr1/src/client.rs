@@ -293,7 +293,8 @@ impl<'a, S: ChunkSource> Index<'a, S> {
         reference: [u8; 32],
         before: (u64, u32),
         limit: usize,
-        filter: &Filter,
+        filter: &(dyn Fn(&Entry) -> bool + Sync),
+        from_block: u64,
     ) -> ReadResult<Vec<Entry>> {
         let root = FileChunk::decode_root(&self.cac(reference, "spill").await?, &reference, MAX_SPAN)?;
         let pages = root.span().div_ceil(PAGE_SIZE as u64);
@@ -339,9 +340,9 @@ impl<'a, S: ChunkSource> Index<'a, S> {
             if let Some(newer) = &newer {
                 check_page_boundary(&entries, newer)?;
             }
-            out.extend(entries.iter().rev().filter(|e| key(e) < before && filter.keeps(e)));
+            out.extend(entries.iter().rev().filter(|e| key(e) < before && filter(e)));
             // Older pages hold only older entries: none of them in the range.
-            if out.len() >= limit || i == 0 || entries[0].block < filter.from_block {
+            if out.len() >= limit || i == 0 || entries[0].block < from_block {
                 break;
             }
             newer = Some(entries);
@@ -369,17 +370,20 @@ impl<'a, S: ChunkSource> Index<'a, S> {
         let Some(found) = self.in_slice(address, &slice).await? else {
             return Ok(None);
         };
-        let mut here: Vec<Entry> = found
-            .entries
-            .iter()
-            .copied()
-            .filter(|e| key(e) < before && plan.keep(e.block) && filter.keeps(e))
-            .collect();
+        // The roles filter applies to an entry as merged from every record of its key (an
+        // inline record and a spill file can name one appearance with other roles): the
+        // inline records are taken whole, a spill entry when its roles match or an inline
+        // record shares its key, and the filter runs after the merge.
+        let in_range = |e: &Entry| key(e) < before && plan.keep(e.block) && e.block >= filter.from_block;
+        let mut here: Vec<Entry> = found.entries.iter().copied().filter(|e| in_range(e)).collect();
+        let inline_keys: std::collections::HashSet<(u64, u32)> = here.iter().map(key).collect();
+        let (roles, from) = (filter.roles, filter.from_block);
+        let pick = move |e: &Entry| e.block >= from && (e.roles & roles != 0 || inline_keys.contains(&key(e)));
         for (reference, _count) in &found.spill_files {
-            let spilled = self.spill_newest(&slice, *reference, before, want, filter).await?;
+            let spilled = self.spill_newest(&slice, *reference, before, want, &pick, filter.from_block).await?;
             here.extend(spilled.into_iter().filter(|e| plan.keep(e.block)));
         }
-        Ok(Some(merge_by_key(here)))
+        Ok(Some(merge_by_key(here).into_iter().filter(|e| e.roles & roles != 0).collect()))
     }
 
     /// A page of `address`'s entries at `head`: up to `limit` that `filter` keeps, newest
@@ -506,7 +510,7 @@ mod tests {
         let index = Index::new(&map, 1, [0; 20]);
         let newest: Vec<Entry> = entries.iter().rev().copied().collect();
         // No cursor: the newest entries.
-        let got = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10, &Filter::default())).unwrap();
+        let got = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10, &|_: &Entry| true, 0)).unwrap();
         assert_eq!(got, newest[..10]);
         // A cursor anywhere, and on either side of a page boundary: the entries below it.
         let firsts: Vec<usize> = {
@@ -528,12 +532,12 @@ mod tests {
                 }
                 let before = key(&entries[at]);
                 let want: Vec<Entry> = entries[..at].iter().rev().take(25).copied().collect();
-                let got = block_on(index.spill_newest(&slice, root, before, 25, &Filter::default())).unwrap();
+                let got = block_on(index.spill_newest(&slice, root, before, 25, &|_: &Entry| true, 0)).unwrap();
                 assert_eq!(got, want, "cursor at entry {at}");
             }
         }
         // Everything, from the newest down.
-        let all = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10_000, &Filter::default())).unwrap();
+        let all = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10_000, &|_: &Entry| true, 0)).unwrap();
         assert_eq!(all, newest);
     }
 
@@ -549,10 +553,10 @@ mod tests {
         partial.remove(&leaf_ref);
         let partial = Map(partial);
         let index = Index::new(&partial, 1, [0; 20]);
-        let r = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10_000, &Filter::default()));
+        let r = block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10_000, &|_: &Entry| true, 0));
         assert!(matches!(r, Err(ReadError::Unavailable(_))), "{r:?}");
         // The newest pages above it still read.
-        assert!(block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10, &Filter::default())).is_ok());
+        assert!(block_on(index.spill_newest(&slice, root, (u64::MAX, u32::MAX), 10, &|_: &Entry| true, 0)).is_ok());
     }
 
     fn block_on<F: Future>(f: F) -> F::Output {

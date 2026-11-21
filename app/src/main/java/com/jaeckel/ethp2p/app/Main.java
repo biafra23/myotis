@@ -237,19 +237,6 @@ public final class Main {
         // can serve, Java fallback; `./gradlew :app:run -Pengine=java` passes it through;
         // `go` is the desktop-only Go engine, explicit choice only).
         MyotisEngine engine = Engines.engine();
-        // -Dmyotis.addressHistory.config=<file> (Gradle: -PaddressHistoryConfig): the address
-        // history's settings (#899; the importer key and the Swarm network), applied once.
-        // A refusal stops the daemon rather than leaving the setting silently unapplied.
-        String historyConfig = System.getProperty("myotis.addressHistory.config");
-        if (historyConfig != null && !historyConfig.isBlank()) {
-            String json = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(historyConfig)),
-                    java.nio.charset.StandardCharsets.UTF_8);
-            String answer = engine.setAddressHistoryConfigJson(json);
-            if (!"{}".equals(answer == null ? null : answer.trim())) {
-                throw new IllegalStateException("the address history settings in " + historyConfig
-                        + " were refused: " + answer);
-            }
-        }
 
         // Client commands / purge target a single network — the first listed. Canonicalize
         // aliases (xdai/gbc → gnosis) so the client targets the SAME socket the daemon
@@ -309,12 +296,38 @@ public final class Main {
                 System.exit(1);
             }
         }
+        applyAddressHistoryConfig(engine);
         runDaemon(engine, canonical, port);
     }
 
     // -------------------------------------------------------------------------
     // Daemon
     // -------------------------------------------------------------------------
+
+    /**
+     * -Dmyotis.addressHistory.config=&lt;file&gt; (Gradle: -PaddressHistoryConfig): the address
+     * history's settings (#899; the importer key and the Swarm network), applied once, in
+     * daemon mode only. A refusal or an unreadable file stops the daemon with a message,
+     * never a daemon running with the setting silently unapplied.
+     */
+    private static void applyAddressHistoryConfig(MyotisEngine engine) {
+        String file = System.getProperty("myotis.addressHistory.config");
+        if (file == null || file.isBlank()) return;
+        String json;
+        try {
+            json = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(file)),
+                    java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            System.err.println("-Dmyotis.addressHistory.config: cannot read " + file + ": " + e.getMessage());
+            System.exit(2);
+            return;
+        }
+        String answer = engine.setAddressHistoryConfigJson(json);
+        if (!"{}".equals(answer == null ? null : answer.trim())) {
+            System.err.println("-Dmyotis.addressHistory.config: the settings in " + file + " were refused: " + answer);
+            System.exit(2);
+        }
+    }
 
     private static void runDaemon(MyotisEngine engine, List<String> networks, int portOverride)
             throws Exception {

@@ -217,6 +217,10 @@ final class RustEngineNative {
      * usage (docs/how-it-works/data-usage.md): 0 unknown, 1 unmetered, 2 metered. False, and
      * nothing recorded, for any other code. Process-global, not per-handle.
      */
+    static boolean nativeSetNetworkMetering(int code) {
+        return Myotis_engineKt.setNetworkMetering(code);
+    }
+
     /** A page of an address's history (ABI 60, #899). */
     static String nativeAddressHistoryJson(long handle, String address, String optionsJson) {
         return Myotis_engineKt.addressHistoryJson(handle, nz(address), nz(optionsJson));
@@ -230,10 +234,6 @@ final class RustEngineNative {
     /** The address history's settings, engine-wide (ABI 60, #899). */
     static String nativeSetAddressHistoryConfigJson(String configJson) {
         return Myotis_engineKt.setAddressHistoryConfigJson(nz(configJson));
-    }
-
-    static boolean nativeSetNetworkMetering(int code) {
-        return Myotis_engineKt.setNetworkMetering(code);
     }
 
     /** The metering code last recorded (0 until a host reports one). */

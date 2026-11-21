@@ -383,11 +383,11 @@ public final class SelectorEngine implements MyotisEngine {
         return java.networkMetering();
     }
 
-    /** The address history's settings (#899): only the Rust engine has the reader, so they go
-     *  to it; without it, the refusal every other engine answers. */
+    /** The address history's settings (#899): to the engine this selector serves chains
+     *  with now ({@link #resolve()}), so a Java or Go choice gets that engine's refusal,
+     *  never a Rust engine that serves nothing accepting them. */
     @Override
     public String setAddressHistoryConfigJson(String configJson) {
-        if (RustMyotisEngine.isAvailable()) return rustEngine().setAddressHistoryConfigJson(configJson);
-        return java.setAddressHistoryConfigJson(configJson);
+        return resolve().setAddressHistoryConfigJson(configJson);
     }
 }

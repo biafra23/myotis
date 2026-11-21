@@ -395,16 +395,33 @@ fn page_json(
     // The gaps of the range asked (`fromBlock ..= toBlock`, the whole chain by default) the
     // index does not cover: above its last block up to the head (open while the node has no
     // verified head), and below its first block.
-    let head_gap = match (opts.to_block, chain_head) {
-        (Some(t), _) if t <= p.to_block => None,
-        (Some(t), Some(h)) => Some(serde_json::json!({"fromBlock": p.to_block + 1, "toBlock": t.min(h)})).filter(|_| h > p.to_block),
-        (None, Some(h)) if h > p.to_block => Some(serde_json::json!({"fromBlock": p.to_block + 1, "toBlock": h})),
-        (None, Some(_)) => None,
-        // No verified head yet: the gap above the index is open, never "none".
-        (_, None) => Some(serde_json::json!({"fromBlock": p.to_block + 1, "toBlock": opts.to_block})),
+    // Every gap is clipped to the range asked; one that ends up empty is not named.
+    let lo = opts.from_block;
+    let head_gap = {
+        let from = (p.to_block + 1).max(lo);
+        match (opts.to_block, chain_head) {
+            (Some(t), Some(h)) => {
+                let to = t.min(h);
+                (from <= to).then(|| serde_json::json!({"fromBlock": from, "toBlock": to}))
+            }
+            (None, Some(h)) => (from <= h).then(|| serde_json::json!({"fromBlock": from, "toBlock": h})),
+            // No verified head yet: the gap above the index is open, never "none".
+            (Some(t), None) => (from <= t).then(|| serde_json::json!({"fromBlock": from, "toBlock": t})),
+            (None, None) => Some(serde_json::json!({"fromBlock": from, "toBlock": null})),
+        }
     };
-    let tail_gap = (p.from_block > opts.from_block)
-        .then(|| serde_json::json!({"fromBlock": opts.from_block, "toBlock": p.from_block - 1}));
+    let tail_gap = {
+        let to = p.from_block.checked_sub(1).map(|t| opts.to_block.map_or(t, |hi| t.min(hi)));
+        to.filter(|to| lo <= *to).map(|to| serde_json::json!({"fromBlock": lo, "toBlock": to}))
+    };
+    let gaps: Vec<serde_json::Value> = p
+        .gaps
+        .iter()
+        .filter_map(|g| {
+            let (from, to) = (g.from_block.max(lo), opts.to_block.map_or(g.to_block, |hi| g.to_block.min(hi)));
+            (from <= to).then(|| serde_json::json!({"fromBlock": from, "toBlock": to}))
+        })
+        .collect();
     serde_json::json!({
         "importer": hex(&importer),
         "headUpdate": read.head_update,
@@ -415,7 +432,7 @@ fn page_json(
         "fromBlock": opts.from_block,
         "toBlock": opts.to_block,
         "roles": role_names(opts.roles),
-        "gaps": p.gaps.iter().map(|g| serde_json::json!({"fromBlock": g.from_block, "toBlock": g.to_block})).collect::<Vec<_>>(),
+        "gaps": gaps,
         // Each entry with its state so far: what an earlier verify call found for it, else
         // "unverified".
         "entries": p.entries.iter().map(|e| {
@@ -1104,6 +1121,16 @@ mod tests {
         // Below it: the tail gap starts at fromBlock.
         let v = render(r#"{"fromBlock":10000}"#, Some(200_000));
         assert_eq!((v["tailGap"]["fromBlock"].as_u64(), v["tailGap"]["toBlock"].as_u64()), (Some(10_000), Some(63_999)));
+        // Wholly below the index: the tail gap ends at toBlock, and no head gap.
+        let v = render(r#"{"fromBlock":10,"toBlock":100}"#, Some(200_000));
+        assert_eq!(v["tailGap"]["toBlock"], 100);
+        assert!(v["headGap"].is_null(), "{v}");
+        // Wholly above it: the head gap starts at fromBlock, and no tail gap.
+        let v = render(r#"{"fromBlock":150000}"#, Some(200_000));
+        assert_eq!(v["headGap"]["fromBlock"], 150_000);
+        assert!(v["tailGap"].is_null(), "{v}");
+        // Above the head: nothing to name.
+        assert!(render(r#"{"fromBlock":300000}"#, Some(200_000))["headGap"].is_null());
         assert_eq!(v["roles"].as_array().unwrap().len(), 8);
     }
 

@@ -63,7 +63,7 @@ public interface MyotisEngine {
     NetworkMetering networkMetering();
 
     /**
-     * The address history's settings, engine-wide (#899; {@link ChainHandle#addressHistoryJson}):
+     * The address history's settings, engine-wide (#899; {@link VerifiedReads#addressHistoryJson}):
      * {@code {"importer": "0x…" | null, "swarm": {"network": "mainnet"} | {"network": "dev",
      * "networkId": N, "bootnodes": ["/ip4/…", …]}}}. The importer key is an experimental setting:
      * the user trusts that importer for the list's completeness. Applied whole ({@code "{}"})
