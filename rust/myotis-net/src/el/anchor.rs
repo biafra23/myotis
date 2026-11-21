@@ -169,6 +169,21 @@ pub struct ExecAnchor {
     /// STALE_ANCHOR park (the sync loop's `reanchor`): the deep anchors (`el::deep`) drop
     /// what they linked under the old anchor when it moves.
     reanchors: std::sync::atomic::AtomicU64,
+    /// This anchor's epoch ([`Self::epoch`]): unique in the process, renewed by every
+    /// re-anchor.
+    epoch: std::sync::atomic::AtomicU64,
+    /// Called with the new count by [`Self::note_reanchor`] ([`Self::on_reanchor`]).
+    reanchor_hooks: Mutex<Vec<ReanchorHook>>,
+}
+
+/// A hook [`ExecAnchor::note_reanchor`] runs with the new count.
+type ReanchorHook = Box<dyn Fn(u64) + Send + Sync>;
+
+/// The next anchor epoch: one counter for the whole process, so an anchor created by a
+/// later sync start (a pause and resume) never repeats an earlier anchor's epoch.
+fn next_epoch() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
 impl Default for ExecAnchor {
@@ -177,19 +192,45 @@ impl Default for ExecAnchor {
             inner: Mutex::new(Inner::default()),
             pending_changed: tokio::sync::Notify::new(),
             reanchors: std::sync::atomic::AtomicU64::new(0),
+            epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+            reanchor_hooks: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl ExecAnchor {
-    /// The light client was re-anchored on a fresh checkpoint (STALE_ANCHOR).
+    /// The light client was re-anchored on a fresh checkpoint (STALE_ANCHOR). The hooks run
+    /// here, in the sync loop, so what rested on the old anchor is dropped when it moves,
+    /// not at the next read that would notice: that read may come only after a restart,
+    /// whose fresh anchor counts from 0 again.
     pub fn note_reanchor(&self) {
-        self.reanchors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let count = self.reanchors.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.epoch.store(next_epoch(), std::sync::atomic::Ordering::SeqCst);
+        if let Ok(hooks) = self.reanchor_hooks.lock() {
+            for hook in hooks.iter() {
+                hook(count);
+            }
+        }
+    }
+
+    /// Run `hook` with the new count at every [`Self::note_reanchor`].
+    pub fn on_reanchor(&self, hook: impl Fn(u64) + Send + Sync + 'static) {
+        if let Ok(mut hooks) = self.reanchor_hooks.lock() {
+            hooks.push(Box::new(hook));
+        }
     }
 
     /// How many times [`Self::note_reanchor`] was called.
     pub fn reanchors(&self) -> u64 {
         self.reanchors.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// What a result verified under this anchor rests on: unique in the process, and renewed
+    /// by every re-anchor. Unlike [`Self::reanchors`], it never repeats when a later sync
+    /// start creates a fresh anchor, so an in-memory cache keyed by it cannot match a
+    /// verdict computed under an anchor since replaced.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn new() -> ExecAnchor {
@@ -700,6 +741,24 @@ fn push_root(roots: &mut VecDeque<SlottedStateRoot>, slot: u64, state_root: [u8;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reanchor_runs_the_hooks_and_renews_the_epoch() {
+        let a = ExecAnchor::new();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = std::sync::Arc::clone(&seen);
+        a.on_reanchor(move |n| s.lock().unwrap().push(n));
+        let first = a.epoch();
+        a.note_reanchor();
+        a.note_reanchor();
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+        assert_eq!(a.reanchors(), 2);
+        assert_ne!(a.epoch(), first);
+        // A fresh anchor (a later sync start) counts from 0 again, but never repeats an epoch.
+        let b = ExecAnchor::new();
+        assert_eq!(b.reanchors(), 0);
+        assert!(b.epoch() != first && b.epoch() != a.epoch());
+    }
 
     fn root(n: u8) -> [u8; 32] {
         let mut r = [0u8; 32];

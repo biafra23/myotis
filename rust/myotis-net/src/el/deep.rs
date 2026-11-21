@@ -10,7 +10,7 @@
 //! - **Above the top (the gap since the table's build):** a hash this node linked itself from
 //!   an attested finalized block. [`DeepAnchors::plan`] names the anchor when one is close
 //!   enough, else the next window to walk down from the lowest linked hash above `n`. Each
-//!   verified window is recorded with [`DeepAnchors::record_window`], which keeps every
+//!   verified window is recorded with [`DeepAnchors::record_window_under`], which keeps every
 //!   1024th block's hash and the window's bottom. The gap closes lazily, only as far down as
 //!   a read needs.
 //! - **The alarm:** a recorded window that covers the table's top must carry the top's hash.
@@ -37,6 +37,17 @@ pub(crate) const K: u64 = CheckpointTable::K;
 /// The start of every refusal the alarm causes. The engine's hosts answer an error that
 /// starts with it with the permanent `-32602`, not the retryable `-32000`.
 pub const ALARM_PREFIX: &str = "checkpoint table alarm:";
+
+/// What [`DeepAnchors::record_window_under`] did with a window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Recorded {
+    /// Its hashes are linked (and the top checked, if the window covers it).
+    Linked,
+    /// It covers the table's top with another hash: the alarm, raised now.
+    Alarm(String),
+    /// The light client was re-anchored during the walk: nothing recorded.
+    Reanchored,
+}
 
 /// What a deep read at `n` needs next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +115,10 @@ impl DeepAnchors {
 
     /// The light client's re-anchor count is `reanchors` (`ExecAnchor::reanchors`). When it
     /// moved, what was linked under the old anchor is dropped (the top's check with it), and
-    /// the state remembers the re-anchor, so a later alarm names both anchors.
+    /// the state remembers the re-anchor, so a later alarm names both anchors. The reader
+    /// calls it from the anchor's re-anchor hook, so the drop reaches the kept file before a
+    /// restart (whose fresh anchor counts from 0 again) could hide it, and again before
+    /// each deep read.
     pub(crate) fn observe_reanchors(&self, reanchors: u64) {
         let text = {
             let Ok(mut state) = self.state.lock() else { return };
@@ -169,13 +183,19 @@ impl DeepAnchors {
     }
 
     /// Record a window `headers` (ascending `(number, hash)`, contiguous) that the caller
-    /// verified up to an attested finalized block or a hash linked from one. Keeps every
-    /// `K`-th block and the bottom, and checks the table's top when the window covers it.
-    /// Returns the alarm's message when this window raised it.
-    pub(crate) fn record_window(&self, headers: &[(u64, [u8; 32])]) -> Option<String> {
+    /// verified up to an attested finalized block or a hash linked from one, under the
+    /// re-anchor count `under` it read before the walk. Keeps every `K`-th block and the
+    /// bottom, and checks the table's top when the window covers it.
+    ///
+    /// [`Recorded::Reanchored`], recording nothing, when the light client was re-anchored
+    /// since `under`: the window was linked under the old anchor.
+    pub(crate) fn record_window_under(&self, headers: &[(u64, [u8; 32])], under: u64) -> Recorded {
         // Rendered under the lock, written after it: plan and alarm never wait on the disk.
         let (raised, text) = {
-            let mut state = self.state.lock().ok()?;
+            let Ok(mut state) = self.state.lock() else { return Recorded::Linked };
+            if state.reanchors_seen != under {
+                return Recorded::Reanchored;
+            }
             let raised = self.record_locked(&mut state, headers);
             let text = self.table.as_ref().map(|t| render_store(&pin_key(t), &state));
             (raised, text)
@@ -185,7 +205,21 @@ impl DeepAnchors {
                 tracing::warn!(path = %path.display(), error = %e, "deep anchors not saved");
             }
         }
-        raised
+        match raised {
+            Some(alarm) => Recorded::Alarm(alarm),
+            None => Recorded::Linked,
+        }
+    }
+
+    /// [`Self::record_window_under`] at the count this state was last told: the alarm's
+    /// message when the window raised it.
+    #[cfg(test)]
+    pub(crate) fn record_window(&self, headers: &[(u64, [u8; 32])]) -> Option<String> {
+        let under = self.state.lock().ok()?.reanchors_seen;
+        match self.record_window_under(headers, under) {
+            Recorded::Alarm(alarm) => Some(alarm),
+            Recorded::Linked | Recorded::Reanchored => None,
+        }
     }
 
     fn record_locked(&self, state: &mut Linked, headers: &[(u64, [u8; 32])]) -> Option<String> {
@@ -420,6 +454,26 @@ mod tests {
 
     fn stored_alarm_text(text: &str) -> Option<String> {
         text.lines().find_map(|l| l.strip_prefix("alarm ").map(str::to_string))
+    }
+
+    #[test]
+    fn a_window_walked_across_a_reanchor_is_not_kept_and_the_drop_reaches_the_file() {
+        let dir = std::env::temp_dir().join(format!("myotis-deep-reanchor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("deep-anchors.txt");
+        let d = DeepAnchors { store: Some(path.clone()), ..DeepAnchors::with_table(table()) };
+        let window: Vec<_> = (4977..=6000).map(|n| (n, h(n))).collect();
+        assert_eq!(d.record_window_under(&window, 0), Recorded::Linked);
+        // The re-anchor, as the anchor's hook reports it: the file loses the old hashes at
+        // once, so a restart (whose anchor counts from 0 again) cannot bring them back.
+        d.observe_reanchors(1);
+        let after = load(&path, &pin_key(&table()));
+        assert!(after.hashes.is_empty() && after.reanchored);
+        // A walk that began under count 0 and ends after it records nothing.
+        assert_eq!(d.record_window_under(&window, 0), Recorded::Reanchored);
+        assert!(d.state.lock().unwrap().hashes.is_empty());
+        assert_eq!(d.record_window_under(&window, 1), Recorded::Linked);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

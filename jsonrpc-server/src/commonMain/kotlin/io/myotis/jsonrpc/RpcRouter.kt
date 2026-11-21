@@ -59,14 +59,14 @@ class RpcRouter internal constructor(
     internal companion object {
         private val HEX_DIGITS = "0123456789abcdef".toCharArray()
 
+        /** Methods only this node serves whose requests must never reach a dev proxy. */
+        private val LOCAL_ONLY = setOf("myotis_getAddressHistory", "myotis_verifyAddressHistoryEntries")
+
         /** Methods we have a verified implementation for, each with the most
          *  positional arguments it takes: geth's arity for the method, so a
          *  request geth refuses with "too many arguments" is refused here too,
          *  never served with the extra argument ignored (#366). Keep in sync
          *  with tryVerified's cases. */
-        /** Methods only this node serves whose requests must never reach a dev proxy. */
-        private val LOCAL_ONLY = setOf("myotis_getAddressHistory", "myotis_verifyAddressHistoryEntries")
-
         private val VERIFIED_ARITY: Map<String, Int> = mapOf(
             "eth_chainId" to 0, "net_version" to 0, "eth_blockNumber" to 0,
             // transaction, block, state overrides, block overrides

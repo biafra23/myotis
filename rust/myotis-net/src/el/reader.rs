@@ -2188,8 +2188,9 @@ pub struct ElReader {
     /// network served. A send signed for another chain is refused (#665).
     chain_id: u64,
     /// Where a by-number read below the 512-block window verifies: the bundled
-    /// checkpoint table and the hashes linked above its top (`el::deep`).
-    deep: super::deep::DeepAnchors,
+    /// checkpoint table and the hashes linked above its top (`el::deep`). Shared with the
+    /// anchor's re-anchor hook, which drops what was linked under the old anchor.
+    deep: Arc<super::deep::DeepAnchors>,
     /// Cross-call EVM caches, shared across every `eth_call` on this reader. Both
     /// hold `stateRoot`-keyed / content-addressed cryptographic facts, so reuse is
     /// sound. Because a call pins to the CURRENT head (whose root advances ~every
@@ -2531,6 +2532,17 @@ impl ElReader {
         // The deep anchors' state sits beside the peer cache, suffixed like it
         // (`peers-sepolia.cache` → `deep-anchors-sepolia.txt`).
         let deep_store = cfg.cache_path.as_deref().and_then(super::deep::store_path);
+        let deep = Arc::new(super::deep::DeepAnchors::for_chain(cfg.network_id, deep_store));
+        {
+            // Dropped when the light client is re-anchored, not at the next deep read: that
+            // read may come only after a restart, whose fresh anchor counts from 0 again.
+            let deep = Arc::downgrade(&deep);
+            anchor.on_reanchor(move |count| {
+                if let Some(deep) = deep.upgrade() {
+                    deep.observe_reanchors(count);
+                }
+            });
+        }
         let local_pubkey = key.public_key_bytes();
         let sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch = Arc::new(
             std::sync::Mutex::new(crate::el::sent_tx::SentTxTracker::new()),
@@ -2579,7 +2591,7 @@ impl ElReader {
             min_suggested_tip_wei: cfg.min_suggested_tip_wei,
             block_time: cfg.block_time,
             chain_id: cfg.network_id,
-            deep: super::deep::DeepAnchors::for_chain(cfg.network_id, deep_store),
+            deep,
             evm_proof_cache: Arc::new(InMemoryStateProofCache::new(EVM_PROOF_CACHE_ENTRIES)),
             evm_bytecode_cache: Arc::new(InMemoryBytecodeCache::new()),
             read_stats,
@@ -8297,8 +8309,10 @@ impl ElReader {
         let WindowTop::Finalized { number, hash } = top else {
             return Err(beyond());
         };
-        // A re-anchor (STALE_ANCHOR) voids what was linked under the old anchor.
-        self.deep.observe_reanchors(self.anchor.reanchors());
+        // A re-anchor (STALE_ANCHOR) voids what was linked under the old anchor. The hook
+        // drops it when the anchor moves; this catches a reader built after one.
+        let under = self.anchor.reanchors();
+        self.deep.observe_reanchors(under);
         loop {
             match self.deep.plan(target_num, (number, hash)) {
                 None => return Err(beyond()),
@@ -8339,8 +8353,17 @@ impl ElReader {
                         .await?;
                     let linked: Vec<(u64, [u8; 32])> =
                         window.iter().map(|vh| (vh.header.number, vh.hash)).collect();
-                    if let Some(alarm) = self.deep.record_window(&linked) {
-                        return Err(PoolReadError::Fatal(alarm));
+                    match self.deep.record_window_under(&linked, under) {
+                        super::deep::Recorded::Linked => {}
+                        super::deep::Recorded::Alarm(alarm) => return Err(PoolReadError::Fatal(alarm)),
+                        // Linked under the old anchor: nothing kept. Retryable: the
+                        // next read walks under the new one.
+                        super::deep::Recorded::Reanchored => {
+                            return Err(PoolReadError::Fatal(format!(
+                                "block {target_num}: the light client was re-anchored during \
+                                 the walk that verifies it; ask again"
+                            )))
+                        }
                     }
                 }
             }
@@ -10432,9 +10455,6 @@ impl ElReader {
         choose_window_top(target_num, head, fin)
     }
 
-    /// The checkpoint table's alarm (`el::deep`), once raised: a walk from an
-    /// attested finalized block found another hash at the table's top, and
-    /// every read resting on the table is refused. Kept across restarts.
     /// How many times this reader's light client was re-anchored at a STALE_ANCHOR park
     /// (`ExecAnchor::reanchors`): what was verified under an earlier count rested on an
     /// anchor since replaced.
@@ -10442,6 +10462,16 @@ impl ElReader {
         self.anchor.reanchors()
     }
 
+    /// What a result verified now rests on (`ExecAnchor::epoch`): unique in the process,
+    /// renewed by every re-anchor and by every sync start. An in-memory cache of verdicts
+    /// keys by it.
+    pub fn anchor_epoch(&self) -> u64 {
+        self.anchor.epoch()
+    }
+
+    /// The checkpoint table's alarm (`el::deep`), once raised: a walk from an
+    /// attested finalized block found another hash at the table's top, and
+    /// every read resting on the table is refused. Kept across restarts.
     pub fn checkpoint_alarm(&self) -> Option<String> {
         self.deep.alarm()
     }

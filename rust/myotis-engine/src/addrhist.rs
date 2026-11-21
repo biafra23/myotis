@@ -448,18 +448,19 @@ fn page_json(
     .to_string()
 }
 
-/// What kept verdicts rest on, as the reader reports it now: the light client's re-anchor
-/// count (a verdict of another count no longer counts) and whether the checkpoint table's
-/// alarm is raised (then none counts, and none is kept).
+/// What kept verdicts rest on, as the reader reports it now: the light client's anchor
+/// epoch (`ElReader::anchor_epoch`, renewed by a re-anchor and by a sync start: a verdict
+/// of another epoch no longer counts) and whether the checkpoint table's alarm is raised
+/// (then none counts, and none is kept).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Trust {
-    pub reanchors: u64,
+    pub anchor: u64,
     pub alarm: bool,
 }
 
 impl Trust {
     pub fn of(reader: &myotis_net::el::reader::ElReader) -> Self {
-        Trust { reanchors: reader.reanchors(), alarm: reader.checkpoint_alarm().is_some() }
+        Trust { anchor: reader.anchor_epoch(), alarm: reader.checkpoint_alarm().is_some() }
     }
 }
 
@@ -679,18 +680,25 @@ mod verified {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    /// `(re-anchor count, chain, address, block, slot, roles)`: a verdict counts only under the
-    /// anchor it was computed under.
-    type Key = (u64, u64, [u8; 20], u64, u32, u8);
+    /// `(address, block, slot, roles)`, within one chain's verdicts.
+    type Key = ([u8; 20], u64, u32, u8);
 
-    /// Final verdicts only (a finalized block's verified or contradicted entry): they never
-    /// change while the trust they rest on holds. Bounded: cleared whole when full, a cache,
-    /// not a store.
-    static KEPT: Mutex<Option<HashMap<Key, serde_json::Value>>> = Mutex::new(None);
+    /// One chain's kept verdicts, all computed under the anchor epoch `anchor`: a verdict
+    /// counts only under the anchor it was computed under.
+    struct Chain {
+        anchor: u64,
+        verdicts: HashMap<Key, serde_json::Value>,
+    }
+
+    /// Final verdicts only (a finalized block's verified or contradicted entry), per chain:
+    /// they never change while the trust they rest on holds. Bounded per chain: cleared whole
+    /// when full, a cache, not a store. Each chain's trust is its own reader's, so one chain's
+    /// re-anchor or alarm never touches another's.
+    static KEPT: Mutex<Option<HashMap<u64, Chain>>> = Mutex::new(None);
     const MAX_KEPT: usize = 50_000;
 
     /// A kept verdict, if any, and only while no checkpoint-table alarm is raised: the alarm
-    /// withdraws the trust table-verified verdicts rest on, so it also clears them all.
+    /// withdraws the trust table-verified verdicts rest on, so it also clears the chain's.
     pub(super) fn cached(
         trust: super::Trust,
         chain: u64,
@@ -701,10 +709,11 @@ mod verified {
     ) -> Option<serde_json::Value> {
         let mut kept = KEPT.lock().ok()?;
         if trust.alarm {
-            *kept = None;
+            kept.as_mut().map(|k| k.remove(&chain));
             return None;
         }
-        kept.as_ref()?.get(&(trust.reanchors, chain, *address, block, slot, roles)).cloned()
+        let ours = kept.as_ref()?.get(&chain).filter(|c| c.anchor == trust.anchor)?;
+        ours.verdicts.get(&(*address, block, slot, roles)).cloned()
     }
 
     pub(super) fn keep(
@@ -720,12 +729,16 @@ mod verified {
             return;
         }
         if let Ok(mut kept) = KEPT.lock() {
-            let map = kept.get_or_insert_with(HashMap::new);
-            // A verdict of an earlier anchor never counts again: drop them all at once.
-            if map.len() >= MAX_KEPT || map.keys().next().is_some_and(|k| k.0 != trust.reanchors) {
-                map.clear();
+            let ours = kept
+                .get_or_insert_with(HashMap::new)
+                .entry(chain)
+                .or_insert_with(|| Chain { anchor: trust.anchor, verdicts: HashMap::new() });
+            // A verdict of an earlier anchor never counts again: drop the chain's at once.
+            if ours.anchor != trust.anchor || ours.verdicts.len() >= MAX_KEPT {
+                ours.anchor = trust.anchor;
+                ours.verdicts.clear();
             }
-            map.insert((trust.reanchors, chain, *address, block, slot, roles), v.clone());
+            ours.verdicts.insert((*address, block, slot, roles), v.clone());
         }
     }
 
@@ -1087,14 +1100,36 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), (1, [0x43; 20]), trust, &parse_options("").unwrap())).unwrap();
         assert_eq!(v["entries"][0]["state"], "unverified");
         // After a re-anchor it no longer counts; under the alarm nothing does, and it is gone.
-        let later = Trust { reanchors: 1, alarm: false };
+        let later = Trust { anchor: 1, alarm: false };
         let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), who, later, &parse_options("").unwrap())).unwrap();
         assert_eq!(v["entries"][0]["state"], "unverified");
         verified::keep(trust, who.0, &who.1, 500, 2, role::FROM, &kept);
-        let alarm = Trust { reanchors: 0, alarm: true };
+        let alarm = Trust { anchor: 0, alarm: true };
         let v: serde_json::Value = serde_json::from_str(&page_json(&read, [0; 20], Some(600), who, alarm, &parse_options("").unwrap())).unwrap();
         assert_eq!(v["entries"][0]["state"], "unverified");
         assert!(verified::cached(trust, who.0, &who.1, 500, 2, role::FROM).is_none(), "the alarm cleared it");
+    }
+
+    #[test]
+    fn one_chains_reanchor_or_alarm_leaves_anothers_verdicts() {
+        use myotis_addr1::records::role;
+        // Chain ids no other test uses: KEPT is one map for the process.
+        let (one, two) = (0x0a11_u64, 0x0a12_u64);
+        let v = serde_json::json!({"state": "verified"});
+        let (t1, t2) = (Trust { anchor: 7, alarm: false }, Trust { anchor: 8, alarm: false });
+        verified::keep(t1, one, &[1; 20], 10, 1, role::FROM, &v);
+        verified::keep(t2, two, &[1; 20], 10, 1, role::FROM, &v);
+        // The first chain re-anchors: its old verdicts no longer count, the other's do.
+        let moved = Trust { anchor: 9, alarm: false };
+        verified::keep(moved, one, &[2; 20], 11, 1, role::FROM, &v);
+        assert!(verified::cached(t1, one, &[1; 20], 10, 1, role::FROM).is_none());
+        assert!(verified::cached(moved, one, &[1; 20], 10, 1, role::FROM).is_none());
+        assert!(verified::cached(moved, one, &[2; 20], 11, 1, role::FROM).is_some());
+        assert!(verified::cached(t2, two, &[1; 20], 10, 1, role::FROM).is_some());
+        // Its alarm clears its own verdicts only.
+        assert!(verified::cached(Trust { anchor: 9, alarm: true }, one, &[2; 20], 11, 1, role::FROM).is_none());
+        assert!(verified::cached(moved, one, &[2; 20], 11, 1, role::FROM).is_none());
+        assert!(verified::cached(t2, two, &[1; 20], 10, 1, role::FROM).is_some());
     }
 
     #[test]

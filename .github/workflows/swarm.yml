@@ -26,6 +26,13 @@ on:
       - "rust/vendor/ant/**"
       - "rust/myotis-addr1/**"
       - "rust/myotis-engine/**"
+      # The path crates the engine builds with `swarm` on: addrhist, tested only here,
+      # calls into myotis-net (addrcheck, ElReader) and myotis-core.
+      - "rust/myotis-net/**"
+      - "rust/myotis-core/**"
+      - "rust/myotis-wire/**"
+      - "rust/myotis-consensus/**"
+      - "rust/myotis-evm/**"
       - "rust/Cargo.lock"
       - ".github/workflows/swarm.yml"
       - ".github/actions/rust-toolchain/**"
@@ -36,6 +43,13 @@ on:
       - "rust/vendor/ant/**"
       - "rust/myotis-addr1/**"
       - "rust/myotis-engine/**"
+      # The path crates the engine builds with `swarm` on: addrhist, tested only here,
+      # calls into myotis-net (addrcheck, ElReader) and myotis-core.
+      - "rust/myotis-net/**"
+      - "rust/myotis-core/**"
+      - "rust/myotis-wire/**"
+      - "rust/myotis-consensus/**"
+      - "rust/myotis-evm/**"
       - "rust/Cargo.lock"
       - ".github/workflows/swarm.yml"
       - ".github/actions/rust-toolchain/**"

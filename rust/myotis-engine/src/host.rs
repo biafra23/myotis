@@ -566,8 +566,6 @@ fn handle_using(engine: &EngineState, snapshot_path: Option<&std::path::Path>) -
         .map(|(id, _)| *id)
 }
 
-/// `""` for mainnet, `-<net>` otherwise — the per-network file-name suffix
-/// shared with the Java hosts.
 /// The handle's deep-anchor state file (`myotis_net::el::deep`): beside its EL peer cache,
 /// under the host's dataDir, suffixed like it. `None` without a dataDir.
 fn deep_store_path(config: &ChainConfig) -> Option<std::path::PathBuf> {
@@ -575,6 +573,8 @@ fn deep_store_path(config: &ChainConfig) -> Option<std::path::PathBuf> {
     Some(dir.join(format!("deep-anchors{}.txt", persistence_suffix(config))))
 }
 
+/// `""` for mainnet, `-<net>` otherwise — the per-network file-name suffix
+/// shared with the Java hosts.
 fn persistence_suffix(config: &ChainConfig) -> String {
     if config.name == "mainnet" {
         String::new()
