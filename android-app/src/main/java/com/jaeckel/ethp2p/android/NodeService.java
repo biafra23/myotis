@@ -2142,7 +2142,9 @@ public final class NodeService extends Service {
             // kept while paused.
             io.myotis.api.DataUsage dataUsage,
             // The device network's metering as last pushed to the engine (debugging aid).
-            io.myotis.api.NetworkMetering networkMetering) {}
+            io.myotis.api.NetworkMetering networkMetering,
+            // The checkpoint table's alarm (rule D1), or null; kept while paused.
+            String checkpointAlarm) {}
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
     public record AccountQueryResult(
@@ -3022,7 +3024,7 @@ public final class NodeService extends Service {
                     s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                     s.peerBodyRequests(), s.peerBodyRequestsServed(),
                     s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods(),
-                    s.upgradeAdvisory(), s.dataUsage(), s.networkMetering());
+                    s.upgradeAdvisory(), s.dataUsage(), s.networkMetering(), s.checkpointAlarm());
         }
         return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
@@ -3039,7 +3041,7 @@ public final class NodeService extends Service {
                 s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                 s.peerBodyRequests(), s.peerBodyRequestsServed(),
                 s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods(),
-                s.upgradeAdvisory(), s.dataUsage(), s.networkMetering());
+                s.upgradeAdvisory(), s.dataUsage(), s.networkMetering(), s.checkpointAlarm());
     }
 
     // ---- Failure forensics (see ProcessHealthDiag) ----
